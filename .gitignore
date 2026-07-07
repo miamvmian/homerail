@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!agent-ui/.env.example
+.DS_Store
+.artifacts/
+runs/
+reports/
+output/
+tmp/
+temp/
+*.log
+*.db
+*.sqlite

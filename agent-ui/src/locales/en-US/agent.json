@@ -1,0 +1,210 @@
+{
+  "title": "Agent Orchestrator",
+  "header": {
+    "title": "OmniArtifacts Orchestrator",
+    "newSession": "New Session"
+  },
+  "chat": {
+    "placeholder": "Describe a task, or mention agent to chat...",
+    "systemWelcome": "Hello, I am the orchestrator. Please describe the task you want to accomplish.",
+    "sending": "Sending...",
+    "send": "Send",
+    "stop": "Stop",
+    "analyzing": "Analyzing...",
+    "creatingChange": "Creating change...",
+    "startingRun": "Starting run...",
+    "toolCall": {
+      "searchCode": "Search code",
+      "createChange": "Create change",
+      "createYaml": "Create orchestration",
+      "startRun": "Start run",
+      "completed": "Completed",
+      "inProgress": "In progress...",
+      "failed": "Failed"
+    }
+  },
+  "workspace": {
+    "title": "Agent Workspace",
+    "tabs": {
+      "team": "Team",
+      "dag": "DAG",
+      "log": "Log"
+    },
+    "status": {
+      "idle": "Idle",
+      "running": "Running",
+      "completed": "Completed",
+      "failed": "Failed"
+    },
+    "empty": {
+      "team": "No team info",
+      "dag": "No DAG topology",
+      "log": "Select a node to view logs"
+    }
+  },
+  "team": {
+    "title": "Team",
+    "status": {
+      "pending": "Waiting",
+      "ready": "Ready",
+      "running": "Running",
+      "completed": "Completed",
+      "failed": "Failed",
+      "skipped": "Skipped"
+    },
+    "clickToViewLog": "Click to view logs"
+  },
+  "statusBar": {
+    "status": {
+      "pending": "Waiting",
+      "ready": "Ready",
+      "running": "Running",
+      "completed": "Completed",
+      "failed": "Failed",
+      "skipped": "Skipped"
+    },
+    "viewLog": "View Log",
+    "stop": "Stop",
+    "allLogs": "All Logs",
+    "stopNotImplemented": "Stop feature not yet implemented"
+  },
+  "nav": {
+    "agent": "Agent"
+  },
+  "inspector": {
+    "title": "Inspector",
+    "noDag": "No DAG run active",
+    "noNodes": "No nodes",
+    "selectNodeLogs": "Select a node to view logs",
+    "noLogs": "No logs",
+    "tabs": {
+      "progress": "Progress",
+      "artifacts": "Artifacts",
+      "evidence": "Evidence",
+      "settings": "Settings",
+      "nodes": "Nodes",
+      "topology": "Topology",
+      "logs": "Logs"
+    }
+  },
+  "progress": {
+    "title": "Run Progress",
+    "noRun": "No run selected",
+    "noDag": "No DAG data",
+    "noNodes": "No workers",
+    "workerRatio": "{completed}/{total} workers",
+    "items": {
+      "run": "Run",
+      "dag": "DAG health",
+      "workers": "Workers",
+      "audit": "Usage audit",
+      "scorecard": "Scorecard"
+    },
+    "auditReady": "Audit summary available",
+    "auditPending": "Waiting for audit data",
+    "auditLoading": "Loading audit summary...",
+    "auditUnavailable": "Audit unavailable",
+    "scorecardPending": "Waiting for DAG evidence",
+    "scorecardResult": "{result} {score}/{total}",
+    "scorecardUnavailable": "Scorecard unavailable",
+    "scorecardLoading": "Calculating scorecard...",
+    "scorecardClean": "No scorecard failures found",
+    "scorecardFailures": {
+      "failedNodes": "{count} worker(s) failed",
+      "testerValidation": "Tester did not run an issue-relevant validation command",
+      "testerOutput": "Tester did not include validation output",
+      "reviewerDiff": "Reviewer did not inspect a diff",
+      "gitAddDot": "Committer used broad git add",
+      "contractHook": "A handoff contract hook failed",
+      "contractSkipped": "A handoff contract hook was skipped"
+    },
+    "failedNodes": "Failed workers",
+    "viewEvidence": "View logs",
+    "tokens": "Tokens",
+    "cost": "Cost",
+    "agents": "{count} agents",
+    "workerEvidence": "Worker evidence",
+    "toolCalls": "Tool calls",
+    "toolResults": "Tool results",
+    "background": "Background tasks",
+    "backgroundQuiet": "No background task reported"
+  },
+  "evidence": {
+    "title": "Worker Evidence",
+    "loading": "Loading",
+    "loadFailed": "Failed to load evidence",
+    "selectNode": "Select a worker to inspect evidence",
+    "toolCalls": "Tool calls",
+    "toolResults": "Tool results",
+    "handoffs": "Handoffs",
+    "errors": "Errors",
+    "timeline": "Evidence timeline",
+    "noText": "No text output yet",
+    "noToolCalls": "No tool calls",
+    "noMessages": "No messages"
+  },
+  "artifacts": {
+    "title": "Git / PR Artifacts",
+    "loading": "Loading",
+    "loadFailed": "Failed to load artifacts",
+    "branch": "Branch",
+    "current": "Current",
+    "base": "Base",
+    "pullRequest": "Pull Request",
+    "sourceIssue": "Source issue",
+    "changedFiles": "Changed files",
+    "moreLinks": "More links",
+    "unavailable": "Unavailable",
+    "noPullRequest": "No PR link found yet",
+    "noIssue": "No source issue found yet",
+    "noChangedFiles": "No diff files found yet",
+    "noMoreLinks": "No more links",
+    "review": {
+      "approved": "review approved",
+      "changes_requested": "changes requested",
+      "unknown": "unconfirmed"
+    }
+  },
+  "settings": {
+    "title": "Agent Settings",
+    "refresh": "Refresh",
+    "loadFailed": "Failed to load settings",
+    "managerApi": "Manager API",
+    "gitServers": "Git servers",
+    "providers": "Providers",
+    "models": "Model settings",
+    "defaults": "Defaults",
+    "defaultsGap": "The backend does not yet expose a unified default DAG template / default worker provider API; this panel surfaces the gap instead of pretending to save non-persistent settings.",
+    "verify": "Verify",
+    "valid": "valid",
+    "invalid": "invalid",
+    "active": "active",
+    "inactive": "inactive",
+    "unavailable": "Unavailable",
+    "noGitServers": "No Git servers configured",
+    "noProviders": "No providers configured",
+    "noModels": "No active model settings",
+    "health": {
+      "unknown": "unknown",
+      "healthy": "healthy",
+      "failed": "unavailable"
+    }
+  },
+  "sidebar": {
+    "newSession": "New Session",
+    "empty": "No sessions yet",
+    "runs": "{count} Runs",
+    "delete": "Delete Session",
+    "selectProject": "Select Project",
+    "noProjects": "No projects",
+    "search": "Search sessions...",
+    "dagRuns": "DAG Runs",
+    "noMatch": "No sessions match your search",
+    "status": {
+      "running": "Running",
+      "completed": "Completed",
+      "failed": "Failed",
+      "interrupted": "Interrupted"
+    }
+  }
+}

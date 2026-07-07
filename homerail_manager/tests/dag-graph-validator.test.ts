@@ -1,0 +1,186 @@
+import { describe, expect, it } from "vitest";
+
+import { validateGraph } from "../src/orchestration/graph-validator.js";
+import { parseDAGYaml } from "../src/orchestration/yaml-loader.js";
+
+describe("DAG graph validator", () => {
+  it("accepts terminal edges", () => {
+    const parsed = parseDAGYaml(`
+name: terminal-ok
+nodes:
+  start:
+    agent: planner
+    outputs:
+      done:
+        to: ""
+`);
+
+    const result = validateGraph(parsed.graph);
+
+    expect(result.valid).toBe(true);
+    expect(result.entry_nodes).toEqual(["start"]);
+    expect(result.terminal_nodes).toEqual(["start"]);
+  });
+
+  it("rejects output edges that reference unknown nodes", () => {
+    expect(() => parseDAGYaml(`
+name: dangling-edge
+nodes:
+  start:
+    agent: planner
+    outputs:
+      done:
+        to: "missing.in:task"
+`)).toThrow(/unknown to_node: missing/);
+  });
+
+  it("rejects non-failure cycles before runtime dispatch", () => {
+    expect(() => parseDAGYaml(`
+name: cyclic
+nodes:
+  first:
+    agent: a
+    outputs:
+      done:
+        to: "second.in:task"
+  second:
+    agent: b
+    outputs:
+      done:
+        to: "first.in:task"
+`)).toThrow(/Cycle detected: first -> second -> first/);
+  });
+
+  it("allows on_failure feedback edges without reporting a cycle", () => {
+    const result = validateGraph({
+      nodes: [
+        {
+          node_id: "first",
+          name: "first",
+          description: "",
+          node_type: "agent",
+          agent: "a",
+          after: [],
+          outputs: {},
+        },
+        {
+          node_id: "second",
+          name: "second",
+          description: "",
+          node_type: "agent",
+          agent: "b",
+          after: [],
+          outputs: {},
+        },
+      ],
+      edges: [
+        {
+          from_node: "first",
+          from_port: "done",
+          to_node: "second",
+          to_port: "task",
+          condition: "on_success",
+        },
+        {
+          from_node: "second",
+          from_port: "error",
+          to_node: "first",
+          to_port: "retry",
+          condition: "on_failure",
+        },
+      ],
+    });
+
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+    expect(result.entry_nodes).toEqual(["first"]);
+  });
+
+  it("reports orphan nodes as warnings, not hard errors", () => {
+    const result = validateGraph({
+      nodes: [
+        {
+          node_id: "main",
+          name: "main",
+          description: "",
+          node_type: "agent",
+          agent: "a",
+          after: [],
+          outputs: {},
+        },
+        {
+          node_id: "orphan",
+          name: "orphan",
+          description: "",
+          node_type: "agent",
+          agent: "b",
+          after: [],
+          outputs: {},
+        },
+      ],
+      edges: [
+        {
+          from_node: "main",
+          from_port: "done",
+          to_node: "",
+          to_port: "",
+          condition: "on_success",
+        },
+      ],
+    });
+
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+    expect(result.warnings).toContain("Orphan node (no edges): orphan");
+  });
+
+  it("reports non-terminal dead-end nodes as warnings", () => {
+    const parsed = parseDAGYaml(`
+name: dead-end-warning
+nodes:
+  start:
+    agent: a
+    outputs:
+      done:
+        to: "middle.in:task"
+  middle:
+    agent: b
+`);
+
+    const result = validateGraph(parsed.graph);
+
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+    expect(result.warnings).toContain("Dead-end node (no terminal or outgoing edges): middle");
+  });
+
+  it("warns when high-retry on_failure feedback edges can loop", () => {
+    const parsed = parseDAGYaml(`
+name: feedback-risk-warning
+nodes:
+  first:
+    agent: a
+    outputs:
+      done:
+        to: "second.in:task"
+  second:
+    agent: b
+    outputs:
+      done:
+        to: ""
+      error:
+        to: "first.in:retry"
+        condition: on_failure
+        retry_policy:
+          max_retries: 11
+`);
+
+    const result = validateGraph(parsed.graph);
+
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+    expect(result.warnings).toContain(
+      "Feedback-loop risk: on_failure edge second.error -> first.retry has max_retries 11",
+    );
+  });
+});

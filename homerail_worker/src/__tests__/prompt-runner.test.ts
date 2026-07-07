@@ -1,0 +1,506 @@
+/**
+ * Tests for prompt runner: full prompt → tool → result flow.
+ */
+
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { runPrompt } from "../prompt-runner.js";
+import type { PromptJob } from "../prompt-runner.js";
+import type { DagNodeConfig } from "homerail-protocol";
+import { registerAgentBackend } from "../agent/factory.js";
+import type { AgentClient, AgentEvent, AgentRunContext } from "../agent/types.js";
+
+function makeConfig(): DagNodeConfig {
+  return {
+    node_id: "coder",
+    agent_type: "claude-sdk",
+    model: "test",
+    outgoing_edges: [
+      { from_port: "done", to_node: "tester", to_port: "in" },
+    ],
+    incoming_edges: [],
+    graph_nodes: ["coder", "tester"],
+  };
+}
+
+function makeConfigWith(overrides: Partial<DagNodeConfig>): DagNodeConfig {
+  return { ...makeConfig(), ...overrides };
+}
+
+describe("prompt runner", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    process.env.LLM_BASE_URL = "https://llm.example.test/v1";
+  });
+
+  it("sends content and SESSION_END", async () => {
+    // Register a mock agent
+    const events: AgentEvent[] = [
+      { type: "text", text: "hello" },
+      { type: "done" },
+    ];
+
+    const mockAgent: AgentClient = {
+      run() {
+        return (async function* () {
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    registerAgentBackend("test-runner", () => mockAgent);
+
+    const sent: string[] = [];
+    const job: PromptJob = {
+      task: "do something",
+      sender: "test",
+      runId: "run-1",
+      dagConfig: makeConfig(),
+    };
+
+    await runPrompt(job, {
+      wsSend: (d) => sent.push(d),
+      agentBackend: "test-runner",
+    });
+
+    // Should have sent content + SESSION_END
+    const types = sent.map((s) => JSON.parse(s).type);
+    expect(types).toContain("content");
+    expect(types).toContain("node_error");
+    expect(types).toContain("SESSION_END");
+  });
+
+  it("sends node_error with agent error when a prompt ends without handoff", async () => {
+    const mockAgent: AgentClient = {
+      run() {
+        return (async function* () {
+          yield { type: "error" as const, message: "Claude SDK result failed: error_max_turns" };
+          yield { type: "done" as const };
+        })();
+      },
+    };
+    registerAgentBackend("test-node-error", () => mockAgent);
+
+    const sent: string[] = [];
+    await runPrompt(
+      {
+        task: "test",
+        sender: "test",
+        runId: "run-node-error",
+        dagConfig: makeConfig(),
+      },
+      {
+        wsSend: (d) => sent.push(d),
+        agentBackend: "test-node-error",
+      },
+    );
+
+    const parsed = sent.map((s) => JSON.parse(s));
+    expect(parsed).toContainEqual(expect.objectContaining({
+      type: "node_error",
+      data: expect.objectContaining({
+        runId: "run-node-error",
+        nodeId: "coder",
+        message: "Claude SDK result failed: error_max_turns",
+        session_id: "run-node-error",
+      }),
+    }));
+    expect(parsed.map((msg) => msg.type)).toContain("SESSION_END");
+  });
+
+  it("fails claude-sdk before execution when the protocol is missing", async () => {
+    const sent: string[] = [];
+    await runPrompt(
+      {
+        task: "test",
+        sender: "test",
+        runId: "run-claude-protocol-missing",
+        dagConfig: makeConfig(),
+      },
+      {
+        wsSend: (d) => sent.push(d),
+        agentBackend: "claude-sdk",
+      },
+    );
+
+    const parsed = sent.map((s) => JSON.parse(s));
+    expect(parsed).toContainEqual(expect.objectContaining({
+      type: "node_error",
+      data: expect.objectContaining({
+        runId: "run-claude-protocol-missing",
+        nodeId: "coder",
+        message: expect.stringContaining("Anthropic-compatible endpoint"),
+      }),
+    }));
+    expect(parsed.map((msg) => msg.type)).toContain("SESSION_END");
+  });
+
+  it("streams agent debug events without sending them as content", async () => {
+    const mockAgent: AgentClient = {
+      run() {
+        return (async function* () {
+          yield {
+            type: "debug" as const,
+            source: "claude-sdk",
+            message: "query_start",
+            data: { model: "claude-sonnet-4-20250514" },
+          };
+          yield { type: "done" as const };
+        })();
+      },
+    };
+    registerAgentBackend("test-debug", () => mockAgent);
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const sent: string[] = [];
+    await runPrompt(
+      {
+        task: "test",
+        sender: "test",
+        runId: "run-debug",
+        dagConfig: makeConfig(),
+      },
+      {
+        wsSend: (d) => sent.push(d),
+        agentBackend: "test-debug",
+      },
+    );
+
+    const parsed = sent.map((s) => JSON.parse(s));
+    expect(parsed.some((msg) => msg.type === "content")).toBe(false);
+    expect(parsed).toContainEqual(expect.objectContaining({
+      type: "stream",
+      data: expect.objectContaining({
+        event: "agent_debug",
+        source: "claude-sdk",
+        message: "query_start",
+      }),
+    }));
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("HOMERAIL_AGENT_DEBUG"));
+  });
+
+  it("streams redacted tool inputs and result previews", async () => {
+    const mockAgent: AgentClient = {
+      run() {
+        return (async function* () {
+          yield {
+            type: "tool_use" as const,
+            id: "tool-1",
+            name: "Bash",
+            input: {
+              command: "curl -H 'Authorization: Bearer secret-token-123456' https://example.test?token=secret-query-token",
+              api_key: "secret-key-value",
+            },
+          };
+          yield {
+            type: "tool_result" as const,
+            tool_use_id: "tool-1",
+            content: "done token=secret-result-token",
+          };
+          yield { type: "done" as const };
+        })();
+      },
+    };
+    registerAgentBackend("test-tool-redaction", () => mockAgent);
+
+    const sent: string[] = [];
+    await runPrompt(
+      {
+        task: "test",
+        sender: "test",
+        runId: "run-tool-redaction",
+        dagConfig: makeConfig(),
+      },
+      {
+        wsSend: (d) => sent.push(d),
+        agentBackend: "test-tool-redaction",
+      },
+    );
+
+    const parsed = sent.map((s) => JSON.parse(s));
+    const toolUse = parsed.find((msg) => msg.type === "stream" && msg.data?.event === "tool_use");
+    const toolResult = parsed.find((msg) => msg.type === "stream" && msg.data?.event === "tool_result");
+
+    expect(toolUse?.data?.tool_input).toMatchObject({
+      command: expect.stringContaining("Authorization: Bearer ***REDACTED***"),
+      api_key: "***REDACTED***",
+    });
+    expect(toolResult?.data?.result_preview).toContain("token=***REDACTED***");
+    expect(JSON.stringify([toolUse, toolResult])).not.toContain("secret-token-123456");
+    expect(JSON.stringify([toolUse, toolResult])).not.toContain("secret-key-value");
+    expect(JSON.stringify([toolUse, toolResult])).not.toContain("secret-result-token");
+  });
+
+  it("passes job LLM credential fields into the agent context", async () => {
+    let observed: AgentRunContext | null = null;
+    const mockAgent: AgentClient = {
+      run(_prompt, _tools, context) {
+        observed = context;
+        return (async function* () {
+          yield { type: "done" as const };
+        })();
+      },
+    };
+    registerAgentBackend("test-credential-context", () => mockAgent);
+
+    await runPrompt(
+      {
+        task: "test",
+        sender: "test",
+        runId: "run-credential",
+        dagConfig: makeConfig(),
+        llmProvider: "anthropic",
+        llmApiKey: "anthropic-test-secret",
+        llmBaseUrl: "https://api.anthropic.test",
+      },
+      {
+        wsSend: () => {},
+        agentBackend: "test-credential-context",
+      },
+    );
+
+    expect(observed).toMatchObject({
+      provider: "anthropic",
+      apiKey: "anthropic-test-secret",
+      baseUrl: "https://api.anthropic.test",
+    });
+  });
+
+  it("persists per-node session transcripts without plaintext credentials", async () => {
+    const oldHome = process.env.HOMERAIL_HOME;
+    const tmpHome = mkdtempSync(join(tmpdir(), "homerail-worker-session-store-"));
+    process.env.HOMERAIL_HOME = tmpHome;
+    try {
+      const mockAgent: AgentClient = {
+        run() {
+          return (async function* () {
+            yield { type: "text" as const, text: "hello" };
+            yield { type: "done" as const };
+          })();
+        },
+      };
+      registerAgentBackend("test-session-store", () => mockAgent);
+
+      for (const [nodeId, sessionId] of [["coder", "node-session-a"], ["tester", "node-session-b"]] as const) {
+        await runPrompt(
+          {
+            task: `task for ${nodeId}`,
+            sender: "test",
+            runId: "same-run",
+            dagConfig: makeConfigWith({ node_id: nodeId, session_id: sessionId }),
+            llmProvider: "anthropic",
+            llmApiKey: "pk-session-store-secret",
+            llmBaseUrl: "https://llm.example.test/v1",
+          },
+          {
+            wsSend: () => {},
+            agentBackend: "test-session-store",
+          },
+        );
+      }
+
+      for (const sessionId of ["node-session-a", "node-session-b"]) {
+        const dir = join(tmpHome, "manager", "session-store", sessionId);
+        expect(existsSync(join(dir, "session.json"))).toBe(true);
+        expect(existsSync(join(dir, "transcript.jsonl"))).toBe(true);
+        const text = `${readFileSync(join(dir, "session.json"), "utf8")}\n${readFileSync(join(dir, "transcript.jsonl"), "utf8")}`;
+        expect(text).toContain(sessionId);
+        expect(text).not.toContain("pk-session-store-secret");
+      }
+    } finally {
+      if (oldHome === undefined) delete process.env.HOMERAIL_HOME;
+      else process.env.HOMERAIL_HOME = oldHome;
+      rmSync(tmpHome, { recursive: true, force: true });
+    }
+  });
+
+  it("records checkpoint resume metadata in the forked session transcript", async () => {
+    const oldHome = process.env.HOMERAIL_HOME;
+    const tmpHome = mkdtempSync(join(tmpdir(), "homerail-worker-checkpoint-transcript-"));
+    process.env.HOMERAIL_HOME = tmpHome;
+    try {
+      const mockAgent: AgentClient = {
+        run() {
+          return (async function* () {
+            yield { type: "done" as const };
+          })();
+        },
+      };
+      registerAgentBackend("test-checkpoint-transcript", () => mockAgent);
+
+      await runPrompt(
+        {
+          task: "checkpoint_resume: RESUME_MARKER",
+          sender: "test",
+          runId: "run-checkpoint",
+          dagConfig: makeConfigWith({ session_id: "child-session" }),
+          checkpointResume: {
+            parentSessionId: "parent-session",
+            entryUuid: "entry-7",
+            instruction: "RESUME_MARKER",
+            attempt: 2,
+          },
+        },
+        {
+          wsSend: () => {},
+          agentBackend: "test-checkpoint-transcript",
+        },
+      );
+
+      const transcript = readFileSync(
+        join(tmpHome, "manager", "session-store", "child-session", "transcript.jsonl"),
+        "utf8",
+      );
+      expect(transcript).toContain("\"type\":\"checkpoint_resume\"");
+      expect(transcript).toContain("parent-session");
+      expect(transcript).toContain("entry-7");
+      expect(transcript).toContain("RESUME_MARKER");
+      expect(existsSync(join(tmpHome, "manager", "session-store", "parent-session"))).toBe(false);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOMERAIL_HOME;
+      else process.env.HOMERAIL_HOME = oldHome;
+      rmSync(tmpHome, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a node error when no LLM base URL is configured", async () => {
+    delete process.env.LLM_BASE_URL;
+    const mockAgent: AgentClient = {
+      run() {
+        return (async function* () {
+          yield { type: "done" as const };
+        })();
+      },
+    };
+    registerAgentBackend("test-missing-base-url", () => mockAgent);
+
+    const sent: string[] = [];
+    await runPrompt(
+      {
+        task: "test",
+        sender: "test",
+        runId: "run-missing-base-url",
+        dagConfig: makeConfig(),
+      },
+      {
+        wsSend: (d) => sent.push(d),
+        agentBackend: "test-missing-base-url",
+      },
+    );
+
+    const parsed = sent.map((s) => JSON.parse(s));
+    expect(parsed).toContainEqual(expect.objectContaining({
+      type: "node_error",
+      data: expect.objectContaining({
+        runId: "run-missing-base-url",
+        nodeId: "coder",
+        message: "LLM base URL is required. Provide job.llmBaseUrl or set LLM_BASE_URL.",
+        session_id: "run-missing-base-url",
+      }),
+    }));
+    expect(parsed.map((msg) => msg.type)).toContain("SESSION_END");
+  });
+
+  it("passes the runner abort signal into the agent context", async () => {
+    const controller = new AbortController();
+    let observed: AgentRunContext | null = null;
+    const mockAgent: AgentClient = {
+      run(_prompt, _tools, context) {
+        observed = context;
+        return (async function* () {
+          yield { type: "done" as const };
+        })();
+      },
+    };
+    registerAgentBackend("test-abort-context", () => mockAgent);
+
+    await runPrompt(
+      {
+        task: "test",
+        sender: "test",
+        runId: "run-abort-context",
+        dagConfig: makeConfig(),
+      },
+      {
+        wsSend: () => {},
+        agentBackend: "test-abort-context",
+        abortSignal: controller.signal,
+      },
+    );
+
+    const finalObserved = observed as AgentRunContext | null;
+    expect(finalObserved?.abortSignal).toBe(controller.signal);
+  });
+
+  it("stops after handoff", async () => {
+    const mockAgent: AgentClient = {
+      run() {
+        return (async function* () {
+          yield { type: "text" as const, text: "before handoff" };
+          yield { type: "text" as const, text: "after handoff" };
+          yield { type: "done" as const };
+        })();
+      },
+    };
+    registerAgentBackend("test-handoff", () => mockAgent);
+
+    const sent: string[] = [];
+    const config = makeConfig();
+    // Pre-set yielded to simulate handoff happening during first text
+    // (In reality, handoff would be triggered by a tool call, but for
+    // this test we just verify the SESSION_END is always sent)
+
+    await runPrompt(
+      {
+        task: "test",
+        sender: "test",
+        runId: "run-2",
+        dagConfig: config,
+      },
+      {
+        wsSend: (d) => sent.push(d),
+        agentBackend: "test-handoff",
+      },
+    );
+
+    const types = sent.map((s) => JSON.parse(s).type);
+    expect(types).toContain("SESSION_END");
+  });
+
+  it("deterministic backend sends node_handoff from systemPrompt directive", async () => {
+    delete process.env.LLM_BASE_URL;
+    const sent: string[] = [];
+
+    await runPrompt(
+      {
+        task: "Initial user task wrapper",
+        sender: "test",
+        runId: "run-det",
+        dagConfig: {
+          ...makeConfig(),
+          node_id: "live_node",
+          agent_type: "deterministic",
+          graph_nodes: ["live_node"],
+          outgoing_edges: [{ from_port: "done", to_node: "", to_port: "" }],
+        },
+        systemPrompt: "  HANDOFF port=done content=Source Issue: #847\n\nArtifact: ok",
+      },
+      {
+        wsSend: (d) => sent.push(d),
+        agentBackend: "deterministic",
+      },
+    );
+
+    const parsed = sent.map((s) => JSON.parse(s));
+    const handoff = parsed.find((msg) => msg.type === "response");
+    expect(handoff?.data).toMatchObject({
+      type: "node_handoff",
+      runId: "run-det",
+      nodeId: "live_node",
+      port: "done",
+      content: "Source Issue: #847\n\nArtifact: ok",
+    });
+    expect(parsed.map((msg) => msg.type)).toContain("SESSION_END");
+  });
+});

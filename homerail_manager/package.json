@@ -1,0 +1,37 @@
+{
+  "name": "homerail-manager",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HomeRail TypeScript Manager service and DAG coordinator.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc --noEmit && vitest run",
+    "typecheck": "tsc --noEmit",
+    "prestart": "npm run build",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "widget": "tsx src/cli/widget.ts",
+    "audit": "npm audit --audit-level=high"
+  },
+  "engines": {
+    "node": ">=20",
+    "npm": ">=10"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "homerail-protocol": "file:../homerail_protocol",
+    "ws": "^8.18.0",
+    "yaml": "^2.4.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.22.4",
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.8"
+  }
+}

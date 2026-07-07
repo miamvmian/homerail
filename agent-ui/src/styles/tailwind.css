@@ -1,0 +1,15 @@
+/* src/styles/tailwind.css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+*:focus {
+    outline: none;
+    box-shadow: none;
+  }
+
+  /* 自定义下拉列表焦点样式 */
+  select:focus {
+    border-color: #cbd5e1; /* gray-300 */
+    box-shadow: 0 0 0 3px rgba(203, 213, 225, 0.2); /* gray-300 with 20% opacity */
+  }

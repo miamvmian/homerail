@@ -1,0 +1,138 @@
+/* Markdown 渲染样式 */
+.markdown-content {
+  font-size: 0.875rem;
+  line-height: 1.4;
+  color: #374151;
+
+  h1, h2, h3, h4 {
+    font-weight: 600;
+    margin-top: 0.3em;
+    margin-bottom: 0.2em;
+  }
+
+  h1 {
+    font-size: 1.4em;
+  }
+
+  h2 {
+    font-size: 1.2em;
+  }
+
+  h3 {
+    font-size: 1.1em;
+  }
+
+  h4 {
+    font-size: 1em;
+  }
+
+  p {
+    margin: 0.2em 0;
+  }
+
+  p:first-child {
+    margin-top: 0;
+  }
+
+  p:last-child {
+    margin-bottom: 0;
+  }
+
+  ul, ol {
+    margin: 0.3em 0;
+    padding-left: 1.3em;
+  }
+
+  ul {
+    list-style-type: disc;
+  }
+
+  ol {
+    list-style-type: decimal;
+  }
+
+  li {
+    margin: 0.1em 0;
+  }
+
+  li p {
+    margin: 0;
+  }
+
+  code {
+    background-color: #f3f4f6;
+    padding: 0.2em 0.3em;
+    border-radius: 0.25em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.875em;
+  }
+
+  pre {
+    background-color: #f3f4f6;
+    padding: 0.5em;
+    border-radius: 0.375em;
+    overflow-x: auto;
+    margin: 0.3em 0;
+
+    code {
+      background-color: transparent;
+      padding: 0;
+      border-radius: 0;
+    }
+  }
+
+  blockquote {
+    border-left: 3px solid #e5e7eb;
+    padding-left: 0.5em;
+    margin: 0.3em 0;
+    color: #6b7280;
+  }
+
+  a {
+    color: #2563eb;
+    text-decoration: none;
+
+    &:hover {
+      text-decoration: underline;
+    }
+  }
+
+  img {
+    max-width: 100%;
+    height: auto;
+    margin: 0.3em 0;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.3em 0;
+    font-size: 0.875em;
+
+    th, td {
+      border: 1px solid #e5e7eb;
+      padding: 0.3em 0.5em;
+      text-align: left;
+    }
+
+    th {
+      background-color: #f9fafb;
+      font-weight: 600;
+    }
+
+    tr:nth-child(even) {
+      background-color: #f9fafb;
+    }
+  }
+
+  hr {
+    border: 0;
+    border-top: 1px solid #e5e7eb;
+    margin: 0.5em 0;
+  }
+
+  /* 数学公式样式 */
+  .katex {
+    font-size: 1.1em;
+  }
+}

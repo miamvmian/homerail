@@ -1,0 +1,8 @@
+{
+  "content": [
+    {
+      "text": "{\"node_id\":\"coder\",\"predecessors\":[],\"successors\":[],\"available_ports\":[\"done\"],\"graph_nodes\":[\"coder\",\"tester\",\"reviewer\"]}",
+      "type": "text"
+    }
+  ]
+}

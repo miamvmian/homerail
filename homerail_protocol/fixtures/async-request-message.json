@@ -1,0 +1,15 @@
+{
+  "data": {},
+  "id": "00000000-0000-0000-0000-000000000006",
+  "operation": "build_start",
+  "parameters": {
+    "tag": "latest"
+  },
+  "priority": "high",
+  "resource_type": "build",
+  "spec": {
+    "dockerfile": "Dockerfile"
+  },
+  "timestamp": "2026-01-01T00:00:00+00:00",
+  "type": "async_request"
+}

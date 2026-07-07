@@ -1,0 +1,1621 @@
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as http from "node:http";
+import * as os from "node:os";
+import * as path from "node:path";
+import { spawnSync } from "node:child_process";
+import { getDataRoot } from "../config/env.js";
+import { encodeJson, getDb, parseJsonRow } from "../persistence/db.js";
+import { getProject } from "../persistence/projects-changes.js";
+import { readManagerAgentConfig, saveManagerAgentConfig } from "../persistence/manager-agent-config.js";
+import { normalizeStatus } from "../persistence/status.js";
+import {
+  resolveManagerAgentConfig,
+  type ManagerAgentContainerOptions,
+} from "./manager-agent-container.js";
+import { getUserVoiceRulesPath, loadVoiceUiRules, writeVoiceMemoWidget, type VoiceUiRules } from "./host-codex-manager-agent.js";
+import {
+  ManagerAgentRuntimeError,
+  managerAgentRuntimePlacement,
+  runManagerAgentTurn,
+  runManagerAgentTurnStream,
+  type RunManagerAgentTurnInput,
+} from "./manager-agent-runtime.js";
+import { validateConfigPatch } from "./manager-agent-config.js";
+import { managerAgentRuntimePlacementForHarness, normalizeManagerAgentHarness } from "homerail-protocol";
+import {
+  listWidgetFileTypes,
+  readWidgetFile,
+  removeWidgetFile,
+  validateWidgetToml,
+  widgetTomlExample,
+  writeWidgetFile,
+  type WidgetFileType,
+} from "../widgets/widget-file-protocol.js";
+import {
+  completeTurn,
+  getTurnStatus,
+  registerTurn,
+  withSessionLock,
+} from "./voice-session-registry.js";
+
+interface BaseResponse {
+  success: boolean;
+  message: string;
+  data?: unknown;
+  error?: string;
+}
+
+/** Distinguish 404 (workspace not found) from 400 (bad request) in lock-scoped flows. */
+class HttpNotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HttpNotFoundError";
+  }
+}
+
+class HttpBadRequestError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HttpBadRequestError";
+  }
+}
+
+type VoicePriority = "low" | "normal" | "high";
+
+interface VoiceWidget {
+  id: string;
+  type: string;
+  title: string;
+  body: string;
+  priority: VoicePriority;
+  status?: string | null;
+  items: string[];
+  steps: string[];
+  active_step?: number | null;
+  data: Record<string, unknown>;
+}
+
+interface VoiceUiRulesSnapshot {
+  hash: string;
+  sources: string[];
+  prompt_path: string;
+  created_at: string;
+}
+
+interface VoiceWorkspace {
+  session_id: string;
+  mode: "voice";
+  project_id?: string | null;
+  project_workspace_path?: string | null;
+  voice_assets_dir?: string | null;
+  voice_ui_rules?: VoiceUiRulesSnapshot | null;
+  manager_session_id?: string | null;
+  manager_run_id?: string | null;
+  manager_run_ids?: string[];
+  orchestrator_session_id?: string | null;
+  source_issue_number?: number | null;
+  source_issue_url?: string | null;
+  source_issue_title?: string | null;
+  session_title?: string | null;
+  session_slate: string;
+  active_objective?: string | null;
+  task_draft?: {
+    title: string;
+    request: string;
+    acceptance: string[];
+    constraints: string[];
+    status: "draft" | "clarifying" | "needs_confirmation" | "submitted";
+  } | null;
+  pending_confirmations: Array<{ id: string; kind: "submit_task" | "memory_write"; summary: string }>;
+  memory_refs: Array<{ id: string; title: string; summary: string; source: string }>;
+  conversation: Array<{ id: string; role: "user" | "assistant" | "system"; text: string; created_at: string; channel?: "final" | "commentary" }>;
+  debug_events: Array<{ id: string; level: "debug" | "info" | "warning" | "error"; code: string; message: string; created_at: string }>;
+  progress_brief: { status: string; short_text: string; updated_at: string };
+  widgets: VoiceWidget[];
+  ui_events: Array<Record<string, unknown>>;
+  codex_monitor_status?: "idle" | "running" | "done" | "failed";
+  codex_monitor_run_id?: string | null;
+  ended_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface VoiceTurnResult {
+  spoken_text: string;
+  suggested_action: "confirm" | null;
+  commentary_texts?: string[];
+}
+
+interface ManagerAgentHandoffResult extends VoiceTurnResult {
+  manager: Record<string, unknown>;
+  manager_status: Record<string, unknown>;
+}
+
+interface RealtimeSpeechEvent {
+  id: string;
+  channel: "commentary" | "final";
+  text: string;
+}
+
+interface ManagerAgentRealtimeHooks {
+  onSpeech?: (event: RealtimeSpeechEvent) => void;
+  streamedCommentaryTexts?: Set<string>;
+}
+
+const DEFAULT_VOICE_AGENT_CONFIG = {
+  agent_type: "voice_agent",
+  harness: "claude_agent_sdk",
+  llm_setting_id: null,
+  provider_name: null,
+  model_name: null,
+  reasoning_effort: "low",
+  system_prompt: "",
+  enabled_tools: [
+    "update_task_draft",
+    "submit_task",
+    "cancel_task",
+    "get_manager_status",
+    "show_status_card",
+    "show_list_card",
+    "show_progress_card",
+    "show_note_card",
+    "show_artifact_card",
+    "show_dynamic_widget",
+    "list_widgets",
+    "set_widget_state",
+    "remove_widget",
+  ],
+  session_policy: {
+    persist_conversation: true,
+    max_conversation_messages: 40,
+    persist_sdk_client: false,
+    repair_attempts: 1,
+    codex_loop_mode: "structured",
+  },
+};
+
+const USER_VOICE_UI_RULES_TEMPLATE = [
+  "# Voice Agent UI Rules",
+  "",
+  "这些规则会在新 voice session 创建时与内置基准规则合并并生成快照。",
+  "只写界面和交互偏好，不要写 API key、token、密码或临时任务内容。",
+  "",
+  "## Listening",
+  "- 优先使用 voice-memo 记录用户连续表达的需求。",
+  "- 用户还没说清范围、交付形式或是否执行前，先记录和确认，不要急着启动任务。",
+  "- 用户补充新信息时，更新已有 memo，并把已完成的 todo 标记完成。",
+  "",
+  "## Spoken Reply",
+  "- 口播保持一两句中文短回复。",
+  "- 长清单、证据、路径和执行状态放进 widget，不直接念出来。",
+  "",
+  "## Widgets",
+  "- 简单聊天不要创建执行状态卡。",
+  "- 需要记录需求时优先更新 voice-memo；只有真实 run 或阻塞才展示执行态势。",
+  "",
+].join("\n");
+
+const LEGACY_PROGRAMMATIC_WIDGET_IDS = new Set([
+  "manager-status",
+  "manager-progress",
+  "dag-progress",
+  "manager-run",
+  "manager-agent-blocker",
+]);
+
+function json(res: http.ServerResponse, status: number, body: BaseResponse) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+function ok(res: http.ServerResponse, message: string, data?: unknown) {
+  json(res, 200, { success: true, message, data });
+}
+
+function created(res: http.ServerResponse, message: string, data?: unknown) {
+  json(res, 201, { success: true, message, data });
+}
+
+function badRequest(res: http.ServerResponse, message: string) {
+  json(res, 400, { success: false, message, error: message });
+}
+
+function notFound(res: http.ServerResponse, message: string) {
+  json(res, 404, { success: false, message, error: message });
+}
+
+function serverError(res: http.ServerResponse, message: string) {
+  json(res, 500, { success: false, message, error: message });
+}
+
+function now(): string {
+  return new Date().toISOString();
+}
+
+function generateId(prefix = ""): string {
+  return `${prefix}${crypto.randomBytes(10).toString("hex")}`;
+}
+
+function artifactRoot(sessionId: string): string {
+  return path.join(getDataRoot(), "voice-agent-sdk", safeId(sessionId));
+}
+
+function safeId(value: string): string {
+  if (!/^[A-Za-z0-9_.-]+$/.test(value)) throw new Error("invalid voice session id");
+  return value;
+}
+
+function safeAssetSegment(value?: string | null): string {
+  const raw = String(value || "_global").trim() || "_global";
+  const safe = raw.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 96);
+  return safe || "_global";
+}
+
+function voiceAssetsDir(projectId?: string | null): string {
+  return path.join(getDataRoot(), "voice-agent-projects", safeAssetSegment(projectId), "assets");
+}
+
+function voiceUiRulesSnapshotPath(projectId: string | null | undefined, sessionId: string): string {
+  return path.join(voiceAssetsDir(projectId), "ui-rules", `${safeId(sessionId)}.md`);
+}
+
+function createVoiceUiRulesSnapshot(sessionId: string, projectId?: string | null): VoiceUiRulesSnapshot {
+  const rules = loadVoiceUiRules();
+  const promptPath = voiceUiRulesSnapshotPath(projectId, sessionId);
+  fs.mkdirSync(path.dirname(promptPath), { recursive: true });
+  fs.writeFileSync(promptPath, rules.prompt, { encoding: "utf8", mode: 0o600 });
+  try {
+    fs.chmodSync(promptPath, 0o600);
+  } catch {
+    // Best effort only; some mounted filesystems ignore chmod.
+  }
+  return {
+    hash: rules.hash,
+    sources: rules.sources,
+    prompt_path: promptPath,
+    created_at: now(),
+  };
+}
+
+function ensureWorkspaceVoiceUiRules(workspace: VoiceWorkspace): VoiceUiRules {
+  if (!workspace.voice_ui_rules || !fs.existsSync(workspace.voice_ui_rules.prompt_path)) {
+    workspace.voice_ui_rules = createVoiceUiRulesSnapshot(workspace.session_id, workspace.project_id);
+  }
+  const prompt = fs.readFileSync(workspace.voice_ui_rules.prompt_path, "utf8").trim();
+  if (!prompt) {
+    workspace.voice_ui_rules = createVoiceUiRulesSnapshot(workspace.session_id, workspace.project_id);
+    return ensureWorkspaceVoiceUiRules(workspace);
+  }
+  return {
+    prompt,
+    sources: workspace.voice_ui_rules.sources,
+    hash: workspace.voice_ui_rules.hash,
+  };
+}
+
+function readVoiceUiRulesAsset(createTemplate = false): Record<string, unknown> {
+  const file = getUserVoiceRulesPath();
+  if (createTemplate && !fs.existsSync(file)) {
+    writeVoiceUiRulesAsset(USER_VOICE_UI_RULES_TEMPLATE);
+  }
+  const exists = fs.existsSync(file);
+  const content = exists ? fs.readFileSync(file, "utf8") : "";
+  const stat = exists ? fs.statSync(file) : null;
+  const rules = loadVoiceUiRules();
+  return {
+    path: file,
+    exists,
+    content,
+    template: USER_VOICE_UI_RULES_TEMPLATE,
+    updated_at: stat ? stat.mtime.toISOString() : null,
+    effective_hash: rules.hash,
+    effective_sources: rules.sources,
+  };
+}
+
+function writeVoiceUiRulesAsset(content: string): void {
+  if (Buffer.byteLength(content, "utf8") > 40_000) {
+    throw new Error("Voice UI rules file is too large; keep it under 40 KB.");
+  }
+  const file = getUserVoiceRulesPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, content, { encoding: "utf8", mode: 0o600 });
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    // Best effort only; some mounted filesystems ignore chmod.
+  }
+}
+
+async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => { data += chunk; });
+    req.on("end", () => {
+      try {
+        const parsed = data ? JSON.parse(data) : {};
+        resolve(parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {});
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function voiceCompatConfig(config: Record<string, unknown>): Record<string, unknown> {
+  return { ...DEFAULT_VOICE_AGENT_CONFIG, ...config };
+}
+
+function readConfig(): Record<string, unknown> {
+  try {
+    return voiceCompatConfig(readManagerAgentConfig() as unknown as Record<string, unknown>);
+  } catch {
+    return voiceCompatConfig(DEFAULT_VOICE_AGENT_CONFIG);
+  }
+}
+
+function saveConfig(patch: Record<string, unknown>): Record<string, unknown> {
+  validateConfigPatch(patch);
+  const saved = saveManagerAgentConfig(patch) as unknown as Record<string, unknown>;
+  return voiceCompatConfig(saved);
+}
+
+function widgetFileRoutesHandler(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  pathname: string,
+  method: string,
+): boolean {
+  if (!pathname.startsWith("/api/voice-agent/widget-files")) return false;
+
+  if (method === "GET" && pathname === "/api/voice-agent/widget-files/types") {
+    ok(res, "Widget file types loaded", { types: listWidgetFileTypes() });
+    return true;
+  }
+
+  if (method === "POST" && pathname === "/api/voice-agent/widget-files/validate") {
+    readJsonBody(req)
+      .then((body) => {
+        const result = validateWidgetToml(
+          String(body.toml || ""),
+          String(body.widget_type || "") as WidgetFileType,
+        );
+        ok(res, "Widget file validated", result);
+      })
+      .catch((err) => badRequest(res, err instanceof Error ? err.message : "Invalid JSON body"));
+    return true;
+  }
+
+  if (method === "POST" && pathname === "/api/voice-agent/widget-files/write") {
+    readJsonBody(req)
+      .then((body) => {
+        const result = writeWidgetFile({
+          projectId: body.project_id,
+          sessionId: body.session_id,
+          widgetId: body.widget_id,
+          widgetType: String(body.widget_type || "") as WidgetFileType,
+          tomlContent: String(body.toml || ""),
+        });
+        ok(res, "Widget file written", result);
+      })
+      .catch((err) => badRequest(res, err instanceof Error ? err.message : "Invalid JSON body"));
+    return true;
+  }
+
+  if (method === "POST" && pathname === "/api/voice-agent/widget-files/voice-memo") {
+    readJsonBody(req)
+      .then((body) => {
+        const result = writeVoiceMemoWidget({
+          projectId: typeof body.project_id === "string" ? body.project_id : null,
+          sessionId: typeof body.session_id === "string" ? body.session_id : null,
+          input: body && typeof body.memo === "object" && !Array.isArray(body.memo)
+            ? body.memo as Record<string, unknown>
+            : body as Record<string, unknown>,
+        });
+        if (!result.write_result.ok) {
+          ok(res, "Voice memo widget rejected", {
+            ok: false,
+            errors: result.write_result.errors,
+            file: result.write_result.file,
+          });
+          return;
+        }
+        ok(res, "Voice memo widget written", {
+          ok: true,
+          memo_path: result.memo_path,
+          widget_id: result.widget_id,
+          status: result.status,
+          widget: result.widget,
+          file: result.write_result.file,
+        });
+      })
+      .catch((err) => badRequest(res, err instanceof Error ? err.message : "Invalid JSON body"));
+    return true;
+  }
+
+  if (method === "POST" && pathname === "/api/voice-agent/widget-files/read") {
+    readJsonBody(req)
+      .then((body) => {
+        const widgetType = typeof body.widget_type === "string" && body.widget_type.trim()
+          ? body.widget_type as WidgetFileType
+          : undefined;
+        const result = readWidgetFile({
+          projectId: body.project_id,
+          sessionId: body.session_id,
+          widgetId: body.widget_id,
+          widgetType,
+        });
+        ok(res, "Widget file read", result);
+      })
+      .catch((err) => badRequest(res, err instanceof Error ? err.message : "Invalid JSON body"));
+    return true;
+  }
+
+  if (method === "POST" && pathname === "/api/voice-agent/widget-files/remove") {
+    readJsonBody(req)
+      .then((body) => {
+        const result = removeWidgetFile({
+          projectId: body.project_id,
+          sessionId: body.session_id,
+          widgetId: body.widget_id,
+        });
+        ok(res, "Widget file removed", result);
+      })
+      .catch((err) => badRequest(res, err instanceof Error ? err.message : "Invalid JSON body"));
+    return true;
+  }
+
+  if (method === "POST" && pathname === "/api/voice-agent/widget-files/example") {
+    readJsonBody(req)
+      .then((body) => ok(res, "Widget TOML example loaded", {
+        widget_type: body.widget_type,
+        toml: widgetTomlExample(String(body.widget_type || "") as WidgetFileType),
+      }))
+      .catch((err) => badRequest(res, err instanceof Error ? err.message : "Invalid JSON body"));
+    return true;
+  }
+
+  badRequest(res, "Unsupported widget file route");
+  return true;
+}
+
+// ── Current-session pointer ───────────────────────────────────────────────
+// Single-user system: the server is the single source of truth for "which
+// session is the user currently viewing". Stored as a dedicated row
+// (id="current_session") in voice_agent_config, isolated from the legacy
+// default config document. Manager Agent runtime config lives only in
+// manager_agent_config.
+const CURRENT_SESSION_ROW_ID = "current_session";
+
+function getCurrentSessionId(): string | null {
+  try {
+    const row = getDb()
+      .prepare("SELECT data FROM voice_agent_config WHERE id = ?")
+      .get(CURRENT_SESSION_ROW_ID) as { data: string } | undefined;
+    if (!row) return null;
+    const parsed = parseJsonRow<{ session_id?: string }>(row.data);
+    return typeof parsed.session_id === "string" && parsed.session_id ? parsed.session_id : null;
+  } catch {
+    return null;
+  }
+}
+
+function setCurrentSessionId(sessionId: string | null): void {
+  const data = encodeJson({ session_id: sessionId });
+  getDb()
+    .prepare(`
+      INSERT INTO voice_agent_config(id, updated_at, data) VALUES (?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at, data = excluded.data
+    `)
+    .run(CURRENT_SESSION_ROW_ID, now(), data);
+}
+
+function projectWorkspacePath(projectId?: string | null): string | null {
+  if (!projectId) return null;
+  const project = getProject(projectId);
+  const raw = project?.workspace_path ?? project?.project_root;
+  if (!raw) return null;
+  const resolved = path.resolve(raw.replace(/^~/, process.env.HOME || ""));
+  return fs.existsSync(resolved) && fs.statSync(resolved).isDirectory() ? resolved : null;
+}
+
+function newWorkspace(projectId?: string | null): VoiceWorkspace {
+  const timestamp = now();
+  const sessionId = generateId("voice-");
+  const assetsDir = voiceAssetsDir(projectId);
+  return {
+    session_id: sessionId,
+    mode: "voice",
+    project_id: projectId ?? null,
+    project_workspace_path: projectWorkspacePath(projectId),
+    voice_assets_dir: assetsDir,
+    voice_ui_rules: createVoiceUiRulesSnapshot(sessionId, projectId),
+    manager_session_id: null,
+    manager_run_id: null,
+    manager_run_ids: [],
+    orchestrator_session_id: null,
+    source_issue_number: null,
+    source_issue_url: null,
+    source_issue_title: null,
+    session_title: null,
+    session_slate: "",
+    active_objective: null,
+    task_draft: null,
+    pending_confirmations: [],
+    memory_refs: [],
+    conversation: [],
+    debug_events: [],
+    progress_brief: { status: "idle", short_text: "", updated_at: timestamp },
+    widgets: [],
+    ui_events: [],
+    codex_monitor_status: "idle",
+    codex_monitor_run_id: null,
+    ended_at: null,
+    created_at: timestamp,
+    updated_at: timestamp,
+  };
+}
+
+function workspaceRunIds(workspace: VoiceWorkspace): string[] {
+  const values = [
+    ...(Array.isArray(workspace.manager_run_ids) ? workspace.manager_run_ids : []),
+    ...(workspace.manager_run_id ? [workspace.manager_run_id] : []),
+  ].map((item) => String(item || "").trim()).filter(Boolean);
+  return Array.from(new Set(values));
+}
+
+function syncWorkspaceRunIds(workspace: VoiceWorkspace, runIds: string[]): void {
+  const unique = Array.from(new Set(runIds.map((item) => item.trim()).filter(Boolean)));
+  workspace.manager_run_ids = unique;
+  workspace.manager_run_id = unique.length ? unique[unique.length - 1] : null;
+}
+
+function syncVoiceWorkspaceTables(workspace: VoiceWorkspace): void {
+  const db = getDb();
+  const sessionStatus = workspace.progress_brief.status === "error" ? "failed" : workspace.progress_brief.status;
+  const runIds = workspaceRunIds(workspace);
+  db.prepare(`
+    INSERT INTO sessions(
+      id, session_id, session_type, project_id, status, prompt, start_time,
+      end_time, message_count, run_ids, created_at, updated_at, data
+    )
+    VALUES (?, ?, 'voice_agent', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(session_id) DO UPDATE SET
+      project_id = excluded.project_id,
+      status = excluded.status,
+      prompt = excluded.prompt,
+      end_time = excluded.end_time,
+      message_count = excluded.message_count,
+      run_ids = excluded.run_ids,
+      updated_at = excluded.updated_at,
+      data = excluded.data
+  `).run(
+    workspace.session_id,
+    workspace.session_id,
+    workspace.project_id ?? null,
+    normalizeStatus("session", sessionStatus, "idle"),
+    workspace.session_title || workspace.session_slate || workspace.active_objective || null,
+    workspace.created_at,
+    workspace.ended_at ?? null,
+    workspace.conversation.length,
+    encodeJson(runIds),
+    workspace.created_at,
+    workspace.updated_at,
+    encodeJson(workspace),
+  );
+
+  db.prepare("DELETE FROM session_messages WHERE session_id = ?").run(workspace.session_id);
+  const messageStmt = db.prepare(`
+    INSERT INTO session_messages(id, session_id, sequence, message_type, content, metadata, timestamp, synced, data)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+  `);
+  workspace.conversation.forEach((message, index) => {
+    messageStmt.run(
+      `${workspace.session_id}:${message.id}`,
+      workspace.session_id,
+      index + 1,
+      message.role,
+      message.text,
+      encodeJson({ channel: message.channel ?? "final" }),
+      message.created_at,
+      encodeJson(message),
+    );
+  });
+
+  db.prepare("DELETE FROM voice_ui_events WHERE session_id = ?").run(workspace.session_id);
+  const eventStmt = db.prepare(`
+    INSERT INTO voice_ui_events(
+      id, session_id, voice_message_id, sequence, event_type, widget_id,
+      widget_type, payload, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  workspace.ui_events.forEach((event, index) => {
+    const eventId = typeof event.id === "string" ? event.id : `${workspace.session_id}:evt:${index}`;
+    eventStmt.run(
+      eventId,
+      workspace.session_id,
+      typeof event.voice_message_id === "string" ? event.voice_message_id : null,
+      typeof event.sequence === "number" ? event.sequence : index,
+      typeof event.event_type === "string" ? event.event_type : "voice_event",
+      typeof event.widget_id === "string" ? event.widget_id : null,
+      typeof event.widget_type === "string" ? event.widget_type : null,
+      encodeJson(event.payload ?? event),
+      typeof event.created_at === "string" ? event.created_at : workspace.updated_at,
+    );
+  });
+}
+
+function saveWorkspace(workspace: VoiceWorkspace): VoiceWorkspace {
+  workspace.updated_at = now();
+  sanitizeLegacyProgrammaticWidgets(workspace);
+  const db = getDb();
+  db.transaction(() => {
+    // Canonical voice workspace body storage: the voice UI reads this JSON blob.
+    // syncVoiceWorkspaceTables below maintains query/index projections.
+    db.prepare(`
+        INSERT INTO voice_agent_sessions(session_id, project_id, updated_at, data)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+          project_id = excluded.project_id,
+          updated_at = excluded.updated_at,
+          data = excluded.data
+      `)
+      .run(workspace.session_id, workspace.project_id ?? null, workspace.updated_at, encodeJson(workspace));
+    syncVoiceWorkspaceTables(workspace);
+  })();
+  return workspace;
+}
+
+function loadWorkspace(sessionId: string): VoiceWorkspace | undefined {
+  try {
+    const row = getDb()
+      .prepare("SELECT data FROM voice_agent_sessions WHERE session_id = ?")
+      .get(safeId(sessionId)) as { data: string } | undefined;
+    return row ? sanitizeLegacyProgrammaticWidgets(parseJsonRow<VoiceWorkspace>(row.data)) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function listWorkspaces(projectId?: string | null, limit = 30): VoiceWorkspace[] {
+  const rows = projectId
+    ? getDb()
+        .prepare("SELECT data FROM voice_agent_sessions WHERE project_id = ? ORDER BY updated_at DESC LIMIT ?")
+        .all(projectId, Math.max(1, Math.min(limit, 200))) as Array<{ data: string }>
+    : getDb()
+        .prepare("SELECT data FROM voice_agent_sessions ORDER BY updated_at DESC LIMIT ?")
+        .all(Math.max(1, Math.min(limit, 200))) as Array<{ data: string }>;
+  return rows
+    .map((row) => {
+      try {
+        return sanitizeLegacyProgrammaticWidgets(parseJsonRow<VoiceWorkspace>(row.data));
+      } catch {
+        return undefined;
+      }
+    })
+    .filter((item): item is VoiceWorkspace => Boolean(item))
+    .filter((item) => !projectId || item.project_id === projectId)
+    .slice(0, Math.max(1, Math.min(limit, 200)));
+}
+
+function sanitizeLegacyProgrammaticWidgets(workspace: VoiceWorkspace): VoiceWorkspace {
+  workspace.widgets = (workspace.widgets ?? []).filter((widget) => !LEGACY_PROGRAMMATIC_WIDGET_IDS.has(widget.id));
+  return workspace;
+}
+
+function sessionItem(workspace: VoiceWorkspace): Record<string, unknown> {
+  const runIds = workspaceRunIds(workspace);
+  return {
+    session_id: workspace.session_id,
+    project_id: workspace.project_id ?? null,
+    status: workspace.progress_brief.status || "idle",
+    title: workspace.session_title || null,
+    prompt: workspace.session_slate || workspace.active_objective || null,
+    start_time: workspace.created_at,
+    end_time: workspace.ended_at ?? null,
+    message_count: workspace.conversation.length,
+    run_ids: runIds,
+    duration_seconds: null,
+  };
+}
+
+function appendConversation(workspace: VoiceWorkspace, role: "user" | "assistant" | "system", text: string, channel: "final" | "commentary" = "final") {
+  workspace.conversation.push({ id: generateId("msg-"), role, text, channel, created_at: now() });
+  workspace.conversation = workspace.conversation.slice(-80);
+}
+
+function upsertWidget(workspace: VoiceWorkspace, widget: VoiceWidget): void {
+  workspace.widgets = [widget, ...workspace.widgets.filter((item) => item.id !== widget.id)].slice(0, 12);
+  workspace.ui_events.push({
+    id: generateId("evt-"),
+    session_id: workspace.session_id,
+    sequence: workspace.ui_events.length,
+    event_type: "upsert_widget",
+    widget_id: widget.id,
+    widget_type: widget.type,
+    payload: { widget },
+    created_at: now(),
+  });
+  workspace.ui_events = workspace.ui_events.slice(-200);
+}
+
+function removeWidget(workspace: VoiceWorkspace, widgetId: string): void {
+  const next = workspace.widgets.filter((item) => item.id !== widgetId);
+  if (next.length === workspace.widgets.length) return;
+  workspace.widgets = next;
+  workspace.ui_events.push({
+    id: generateId("evt-"),
+    session_id: workspace.session_id,
+    sequence: workspace.ui_events.length,
+    event_type: "remove_widget",
+    widget_id: widgetId,
+    widget_type: "unknown",
+    payload: {},
+    created_at: now(),
+  });
+  workspace.ui_events = workspace.ui_events.slice(-200);
+}
+
+function voiceEvents(text: string, commentary: string[] = []) {
+  const events = commentary.filter(Boolean).map((item) => ({ id: generateId("speech-"), channel: "commentary", text: item }));
+  if (text.trim()) events.push({ id: generateId("speech-"), channel: "final", text });
+  return events;
+}
+
+function shortText(text: string, maxLength: number): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= maxLength) return trimmed;
+  return `${trimmed.slice(0, Math.max(1, maxLength - 1))}…`;
+}
+
+function voiceSessionTitleFromUserText(text: string): string {
+  const clean = text.replace(/\s+/g, " ").trim();
+  const firstSentence = clean.split(/[。！？!?；;\r\n]/)[0]?.trim() || clean;
+  return shortText(firstSentence.replace(/[。！？!?；;，,、\s]+$/g, ""), 80);
+}
+
+function ensureVoiceSessionTitle(workspace: VoiceWorkspace, text: string): void {
+  if (workspace.session_title?.trim()) return;
+  const title = voiceSessionTitleFromUserText(text);
+  if (title) workspace.session_title = title;
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map((item) => String(item).trim()).filter(Boolean).slice(0, 8)
+    : [];
+}
+
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function cleanSpokenText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function normalizeProgressStatus(value: unknown, fallback: string): string {
+  const status = typeof value === "string" ? value.trim() : "";
+  if ([
+    "idle",
+    "clarifying",
+    "needs_confirmation",
+    "waiting_for_confirmation",
+    "submitted",
+    "running",
+    "blocked",
+    "done",
+    "failed",
+  ].includes(status)) {
+    return status;
+  }
+  if (status === "error") return "failed";
+  return fallback;
+}
+
+function normalizeWidget(raw: unknown): VoiceWidget | null {
+  const item = objectValue(raw);
+  if (!item) return null;
+  const title = String(item.title || "").trim();
+  if (!title) return null;
+  const priority = item.priority === "low" || item.priority === "high" ? item.priority : "normal";
+  const activeStep = typeof item.active_step === "number" && Number.isFinite(item.active_step)
+    ? Math.max(0, Math.floor(item.active_step))
+    : null;
+  const type = String(item.type || "note").trim() || "note";
+  const explicitId = String(item.id || "").trim();
+  // 无显式 id 时基于 type+title 生成稳定 id，让同类型同标题的 widget 能被后续覆盖而非重复堆积
+  const id = explicitId || `widget-${type}-${title.slice(0, 24)}`;
+  return {
+    id,
+    type,
+    title: shortText(title, 80),
+    body: typeof item.body === "string" ? item.body.trim() : "",
+    priority,
+    status: typeof item.status === "string" && item.status.trim() ? shortText(item.status, 40) : null,
+    items: stringList(item.items),
+    steps: stringList(item.steps),
+    active_step: activeStep,
+    data: objectValue(item.data) ?? {},
+  };
+}
+
+function applyTaskDraftPatch(workspace: VoiceWorkspace, raw: unknown, fallbackText: string): boolean {
+  const patch = objectValue(raw);
+  if (!patch) return false;
+  const request = String(patch.request || patch.summary || fallbackText).trim();
+  const title = String(patch.title || request || fallbackText).trim();
+  if (!request && !title) return false;
+  const rawStatus = typeof patch.status === "string" ? patch.status.trim() : "";
+  const status = rawStatus === "draft" || rawStatus === "needs_confirmation" || rawStatus === "submitted"
+    ? rawStatus
+    : "clarifying";
+  workspace.session_slate = request || fallbackText;
+  workspace.task_draft = {
+    title: shortText(title || request || fallbackText || "语音任务", 24),
+    request: request || fallbackText,
+    acceptance: stringList(patch.acceptance),
+    constraints: stringList(patch.constraints),
+    status,
+  };
+  workspace.active_objective = request || fallbackText;
+  if (status === "needs_confirmation") {
+    workspace.pending_confirmations = [{ id: "submit-task", kind: "submit_task", summary: workspace.task_draft.title }];
+    workspace.progress_brief = { status: "waiting_for_confirmation", short_text: "等待确认", updated_at: now() };
+  } else {
+    workspace.pending_confirmations = [];
+    workspace.progress_brief = { status: status === "draft" ? "clarifying" : status, short_text: "已整理任务草稿", updated_at: now() };
+  }
+  upsertWidget(workspace, {
+    id: "task-draft",
+    type: "task_draft",
+    title: workspace.task_draft.title,
+    body: workspace.task_draft.request,
+    priority: "normal",
+    status: workspace.task_draft.status,
+    items: workspace.task_draft.acceptance,
+    steps: workspace.task_draft.constraints,
+    active_step: 0,
+    data: { task_draft: workspace.task_draft },
+  });
+  return true;
+}
+
+function applyVoiceSurfaceFromResult(workspace: VoiceWorkspace, result: Record<string, unknown>, fallbackText: string): boolean {
+  const surface = objectValue(result.voice_surface);
+  let changed = false;
+  const taskDraft = objectValue(surface?.task_draft) ?? objectValue(result.task_draft) ?? objectValue(result.task_draft_patch);
+  if (taskDraft && applyTaskDraftPatch(workspace, taskDraft, fallbackText)) changed = true;
+
+  const progress = objectValue(surface?.progress) ?? objectValue(result.progress);
+  if (progress) {
+    workspace.progress_brief = {
+      status: normalizeProgressStatus(progress.status, workspace.progress_brief.status || "done"),
+      short_text: shortText(String(progress.short_text || workspace.progress_brief.short_text || fallbackText || "状态已更新"), 80),
+      updated_at: now(),
+    };
+    changed = true;
+  }
+
+  // 优先用 voice_surface.widgets；只有 surface 缺失时才回退到顶层 result.widgets，
+  // 避免两边同一数据被各生成一个 id 导致重复卡片。
+  const rawWidgets = Array.isArray(surface?.widgets) && surface.widgets.length
+    ? surface.widgets
+    : (Array.isArray(result.widgets) ? result.widgets : []);
+  for (const rawWidget of rawWidgets) {
+    const widget = normalizeWidget(rawWidget);
+    if (widget) {
+      upsertWidget(workspace, widget);
+      changed = true;
+    }
+  }
+
+  const removeIds = [
+    ...(Array.isArray(surface?.remove_widget_ids) ? surface.remove_widget_ids : []),
+    ...(Array.isArray(result.remove_widget_ids) ? result.remove_widget_ids : []),
+  ].map((item) => String(item || "").trim()).filter(Boolean);
+  for (const id of removeIds) {
+    removeWidget(workspace, id);
+    changed = true;
+  }
+  return changed;
+}
+
+function voiceSpokenText(raw: string, runIds: string[], status: string): string {
+  const clean = cleanSpokenText(raw);
+  if (runIds.length) return "已启动执行，我会继续跟进。";
+  if (status === "blocked" || status === "failed") return "处理被阻塞，原因已放到屏幕上。";
+  return shortText(clean || "已处理。", 80);
+}
+
+function appendDebugEvent(
+  workspace: VoiceWorkspace,
+  code: string,
+  message: string,
+  level: "debug" | "info" | "warning" | "error" = "info",
+): void {
+  workspace.debug_events.push({
+    id: generateId("debug-"),
+    code,
+    message: shortText(message, 500),
+    level,
+    created_at: now(),
+  });
+  workspace.debug_events = workspace.debug_events.slice(-80);
+}
+
+function confirmedTaskMessage(workspace: VoiceWorkspace, fallbackText = ""): string {
+  const draft = workspace.task_draft;
+  if (!draft) return fallbackText || workspace.session_slate || workspace.active_objective || "用户已确认执行当前任务。";
+  const sections = [
+    "用户已确认执行以下任务。请使用主 Agent 工具执行真实操作；如果不能执行，返回真实阻塞原因，不要假装已经启动 DAG 或创建产物。",
+    `标题：${draft.title}`,
+    `请求：${draft.request}`,
+  ];
+  if (draft.acceptance.length) sections.push(`验收：${draft.acceptance.join("；")}`);
+  if (draft.constraints.length) sections.push(`约束：${draft.constraints.join("；")}`);
+  return sections.join("\n");
+}
+
+function managerAgentHistory(workspace: VoiceWorkspace): Array<{ role: string; content: string; timestamp?: string }> {
+  return (workspace.conversation ?? []).slice(-24).map((item) => ({
+    role: item.role,
+    content: item.text,
+    timestamp: item.created_at,
+  }));
+}
+
+function markManagerAgentBlocker(workspace: VoiceWorkspace, code: string, message: string): ManagerAgentHandoffResult {
+  appendDebugEvent(workspace, code, message, "error");
+  const spoken = code === "manager_agent_unavailable"
+    ? `主 Agent 执行入口不可用：${message}`
+    : `主 Agent 执行失败：${message}`;
+  workspace.progress_brief = { status: "error", short_text: shortText(spoken, 80), updated_at: now() };
+  removeWidget(workspace, "manager-agent-blocker");
+  removeWidget(workspace, "manager-run");
+  appendConversation(workspace, "assistant", spoken);
+  return { spoken_text: spoken, suggested_action: null, manager: { error: message, code }, manager_status: managerStatus(workspace) };
+}
+
+async function submitVoiceWorkspaceToManagerAgent(
+  workspace: VoiceWorkspace,
+  message: string,
+  config: Record<string, unknown>,
+  options?: ManagerAgentContainerOptions,
+  realtimeHooks?: ManagerAgentRealtimeHooks,
+): Promise<ManagerAgentHandoffResult> {
+  if (workspace.task_draft) workspace.task_draft.status = "submitted";
+  workspace.pending_confirmations = [];
+  workspace.progress_brief = { status: "submitted", short_text: "已确认，主 Agent 正在处理。", updated_at: now() };
+
+  const requestedHarness = normalizeManagerAgentHarness(config.harness) ?? "claude_agent_sdk";
+  if (!options && managerAgentRuntimePlacementForHarness(requestedHarness) === "container") {
+    return markManagerAgentBlocker(workspace, "manager_agent_unavailable", "当前服务未启用容器执行入口");
+  }
+
+  let agentConfig;
+  try {
+    const settingId = typeof config.llm_setting_id === "string" ? config.llm_setting_id : undefined;
+    const providerName = typeof config.provider_name === "string" ? config.provider_name : undefined;
+    const modelName = typeof config.model_name === "string" ? config.model_name : undefined;
+    const reasoningEffort = typeof config.reasoning_effort === "string" ? config.reasoning_effort : undefined;
+    agentConfig = resolveManagerAgentConfig(workspace.project_id ?? undefined, providerName, modelName, settingId, requestedHarness, reasoningEffort);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    return markManagerAgentBlocker(workspace, "manager_config_error", detail);
+  }
+
+  let result: Record<string, unknown>;
+  try {
+    const voiceUiRules = ensureWorkspaceVoiceUiRules(workspace);
+    const turnInput: RunManagerAgentTurnInput = {
+      message,
+      project_id: workspace.project_id ?? undefined,
+      session_id: workspace.manager_session_id ?? undefined,
+      voice_session_id: workspace.session_id,
+      continue_chat: true,
+      response_mode: "voice",
+      history: managerAgentHistory(workspace),
+      agent_config: agentConfig,
+      voice_ui_rules: voiceUiRules,
+    };
+    if (realtimeHooks?.onSpeech) {
+      let streamResult: Awaited<ReturnType<typeof runManagerAgentTurn>> | undefined;
+      for await (const event of runManagerAgentTurnStream(turnInput, options)) {
+        if (event.type === "commentary") {
+          const text = shortText(String(event.text || "").trim(), 120);
+          if (!text) continue;
+          appendConversation(workspace, "assistant", text, "commentary");
+          realtimeHooks.streamedCommentaryTexts?.add(text);
+          realtimeHooks.onSpeech({ id: generateId("speech-"), channel: "commentary", text });
+        } else if (event.type === "result") {
+          streamResult = event.result;
+        }
+      }
+      if (!streamResult) throw new Error("Manager Agent stream completed without a result");
+      result = streamResult.result;
+    } else {
+      const turn = await runManagerAgentTurn(turnInput, options);
+      result = turn.result;
+    }
+  } catch (err) {
+    if (err instanceof ManagerAgentRuntimeError) {
+      if (err.code === "manager_container_options_missing") {
+        return markManagerAgentBlocker(workspace, "manager_agent_unavailable", "当前服务未启用容器执行入口");
+      }
+      if (err.code === "manager_container_error") {
+        return markManagerAgentBlocker(workspace, "manager_container_error", err.message);
+      }
+      return markManagerAgentBlocker(workspace, "manager_chat_error", err.message);
+    }
+    const detail = err instanceof Error ? err.message : String(err);
+    if (!options && managerAgentRuntimePlacement(agentConfig) === "container") {
+      return markManagerAgentBlocker(workspace, "manager_agent_unavailable", "当前服务未启用容器执行入口");
+    }
+    return markManagerAgentBlocker(workspace, "manager_chat_error", detail);
+  }
+
+  const reply = typeof result.text === "string" && result.text.trim()
+    ? result.text.trim()
+    : "主 Agent 已处理。";
+  const surface = objectValue(result.voice_surface);
+  const surfaceCommentary = Array.isArray(surface?.commentary_texts) ? surface.commentary_texts : [];
+  const alreadyStreamed = realtimeHooks?.streamedCommentaryTexts ?? new Set<string>();
+  const commentaryTexts = [
+    ...(Array.isArray(result.commentary_texts) ? result.commentary_texts : []),
+    ...surfaceCommentary,
+  ]
+    .map((item) => shortText(String(item || "").trim(), 120))
+    .filter((item) => item && !alreadyStreamed.has(item))
+    .slice(0, 6);
+  const runId = typeof result.run_id === "string" && result.run_id.trim() ? result.run_id.trim() : undefined;
+  const runIds = Array.isArray(result.run_ids)
+    ? result.run_ids.map((item) => String(item || "").trim()).filter(Boolean)
+    : runId
+      ? [runId]
+      : [];
+
+  if (typeof result.session_id === "string" && result.session_id.trim()) workspace.manager_session_id = result.session_id.trim();
+  if (runIds.length) {
+    syncWorkspaceRunIds(workspace, runIds);
+  }
+
+  const objective = result.objective && typeof result.objective === "object" ? result.objective as Record<string, unknown> : null;
+  const status = objective?.satisfied === false ? "blocked" : "done";
+  const updatedAt = now();
+  workspace.ended_at = updatedAt;
+  workspace.progress_brief = {
+    status,
+    short_text: runIds.length ? "主 Agent 已启动执行" : shortText(reply, 80),
+    updated_at: updatedAt,
+  };
+  applyVoiceSurfaceFromResult(workspace, result, reply);
+  const spoken = voiceSpokenText(
+    typeof result.spoken_text === "string" && result.spoken_text.trim() ? result.spoken_text.trim() : reply,
+    runIds,
+    workspace.progress_brief.status || status,
+  );
+  // 生成式 UI 只能来自 Agent 显式返回的 voice_surface.widgets/show_* 工具结果；
+  // Manager 执行状态只写 progress_brief/manager_run_id，不在这里程序化插入 status widget。
+  removeWidget(workspace, "manager-run");
+  removeWidget(workspace, "manager-agent-blocker");
+  for (const commentary of commentaryTexts) {
+    appendConversation(workspace, "assistant", commentary, "commentary");
+  }
+  appendConversation(workspace, "assistant", spoken);
+  return {
+    spoken_text: spoken,
+    suggested_action: null,
+    commentary_texts: commentaryTexts,
+    manager: {
+      text: reply,
+      session_id: workspace.manager_session_id ?? null,
+      run_id: workspace.manager_run_id ?? null,
+      run_ids: runIds,
+      runtime_placement: agentConfig.runtime_placement,
+      objective,
+      effective_config: objectValue(result.effective_config) ?? null,
+      tool_calls: Array.isArray(result.tool_calls) ? result.tool_calls : [],
+      tool_results: Array.isArray(result.tool_results) ? result.tool_results : [],
+    },
+    manager_status: managerStatus(workspace),
+  };
+}
+
+async function processTurn(
+  workspace: VoiceWorkspace,
+  text: string,
+  options?: ManagerAgentContainerOptions,
+  realtimeHooks?: ManagerAgentRealtimeHooks,
+): Promise<VoiceTurnResult> {
+  appendConversation(workspace, "user", text);
+  ensureVoiceSessionTitle(workspace, text);
+  const config = readConfig();
+
+  // 真实调用 Manager Agent：与文本模式 /api/manager/chat 走同一条链路。
+  // voice agent 和 manager agent 是同一个主 Agent 的不同 I/O 表面。
+  return submitVoiceWorkspaceToManagerAgent(workspace, text, config, options, realtimeHooks);
+}
+
+function managerStatus(workspace: VoiceWorkspace): Record<string, unknown> {
+  // 优先用进程注册表的实时状态（turn 正在跑时 SQLite blob 还没更新）。
+  const liveStatus = getTurnStatus(workspace.session_id);
+  return {
+    manager_session_id: workspace.manager_session_id ?? null,
+    manager_run_id: workspace.manager_run_id ?? null,
+    manager_status: liveStatus ?? workspace.progress_brief.status ?? "idle",
+    run: workspace.manager_run_id ? { run_id: workspace.manager_run_id } : null,
+    dag: null,
+  };
+}
+
+function streamLine(res: http.ServerResponse, event: Record<string, unknown>): void {
+  res.write(`${JSON.stringify(event)}\n`);
+}
+
+function resolveArtifact(sessionId: string, filePath = "index.html"): string {
+  const root = path.resolve(artifactRoot(sessionId));
+  const relative = decodeURIComponent(filePath || "index.html").replace(/^\/+/, "");
+  const candidate = path.resolve(root, relative);
+  if (candidate !== root && !candidate.startsWith(`${root}${path.sep}`)) {
+    throw new Error("invalid artifact path");
+  }
+  if (!fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) {
+    throw new Error("voice artifact file not found");
+  }
+  return candidate;
+}
+
+export function _clearStoredConfig(): void {
+  const db = getDb();
+  db.transaction(() => {
+    db.prepare("DELETE FROM voice_agent_config").run();
+    db.prepare("DELETE FROM manager_agent_config").run();
+    db.prepare("DELETE FROM voice_ui_events").run();
+    db.prepare("DELETE FROM session_messages WHERE session_id IN (SELECT session_id FROM sessions WHERE session_type = 'voice_agent')").run();
+    db.prepare("DELETE FROM sessions WHERE session_type = 'voice_agent'").run();
+    db.prepare("DELETE FROM voice_agent_sessions").run();
+  })();
+}
+
+export function voiceAgentBootstrapHandler(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  managerAgentOptions?: ManagerAgentContainerOptions,
+): boolean {
+  const url = new URL(req.url || "/", "http://localhost");
+  const pathname = url.pathname;
+  const method = req.method || "GET";
+
+  if (widgetFileRoutesHandler(req, res, pathname, method)) {
+    return true;
+  }
+
+  if (method === "GET" && pathname === "/api/voice-agent/config") {
+    ok(res, "Voice Agent config loaded", readConfig());
+    return true;
+  }
+
+  if (method === "GET" && pathname === "/api/voice-agent/ui-rules") {
+    try {
+      const createTemplate = url.searchParams.get("create") === "1" || url.searchParams.get("create") === "true";
+      ok(res, "Voice UI rules loaded", readVoiceUiRulesAsset(createTemplate));
+    } catch (err) {
+      serverError(res, err instanceof Error ? err.message : String(err));
+    }
+    return true;
+  }
+
+  if (method === "PUT" && pathname === "/api/voice-agent/ui-rules") {
+    readJsonBody(req)
+      .then((body) => {
+        const content = body.reset_to_template === true
+          ? USER_VOICE_UI_RULES_TEMPLATE
+          : typeof body.content === "string"
+            ? body.content
+            : "";
+        writeVoiceUiRulesAsset(content);
+        ok(res, "Voice UI rules saved", readVoiceUiRulesAsset(false));
+      })
+      .catch((err) => serverError(res, err instanceof Error ? err.message : String(err)));
+    return true;
+  }
+
+  // Codex 可用性检测：检查 CLI 是否安装 + 是否有登录态
+  if (method === "GET" && pathname === "/api/voice-agent/codex-status") {
+    const codexBin = process.env.HOMERAIL_CODEX_BIN || "codex";
+    let available = false;
+    let version: string | undefined;
+    try {
+      const result = spawnSync(codexBin, ["--version"], {
+        timeout: 5_000,
+        encoding: "utf-8",
+        env: process.env,
+      });
+      if (result.status === 0) {
+        available = true;
+        version = (result.stdout || "").trim().split("\n")[0] || undefined;
+      }
+    } catch {
+      available = false;
+    }
+    // 检查登录态：~/.codex/auth.json 存在且非空
+    let loggedIn = false;
+    try {
+      const authPath = path.join(os.homedir(), ".codex", "auth.json");
+      if (fs.existsSync(authPath)) {
+        const content = fs.readFileSync(authPath, "utf-8").trim();
+        loggedIn = content.length > 0 && content !== "{}";
+      }
+    } catch {
+      loggedIn = false;
+    }
+    ok(res, "Codex status checked", { available, logged_in: loggedIn, version });
+    return true;
+  }
+
+  if (method === "PUT" && pathname === "/api/voice-agent/config") {
+    readJsonBody(req)
+      .then((body) => ok(res, "Voice Agent config saved", saveConfig(body)))
+      .catch((err) => serverError(res, err instanceof Error ? err.message : String(err)));
+    return true;
+  }
+
+  if (method === "POST" && pathname === "/api/voice-agent/sessions") {
+    readJsonBody(req)
+      .then((body) => {
+        const projectId = typeof body.project_id === "string" ? body.project_id : null;
+        created(res, "Voice session created", saveWorkspace(newWorkspace(projectId)));
+      })
+      .catch((err) => badRequest(res, err instanceof Error ? err.message : "Invalid JSON body"));
+    return true;
+  }
+
+  if (method === "GET" && pathname === "/api/voice-agent/sessions") {
+    const projectId = url.searchParams.get("project_id");
+    const limit = Number(url.searchParams.get("limit") || "30") || 30;
+    ok(res, "ok", { sessions: listWorkspaces(projectId, limit).map(sessionItem) });
+    return true;
+  }
+
+  if (method === "GET" && pathname === "/api/voice-agent/current-session") {
+    ok(res, "ok", { session_id: getCurrentSessionId() });
+    return true;
+  }
+
+  if (method === "PUT" && pathname === "/api/voice-agent/current-session") {
+    readJsonBody(req)
+      .then((body) => {
+        const sessionId = typeof body.session_id === "string" ? body.session_id : null;
+        setCurrentSessionId(sessionId);
+        ok(res, "ok", { session_id: sessionId });
+      })
+      .catch((err) => badRequest(res, err instanceof Error ? err.message : "Invalid JSON body"));
+    return true;
+  }
+
+  const artifactPreview = pathname.match(/^\/api\/voice-agent\/sessions\/([^/]+)\/artifacts\/preview$/);
+  const artifactFile = pathname.match(/^\/api\/voice-agent\/sessions\/([^/]+)\/artifacts\/(.+)$/);
+  if (method === "GET" && (artifactPreview || artifactFile)) {
+    try {
+      const sessionId = decodeURIComponent((artifactPreview ?? artifactFile)![1]);
+      const filePath = artifactPreview ? "index.html" : decodeURIComponent(artifactFile![2]);
+      const resolved = resolveArtifact(sessionId, filePath);
+      const ext = path.extname(resolved).toLowerCase();
+      const type = ext === ".html" ? "text/html; charset=utf-8" : ext === ".svg" ? "image/svg+xml" : ext === ".png" ? "image/png" : "application/octet-stream";
+      res.writeHead(200, {
+        "Content-Type": type,
+        "X-Content-Type-Options": "nosniff",
+        ...(ext === ".html" ? { "Content-Security-Policy": "sandbox allow-scripts allow-forms allow-pointer-lock allow-popups" } : {}),
+      });
+      fs.createReadStream(resolved).pipe(res);
+    } catch (err) {
+      notFound(res, err instanceof Error ? err.message : String(err));
+    }
+    return true;
+  }
+
+  const sessionMatch = pathname.match(/^\/api\/voice-agent\/sessions\/([^/]+)$/);
+  if (sessionMatch && method === "GET") {
+    const workspace = loadWorkspace(decodeURIComponent(sessionMatch[1]));
+    if (!workspace) notFound(res, "Voice workspace not found");
+    else ok(res, "Voice session loaded", workspace);
+    return true;
+  }
+
+  if (sessionMatch && method === "DELETE") {
+    const sessionId = decodeURIComponent(sessionMatch[1]);
+    const workspace = loadWorkspace(sessionId);
+    if (!workspace) {
+      notFound(res, "Voice workspace not found");
+      return true;
+    }
+    workspace.progress_brief = { status: "done", short_text: "会话已关闭。", updated_at: now() };
+    saveWorkspace(workspace);
+    ok(res, "Voice session closed", { session_id: sessionId });
+    return true;
+  }
+
+  const managerStatusMatch = pathname.match(/^\/api\/voice-agent\/sessions\/([^/]+)\/manager-status$/);
+  if (managerStatusMatch && method === "POST") {
+    const workspace = loadWorkspace(decodeURIComponent(managerStatusMatch[1]));
+    if (!workspace) notFound(res, "Voice workspace not found");
+    else ok(res, "Manager status refreshed", { workspace: saveWorkspace(workspace), manager_status: managerStatus(workspace) });
+    return true;
+  }
+
+  const stopMatch = pathname.match(/^\/api\/voice-agent\/sessions\/([^/]+)\/monitor\/stop$/);
+  if (stopMatch && method === "POST") {
+    const workspace = loadWorkspace(decodeURIComponent(stopMatch[1]));
+    if (!workspace) {
+      notFound(res, "Voice workspace not found");
+      return true;
+    }
+    workspace.codex_monitor_status = "done";
+    workspace.progress_brief = { status: "done", short_text: "监听已停止。", updated_at: now() };
+    ok(res, "Voice monitor stopped", { workspace: saveWorkspace(workspace) });
+    return true;
+  }
+
+  const turnMatch = pathname.match(/^\/api\/voice-agent\/sessions\/([^/]+)\/turn$/);
+  if (turnMatch && method === "POST") {
+    readJsonBody(req)
+      .then(async (body) => {
+        const sessionId = decodeURIComponent(turnMatch[1]);
+        const text = typeof body.text === "string" ? body.text.trim() : "";
+        if (!text) {
+          badRequest(res, "Missing required field: text");
+          return;
+        }
+        const projectIdPatch = typeof body.project_id === "string" ? body.project_id : null;
+        // workspace 必须在锁内重新读取：否则并发 turn 的第二个请求会拿着旧快照覆盖第一个的结果。
+        const result = await withSessionLock(sessionId, async () => {
+          const workspace = loadWorkspace(sessionId);
+          if (!workspace) throw new HttpNotFoundError("Voice workspace not found");
+          if (projectIdPatch && !workspace.project_id) workspace.project_id = projectIdPatch;
+          registerTurn(sessionId, "running");
+          try {
+            const r = await processTurn(workspace, text, managerAgentOptions);
+            const saved = saveWorkspace(workspace);
+            completeTurn(sessionId, saved.progress_brief?.status || "done");
+            return { result: r, saved };
+          } catch (err) {
+            completeTurn(sessionId, "error");
+            throw err;
+          }
+        });
+        const handoff = result.result as Partial<ManagerAgentHandoffResult>;
+        ok(res, "Voice turn processed", {
+          workspace: result.saved,
+          spoken_text: result.result.spoken_text,
+          voice_events: voiceEvents(result.result.spoken_text, result.result.commentary_texts),
+          suggested_action: result.result.suggested_action,
+          manager: handoff.manager,
+          manager_status: handoff.manager_status,
+        });
+      })
+      .catch((err) => {
+        if (err instanceof HttpNotFoundError) notFound(res, err.message);
+        else badRequest(res, err instanceof Error ? err.message : "Invalid JSON body");
+      });
+    return true;
+  }
+
+  const turnStreamMatch = pathname.match(/^\/api\/voice-agent\/sessions\/([^/]+)\/turn\/stream$/);
+  if (turnStreamMatch && method === "POST") {
+    readJsonBody(req)
+      .then(async (body) => {
+        const sessionId = decodeURIComponent(turnStreamMatch[1]);
+        const text = typeof body.text === "string" ? body.text.trim() : "";
+        const projectIdPatch = typeof body.project_id === "string" ? body.project_id : null;
+        res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+        if (!text) {
+          streamLine(res, { type: "error", message: "Missing required field: text" });
+          res.end();
+          return;
+        }
+        // workspace 必须在锁内重新读取，避免并发 turn 拿旧快照覆盖。
+        // accepted 行在锁内发送，确保用户看到的 workspace 是锁内 fresh 版本。
+        const result = await withSessionLock(sessionId, async () => {
+          const workspace = loadWorkspace(sessionId);
+          if (!workspace) {
+            streamLine(res, { type: "error", message: "Voice workspace not found" });
+            res.end();
+            return null;
+          }
+          if (projectIdPatch && !workspace.project_id) workspace.project_id = projectIdPatch;
+          workspace.progress_brief = {
+            status: "running",
+            short_text: "正在交给主 Agent。",
+            updated_at: now(),
+          };
+          streamLine(res, { type: "workspace", phase: "accepted", workspace });
+          registerTurn(sessionId, "running");
+          try {
+            const streamedCommentaryTexts = new Set<string>();
+            const r = await processTurn(workspace, text, managerAgentOptions, {
+              streamedCommentaryTexts,
+              onSpeech: (event) => {
+                const saved = saveWorkspace(workspace);
+                streamLine(res, { type: "speech", event, workspace: saved });
+              },
+            });
+            const saved = saveWorkspace(workspace);
+            completeTurn(sessionId, saved.progress_brief?.status || "done");
+            return { result: r, saved };
+          } catch (err) {
+            completeTurn(sessionId, "error");
+            throw err;
+          }
+        });
+        if (!result) return; // workspace not found, already streamed error
+        const handoff = result.result as Partial<ManagerAgentHandoffResult>;
+        streamLine(res, { type: "workspace", workspace: result.saved });
+        for (const event of voiceEvents(result.result.spoken_text, result.result.commentary_texts)) streamLine(res, { type: "speech", event, workspace: result.saved });
+        streamLine(res, {
+          type: "done",
+          workspace: result.saved,
+          spoken_text: result.result.spoken_text,
+          voice_events: [],
+          suggested_action: result.result.suggested_action,
+          manager: handoff.manager,
+          manager_status: handoff.manager_status,
+        });
+        res.end();
+      })
+      .catch((err) => {
+        // 流式响应的头可能已发送（writeHead 在 try 之前），不能重复写
+        if (!res.headersSent) {
+          res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+        }
+        try {
+          streamLine(res, { type: "error", message: err instanceof Error ? err.message : "Invalid JSON body" });
+        } catch {
+          // 头已发送但流已关闭时 streamLine 可能抛错，忽略
+        }
+        try { res.end(); } catch { /* already ended */ }
+      });
+    return true;
+  }
+
+  const confirmMatch = pathname.match(/^\/api\/voice-agent\/sessions\/([^/]+)\/confirm$/);
+  if (confirmMatch && method === "POST") {
+    readJsonBody(req)
+      .then(async (body) => {
+        const sessionId = decodeURIComponent(confirmMatch[1]);
+        const requested = typeof body.confirmation_id === "string" ? body.confirmation_id : "";
+        const config = readConfig();
+        // workspace 在锁内重新读取，确保 confirm 基于最新 workspace。
+        const result = await withSessionLock(sessionId, async () => {
+          const workspace = loadWorkspace(sessionId);
+          if (!workspace) throw new HttpNotFoundError("Voice workspace not found");
+          const expected = workspace.pending_confirmations[0]?.id;
+          if (requested && expected && requested !== expected) {
+            throw new HttpBadRequestError("Confirmation id mismatch");
+          }
+          registerTurn(sessionId, "submitted");
+          try {
+            const r = await submitVoiceWorkspaceToManagerAgent(
+              workspace,
+              confirmedTaskMessage(workspace),
+              config,
+              managerAgentOptions,
+            );
+            const saved = saveWorkspace(workspace);
+            completeTurn(sessionId, saved.progress_brief?.status || "done");
+            return { result: r, saved };
+          } catch (err) {
+            completeTurn(sessionId, "error");
+            throw err;
+          }
+        });
+        ok(res, "Voice task submitted to main Agent", {
+          workspace: result.saved,
+          manager: result.result.manager,
+          manager_status: result.result.manager_status,
+          spoken_text: result.result.spoken_text,
+          voice_events: voiceEvents(result.result.spoken_text, result.result.commentary_texts),
+        });
+      })
+      .catch((err) => {
+        if (err instanceof HttpNotFoundError) notFound(res, err.message);
+        else if (err instanceof HttpBadRequestError) badRequest(res, err.message);
+        else badRequest(res, err instanceof Error ? err.message : "Invalid JSON body");
+      });
+    return true;
+  }
+
+  const confirmStreamMatch = pathname.match(/^\/api\/voice-agent\/sessions\/([^/]+)\/confirm\/stream$/);
+  if (confirmStreamMatch && method === "POST") {
+    readJsonBody(req)
+      .then(async () => {
+        const sessionId = decodeURIComponent(confirmStreamMatch[1]);
+        const config = readConfig();
+        res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+        // workspace 在锁内重新读取。
+        const result = await withSessionLock(sessionId, async () => {
+          const workspace = loadWorkspace(sessionId);
+          if (!workspace) {
+            streamLine(res, { type: "error", message: "Voice workspace not found" });
+            res.end();
+            return null;
+          }
+          workspace.progress_brief = {
+            status: "submitted",
+            short_text: "已确认，正在交给主 Agent。",
+            updated_at: now(),
+          };
+          streamLine(res, { type: "workspace", phase: "accepted", workspace });
+          registerTurn(sessionId, "submitted");
+          try {
+            const streamedCommentaryTexts = new Set<string>();
+            const r = await submitVoiceWorkspaceToManagerAgent(
+              workspace,
+              confirmedTaskMessage(workspace),
+              config,
+              managerAgentOptions,
+              {
+                streamedCommentaryTexts,
+                onSpeech: (event) => {
+                  const saved = saveWorkspace(workspace);
+                  streamLine(res, { type: "speech", event, workspace: saved });
+                },
+              },
+            );
+            const saved = saveWorkspace(workspace);
+            completeTurn(sessionId, saved.progress_brief?.status || "done");
+            return { result: r, saved };
+          } catch (err) {
+            completeTurn(sessionId, "error");
+            throw err;
+          }
+        });
+        if (!result) return; // workspace not found, already streamed error
+        streamLine(res, { type: "workspace", workspace: result.saved });
+        for (const event of voiceEvents(result.result.spoken_text, result.result.commentary_texts)) streamLine(res, { type: "speech", event, workspace: result.saved });
+        streamLine(res, {
+          type: "done",
+          workspace: result.saved,
+          spoken_text: result.result.spoken_text,
+          voice_events: [],
+          manager: result.result.manager,
+          manager_status: result.result.manager_status,
+        });
+        res.end();
+      })
+      .catch((err) => {
+        res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+        streamLine(res, { type: "error", message: err instanceof Error ? err.message : "Invalid JSON body" });
+        res.end();
+      });
+    return true;
+  }
+
+  const notificationMatch = pathname.match(/^\/api\/voice-agent\/sessions\/([^/]+)\/notifications$/);
+  if (notificationMatch && method === "POST") {
+    readJsonBody(req)
+      .then((body) => {
+        const workspace = loadWorkspace(decodeURIComponent(notificationMatch[1]));
+        if (!workspace) {
+          notFound(res, "Voice workspace not found");
+          return;
+        }
+        const title = typeof body.title === "string" ? body.title : "通知";
+        const msg = typeof body.body === "string" ? body.body : "";
+        const priority = body.priority === "high" || body.priority === "low" ? body.priority : "normal";
+        const spoken = typeof body.spoken_text === "string" && body.spoken_text.trim() ? body.spoken_text.trim() : title;
+        workspace.progress_brief = { status: priority === "high" ? "blocked" : "running", short_text: spoken, updated_at: now() };
+        appendConversation(workspace, "assistant", msg ? `${spoken}\n${msg}` : spoken);
+        ok(res, "Voice notification queued", { workspace: saveWorkspace(workspace), spoken_text: spoken, voice_events: voiceEvents(spoken) });
+      })
+      .catch((err) => badRequest(res, err instanceof Error ? err.message : "Invalid JSON body"));
+    return true;
+  }
+
+  return false;
+}

@@ -1,0 +1,27 @@
+{
+  "available_ports": [
+    "done"
+  ],
+  "graph_nodes": [
+    "triage",
+    "coder",
+    "tester",
+    "reviewer",
+    "committer"
+  ],
+  "node_id": "coder",
+  "predecessors": [
+    {
+      "from_port": "done",
+      "node": "triage",
+      "to_port": "in:task"
+    }
+  ],
+  "successors": [
+    {
+      "from_port": "done",
+      "node": "tester",
+      "to_port": "in:artifact"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "control_action": "cancel",
+  "data": {},
+  "force": true,
+  "id": "00000000-0000-0000-0000-000000000009",
+  "operation_id": "op-001",
+  "reason": "no longer needed",
+  "timestamp": "2026-01-01T00:00:00+00:00",
+  "type": "async_control"
+}

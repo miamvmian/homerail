@@ -1,0 +1,49 @@
+# Copy this file or pass it explicitly with:
+#   hr run assets/orchestrations/public-two-node.yaml.template --prompt "Write a release checklist"
+# DAG provider/model selection comes from HomeRail's database LLM settings.
+
+name: public-two-node-template
+workflow_id: public-two-node-template
+description: "Public two-node DAG template: one agent drafts an answer, another reviews it."
+
+runtime_profiles:
+  offline-deterministic:
+    agents:
+      "*":
+        agent_type: deterministic
+
+workspace:
+  mode: isolated
+
+agents:
+  drafter:
+    system: |
+      You are the drafting node in a public HomeRail example DAG.
+      HANDOFF port=drafted content=Draft checklist:
+      1. Confirm scope.
+      2. Build the TypeScript backend.
+      3. Run smoke tests.
+
+  reviewer:
+    system: |
+      You are the review node in a public HomeRail example DAG.
+      HANDOFF port=approved content=Review passed: the checklist is concise and actionable.
+
+nodes:
+  draft:
+    name: Draft
+    agent: drafter
+    after: []
+    outputs:
+      drafted:
+        to: "review.in:draft"
+
+  review:
+    name: Review
+    agent: reviewer
+    after: [draft]
+    outputs:
+      approved:
+        to: ""
+      needs_work:
+        to: ""

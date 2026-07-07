@@ -1,0 +1,4 @@
+interface:
+  display_name: "HomeRail CLI"
+  short_description: "Use the local-source HomeRail CLI for runtime, model, DAG, and evidence commands."
+  default_prompt: "Use $homerail-cli when you need HomeRail CLI commands, flags, or evidence inspection."

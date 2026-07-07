@@ -1,0 +1,8 @@
+widget_id = "voice-memo"
+widget_type = "memo"
+schema_version = 1
+title = "任务记录"
+status = "unknown"
+ready_to_execute = "no"
+
+known_facts = "不是数组"

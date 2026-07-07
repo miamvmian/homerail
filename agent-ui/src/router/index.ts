@@ -1,0 +1,43 @@
+/// <reference types="vite/client" />
+
+import { createRouter, createWebHistory } from 'vue-router'
+
+const router = createRouter({
+  history: createWebHistory(import.meta.env.BASE_URL),
+  routes: [
+    // Agent UI — full-screen, no layout chrome
+    {
+      path: '/',
+      name: 'agent',
+      component: () => import('@/views/agent/index.vue')
+    },
+    {
+      path: '/agent',
+      name: 'agent-path',
+      component: () => import('@/views/agent/index.vue')
+    },
+    {
+      path: '/agent/experience',
+      name: 'agent-experience-graph',
+      component: () => import('@/views/agent/ExperienceGraphExplorer.vue')
+    },
+    {
+      path: '/dag/run/:runId',
+      name: 'DAGRun',
+      redirect: route => ({
+        path: '/agent',
+        query: {
+          runId: route.params.runId as string,
+          tab: 'topology',
+        },
+      }),
+    },
+    {
+      path: '/:pathMatch(.*)*',
+      redirect: '/agent',
+    },
+  ]
+})
+
+export default router
+  ;

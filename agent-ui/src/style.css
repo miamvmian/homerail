@@ -1,0 +1,56 @@
+html, body {
+  height: 100%;
+  overflow: hidden;
+  margin: 0; /* 重置默认边距 */
+  padding: 0; /* 重置默认内边距 */
+}
+
+#app {
+  width: 100vw;
+  max-width: 100%;
+  height: 100%; /* 确保 #app 高度为 100% */
+  margin: 0;
+  padding: 0;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#app input,
+#app textarea,
+#app select,
+#app [contenteditable='true'],
+#app [contenteditable=''],
+#app pre,
+#app code,
+#app kbd,
+#app samp,
+#app iframe,
+#app .agent-markdown,
+#app .message-list-wrapper,
+#app .text-message-item,
+#app .tool-message-item,
+#app .system-message-item,
+#app .voice-dynamic-widget,
+#app .voice-task-card,
+#app .voice-status-card,
+#app .voice-artifact-card,
+#app .voice-artifact-modal,
+#app .voice-manager-stream,
+#app .voice-thread,
+#app .voice-input-zone__text,
+#app .voice-card-id,
+#app .voice-dag-panel,
+#app .voice-dag-signal-list {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+#app button,
+#app [role='button'],
+#app img,
+#app svg,
+#app canvas {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}

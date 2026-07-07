@@ -1,0 +1,44 @@
+{
+  "name": "HomeRail",
+  "short_name": "HomeRail",
+  "id": "/agent",
+  "start_url": "/agent",
+  "scope": "/",
+  "display_override": ["fullscreen", "standalone"],
+  "display": "fullscreen",
+  "orientation": "any",
+  "background_color": "#090b0d",
+  "theme_color": "#090b0d",
+  "icons": [
+    {
+      "src": "/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/homerail-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/homerail-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/homerail-icon-maskable-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icons/homerail-icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

@@ -1,0 +1,440 @@
+import * as crypto from "node:crypto";
+import YAML from "yaml";
+import { encodeJson, getDb, parseJsonRow, clearTables } from "./db.js";
+import { nowIso } from "./time.js";
+import {
+  getSetting,
+  isVoiceServiceSetting,
+  listSettings,
+  type LLMSetting,
+} from "./llm-settings.js";
+import type { DAGAgentConfig, ParsedDAG } from "../orchestration/graph.js";
+import { parseDAGYaml } from "../orchestration/yaml-loader.js";
+import { assertNoYamlProviderRuntime } from "../orchestration/runtime-selection.js";
+
+export interface DagWorkflow {
+  workflow_id: string;
+  name: string;
+  description?: string;
+  source_path?: string;
+  yaml_text: string;
+  yaml_hash: string;
+  node_ids: string[];
+  agent_ids: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DagRuntimeProfileEntry {
+  llm_setting_id?: string;
+  model_alias?: string;
+  agent_type?: string;
+}
+
+export interface DagRuntimeProfile {
+  profile_key: string;
+  workflow_id: string;
+  profile_id: string;
+  description?: string;
+  source_path?: string;
+  default?: DagRuntimeProfileEntry;
+  agents: Record<string, DagRuntimeProfileEntry>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DagRuntimeProfileResolvedEntry {
+  llm_setting_id?: string;
+  agent_type?: string;
+}
+
+export interface DagRuntimeProfileResolved {
+  profile_id: string;
+  workflow_id: string;
+  default?: DagRuntimeProfileResolvedEntry;
+  agents: Record<string, DagRuntimeProfileResolvedEntry>;
+}
+
+function _sha256(text: string): string {
+  return crypto.createHash("sha256").update(text).digest("hex");
+}
+
+function _string(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function _stringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = parseJsonRow<unknown>(value);
+      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function _jsonObject(value: unknown): Record<string, unknown> {
+  if (typeof value !== "string" || !value.trim()) return {};
+  try {
+    const parsed = parseJsonRow<unknown>(value);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function _workflowFromRow(row: Record<string, unknown>): DagWorkflow {
+  const raw = _jsonObject(row.data);
+  return {
+    ...raw,
+    workflow_id: _string(row.workflow_id) ?? _string(raw.workflow_id) ?? "",
+    name: _string(row.name) ?? _string(raw.name) ?? "",
+    description: _string(row.description) ?? _string(raw.description),
+    source_path: _string(row.source_path) ?? _string(raw.source_path),
+    yaml_text: _string(row.yaml_text) ?? _string(raw.yaml_text) ?? "",
+    yaml_hash: _string(row.yaml_hash) ?? _string(raw.yaml_hash) ?? "",
+    node_ids: _stringArray(row.node_ids ?? raw.node_ids),
+    agent_ids: _stringArray(row.agent_ids ?? raw.agent_ids),
+    created_at: _string(row.created_at) ?? _string(raw.created_at) ?? nowIso(),
+    updated_at: _string(row.updated_at) ?? _string(raw.updated_at) ?? nowIso(),
+  };
+}
+
+function _profileEntry(value: unknown): DagRuntimeProfileEntry | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const entry: DagRuntimeProfileEntry = {};
+  const llmSettingId = _string(raw.llm_setting_id ?? raw.llmSettingId ?? raw.setting_id ?? raw.settingId);
+  const modelAlias = _string(raw.model_alias ?? raw.modelAlias);
+  const agentType = _string(raw.agent_type ?? raw.agentType ?? raw.harness);
+  if (llmSettingId) entry.llm_setting_id = llmSettingId;
+  if (modelAlias) entry.model_alias = modelAlias;
+  if (agentType) entry.agent_type = agentType;
+  return Object.keys(entry).length > 0 ? entry : undefined;
+}
+
+function _entryFromJson(value: unknown): DagRuntimeProfileEntry | undefined {
+  if (typeof value === "string" && value.trim()) return _profileEntry(_jsonObject(value));
+  return _profileEntry(value);
+}
+
+function _entriesFromJson(value: unknown): Record<string, DagRuntimeProfileEntry> {
+  const raw = typeof value === "string" ? _jsonObject(value) : value;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {};
+  const entries: Record<string, DagRuntimeProfileEntry> = {};
+  for (const [agentId, entry] of Object.entries(raw)) {
+    const parsed = _profileEntry(entry);
+    if (parsed) entries[agentId] = parsed;
+  }
+  return entries;
+}
+
+function _profileFromRow(row: Record<string, unknown>): DagRuntimeProfile {
+  const raw = _jsonObject(row.data);
+  const workflowId = _string(row.workflow_id) ?? _string(raw.workflow_id) ?? "";
+  const profileId = _string(row.profile_id) ?? _string(raw.profile_id) ?? "";
+  return {
+    ...raw,
+    profile_key: _string(row.profile_key) ?? _string(raw.profile_key) ?? `${workflowId}:${profileId}`,
+    workflow_id: workflowId,
+    profile_id: profileId,
+    description: _string(row.description) ?? _string(raw.description),
+    source_path: _string(row.source_path) ?? _string(raw.source_path),
+    default: _entryFromJson(row.default_config ?? raw.default),
+    agents: _entriesFromJson(row.agent_configs ?? raw.agents),
+    created_at: _string(row.created_at) ?? _string(raw.created_at) ?? nowIso(),
+    updated_at: _string(row.updated_at) ?? _string(raw.updated_at) ?? nowIso(),
+  };
+}
+
+function _workflowAgentIds(parsed: ParsedDAG): string[] {
+  const ids = new Set<string>();
+  for (const id of Object.keys(parsed.meta.agents ?? {})) ids.add(id);
+  for (const node of parsed.graph.nodes) {
+    if (node.agent && node.agent !== "__gateway__") ids.add(node.agent);
+  }
+  return Array.from(ids).sort();
+}
+
+function _writeWorkflow(workflow: DagWorkflow): void {
+  getDb().prepare(`
+    INSERT INTO dag_workflows(
+      workflow_id, name, description, source_path, yaml_text, yaml_hash,
+      node_ids, agent_ids, created_at, updated_at, data
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(workflow_id) DO UPDATE SET
+      name = excluded.name,
+      description = excluded.description,
+      source_path = excluded.source_path,
+      yaml_text = excluded.yaml_text,
+      yaml_hash = excluded.yaml_hash,
+      node_ids = excluded.node_ids,
+      agent_ids = excluded.agent_ids,
+      updated_at = excluded.updated_at,
+      data = excluded.data
+  `).run(
+    workflow.workflow_id,
+    workflow.name,
+    workflow.description ?? null,
+    workflow.source_path ?? null,
+    workflow.yaml_text,
+    workflow.yaml_hash,
+    encodeJson(workflow.node_ids),
+    encodeJson(workflow.agent_ids),
+    workflow.created_at,
+    workflow.updated_at,
+    encodeJson(workflow),
+  );
+}
+
+function _writeProfile(profile: DagRuntimeProfile): void {
+  getDb().prepare(`
+    INSERT INTO dag_runtime_profiles(
+      profile_key, workflow_id, profile_id, description, source_path,
+      default_config, agent_configs, created_at, updated_at, data
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(workflow_id, profile_id) DO UPDATE SET
+      description = excluded.description,
+      source_path = excluded.source_path,
+      default_config = excluded.default_config,
+      agent_configs = excluded.agent_configs,
+      updated_at = excluded.updated_at,
+      data = excluded.data
+  `).run(
+    profile.profile_key,
+    profile.workflow_id,
+    profile.profile_id,
+    profile.description ?? null,
+    profile.source_path ?? null,
+    profile.default ? encodeJson(profile.default) : null,
+    encodeJson(profile.agents),
+    profile.created_at,
+    profile.updated_at,
+    encodeJson(profile),
+  );
+}
+
+export function upsertDagWorkflowFromYaml(input: {
+  yaml_text: string;
+  source_path?: string;
+}): { workflow: DagWorkflow; created: boolean; parsed: ParsedDAG } {
+  const parsed = parseDAGYaml(input.yaml_text);
+  assertNoYamlProviderRuntime(parsed);
+  const workflowId = _string(parsed.meta.workflow_id);
+  if (!workflowId) {
+    throw new Error("DAG YAML must define a stable workflow_id before it can be synced to the database.");
+  }
+  const existing = getDagWorkflow(workflowId);
+  const now = nowIso();
+  const workflow: DagWorkflow = {
+    workflow_id: workflowId,
+    name: parsed.meta.name || workflowId,
+    description: parsed.meta.description,
+    source_path: input.source_path,
+    yaml_text: input.yaml_text,
+    yaml_hash: _sha256(input.yaml_text),
+    node_ids: parsed.graph.nodes.map((node) => node.node_id),
+    agent_ids: _workflowAgentIds(parsed),
+    created_at: existing?.created_at ?? now,
+    updated_at: now,
+  };
+  _writeWorkflow(workflow);
+  return { workflow, created: !existing, parsed };
+}
+
+export function listDagWorkflows(): DagWorkflow[] {
+  return (getDb()
+    .prepare("SELECT * FROM dag_workflows ORDER BY updated_at DESC, workflow_id")
+    .all() as Record<string, unknown>[])
+    .map(_workflowFromRow);
+}
+
+export function getDagWorkflow(workflowId: string): DagWorkflow | undefined {
+  const row = getDb()
+    .prepare("SELECT * FROM dag_workflows WHERE workflow_id = ?")
+    .get(workflowId) as Record<string, unknown> | undefined;
+  return row ? _workflowFromRow(row) : undefined;
+}
+
+function _parseProfileYaml(yamlText: string, workflowIdOverride?: string): Omit<DagRuntimeProfile, "profile_key" | "created_at" | "updated_at"> {
+  const raw = YAML.parse(yamlText);
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error("Profile YAML root must be an object.");
+  }
+  const record = raw as Record<string, unknown>;
+  const profileId = _string(record.profile_id ?? record.profileId ?? record.id ?? record.name);
+  if (!profileId) throw new Error("Profile YAML must define profile_id.");
+  const workflowId = workflowIdOverride ?? _string(record.workflow_id ?? record.workflowId);
+  if (!workflowId) throw new Error("Profile YAML must define workflow_id or CLI must pass --workflow.");
+
+  const defaultEntry = _profileEntry(record.default ?? record.defaults);
+  const agents = _entriesFromJson(record.agents);
+  _assertProfileHasNoProviderModel(record);
+  _assertProfileEntriesResolvable(defaultEntry, agents);
+  return {
+    workflow_id: workflowId,
+    profile_id: profileId,
+    description: _string(record.description),
+    default: defaultEntry,
+    agents,
+    source_path: undefined,
+  };
+}
+
+function _assertProfileHasNoProviderModel(root: Record<string, unknown>): void {
+  const failures: string[] = [];
+  const checkEntry = (prefix: string, value: unknown) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return;
+    const record = value as Record<string, unknown>;
+    if (_string(record.provider)) failures.push(`${prefix}.provider`);
+    if (_string(record.model)) failures.push(`${prefix}.model`);
+    if (_string(record.api_key ?? record.apiKey)) failures.push(`${prefix}.api_key`);
+    if (_string(record.base_url ?? record.baseUrl)) failures.push(`${prefix}.base_url`);
+  };
+  checkEntry("default", root.default ?? root.defaults);
+  const agents = root.agents;
+  if (typeof agents === "object" && agents !== null && !Array.isArray(agents)) {
+    for (const [agentId, value] of Object.entries(agents)) {
+      checkEntry(`agents.${agentId}`, value);
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(`Runtime profile must reference DB model_alias or llm_setting_id, not provider/model. Remove: ${failures.join(", ")}`);
+  }
+}
+
+function _assertProfileEntriesResolvable(defaultEntry: DagRuntimeProfileEntry | undefined, agents: Record<string, DagRuntimeProfileEntry>): void {
+  for (const [label, entry] of [["default", defaultEntry] as const, ...Object.entries(agents) as Array<[string, DagRuntimeProfileEntry]>]) {
+    if (!entry) continue;
+    if (entry.llm_setting_id && entry.model_alias) {
+      throw new Error(`Profile entry '${label}' must use either llm_setting_id or model_alias, not both.`);
+    }
+    if (entry.llm_setting_id) {
+      const setting = getSetting(entry.llm_setting_id);
+      if (!setting?.is_active || !setting.supports_llm || isVoiceServiceSetting(setting)) {
+        throw new Error(`Profile entry '${label}' references an unavailable LLM setting: ${entry.llm_setting_id}`);
+      }
+    }
+    if (entry.model_alias) resolveModelAlias(entry.model_alias);
+  }
+}
+
+export function upsertDagRuntimeProfileFromYaml(input: {
+  yaml_text: string;
+  workflow_id?: string;
+  source_path?: string;
+}): { profile: DagRuntimeProfile; created: boolean } {
+  const parsed = _parseProfileYaml(input.yaml_text, input.workflow_id);
+  const workflow = getDagWorkflow(parsed.workflow_id);
+  if (!workflow) {
+    throw new Error(`DAG workflow not found in database: ${parsed.workflow_id}. Run hr dag sync first.`);
+  }
+  const existing = getDagRuntimeProfile(parsed.workflow_id, parsed.profile_id);
+  const now = nowIso();
+  const profile: DagRuntimeProfile = {
+    ...parsed,
+    source_path: input.source_path,
+    profile_key: `${parsed.workflow_id}:${parsed.profile_id}`,
+    agents: parsed.agents,
+    created_at: existing?.created_at ?? now,
+    updated_at: now,
+  };
+  _writeProfile(profile);
+  return { profile, created: !existing };
+}
+
+export function listDagRuntimeProfiles(workflowId?: string): DagRuntimeProfile[] {
+  const rows = workflowId
+    ? getDb()
+      .prepare("SELECT * FROM dag_runtime_profiles WHERE workflow_id = ? ORDER BY updated_at DESC, profile_id")
+      .all(workflowId) as Record<string, unknown>[]
+    : getDb()
+      .prepare("SELECT * FROM dag_runtime_profiles ORDER BY updated_at DESC, workflow_id, profile_id")
+      .all() as Record<string, unknown>[];
+  return rows.map(_profileFromRow);
+}
+
+export function getDagRuntimeProfile(workflowId: string, profileId: string): DagRuntimeProfile | undefined {
+  const row = getDb()
+    .prepare("SELECT * FROM dag_runtime_profiles WHERE workflow_id = ? AND profile_id = ?")
+    .get(workflowId, profileId) as Record<string, unknown> | undefined;
+  return row ? _profileFromRow(row) : undefined;
+}
+
+export function resolveModelAlias(alias: string): LLMSetting {
+  const idMatch = getSetting(alias);
+  if (idMatch?.is_active && idMatch.supports_llm && !isVoiceServiceSetting(idMatch)) return idMatch;
+  const matches = listSettings().filter(
+    (setting) => setting.is_active &&
+      setting.supports_llm &&
+      !isVoiceServiceSetting(setting) &&
+      setting.display_name === alias,
+  );
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) {
+    throw new Error(`Model alias '${alias}' is ambiguous across ${matches.length} settings. Use llm_setting_id instead.`);
+  }
+  throw new Error(`Model alias not found: ${alias}`);
+}
+
+function _resolveEntry(entry: DagRuntimeProfileEntry): DagRuntimeProfileResolvedEntry {
+  const resolved: DagRuntimeProfileResolvedEntry = {};
+  if (entry.llm_setting_id) {
+    const setting = getSetting(entry.llm_setting_id);
+    if (!setting?.is_active || !setting.supports_llm || isVoiceServiceSetting(setting)) {
+      throw new Error(`Runtime profile references an unavailable LLM setting: ${entry.llm_setting_id}`);
+    }
+    resolved.llm_setting_id = entry.llm_setting_id;
+  } else if (entry.model_alias) {
+    resolved.llm_setting_id = resolveModelAlias(entry.model_alias).id;
+  }
+  if (entry.agent_type) resolved.agent_type = entry.agent_type;
+  return resolved;
+}
+
+export function resolveDagRuntimeProfile(profile: DagRuntimeProfile): DagRuntimeProfileResolved {
+  return {
+    profile_id: profile.profile_id,
+    workflow_id: profile.workflow_id,
+    default: profile.default ? _resolveEntry(profile.default) : undefined,
+    agents: Object.fromEntries(
+      Object.entries(profile.agents).map(([agentId, entry]) => [agentId, _resolveEntry(entry)]),
+    ),
+  };
+}
+
+export function parseStoredDagWorkflow(workflow: DagWorkflow): ParsedDAG {
+  const parsed = parseDAGYaml(workflow.yaml_text);
+  assertNoYamlProviderRuntime(parsed);
+  return parsed;
+}
+
+export function applyDagRuntimeProfile(parsed: ParsedDAG, profile: DagRuntimeProfileResolved): ParsedDAG {
+  const agentIds = _workflowAgentIds(parsed);
+  const agents: Record<string, DAGAgentConfig> = {};
+  for (const agentId of agentIds) {
+    const base = parsed.meta.agents?.[agentId] ?? {};
+    const override = profile.agents[agentId] ?? profile.default;
+    agents[agentId] = {
+      ...base,
+      llm_setting_id: override?.llm_setting_id ?? base.llm_setting_id,
+      agent_type: override?.agent_type ?? base.agent_type,
+    };
+  }
+  return {
+    meta: { ...parsed.meta, agents },
+    graph: parsed.graph,
+    loop_sources: parsed.loop_sources,
+  };
+}
+
+export function _clearDagWorkflowTablesForTest(): void {
+  clearTables(["dag_runtime_profiles", "dag_workflows"]);
+}

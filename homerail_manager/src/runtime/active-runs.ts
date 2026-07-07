@@ -1,0 +1,1476 @@
+import { randomUUID } from "node:crypto";
+import { emit } from "../events/bus.js";
+import type { DAGDispatcher, DispatchEnvelope } from "../orchestration/dag-dispatcher.js";
+import type { DAGRun, NodeState } from "../orchestration/dag-engine.js";
+import {
+  createDAGRun,
+  edgeMatchesHandoff,
+  failNode,
+  getNodeState,
+  getReadyNodes,
+  handoff,
+  isFailurePort,
+  isRunTerminal,
+  startNode,
+} from "../orchestration/dag-engine.js";
+import type { DAGAgentConfig, DAGEdge, DAGGatewayConfig, DAGGraphNode, DAGOutputRoute, ParsedDAG, ScorecardPolicyConfig } from "../orchestration/graph.js";
+import { _normalizeOutputsToEdges } from "../orchestration/yaml-loader.js";
+import { assertGraphValid } from "../orchestration/graph-validator.js";
+import { findDispatchTarget } from "../orchestration/dispatch-tracker.js";
+import { deprovisionProvisionedForRun } from "../orchestration/provisioned-cleanup.js";
+import { getWorker } from "../worker/registry.js";
+import { getNode } from "../node/registry.js";
+import {
+  isDisabledDirectLlmAgentType,
+  normalizeManagerAgentRuntimeAgentType,
+} from "homerail-protocol";
+import { resolveAgentRuntimeConfig } from "./agent-runtime-resolver.js";
+import {
+  writeRunMetadata,
+  appendHandoff,
+  serializeRunMetadata,
+  loadRunMetadata,
+  loadRunSnapshot,
+  listPersistedRunIds,
+} from "../persistence/store.js";
+import type {
+  PersistedGraphData,
+  PersistedRunMetadata,
+} from "../persistence/types.js";
+import {
+  getDagSessionIndex,
+  upsertDagSessionIndex,
+  listDagSessionIndex,
+  type DagSessionIndexEntry,
+} from "../persistence/dag-session-index.js";
+import { checkpointForkSession } from "../persistence/dag-session-files.js";
+import WebSocket from "ws";
+
+export interface InjectResult {
+  runId: string;
+  nodeId: string;
+  instruction: string;
+  mode: string;
+  timestamp: number;
+  delivered: boolean;
+  deliveryTargetType?: "worker" | "node";
+  deliveryTargetId?: string;
+  deliveryGap?: string;
+}
+
+export interface ActiveRun {
+  runId: string;
+  workflowId?: string;
+  workflowName?: string;
+  nodeCount?: number;
+  agents?: Record<string, DAGAgentConfig>;
+  workspace?: Record<string, unknown>;
+  scorecard?: ScorecardPolicyConfig;
+  dagRun: DAGRun;
+  createdAt: number;
+  status: "active" | "completed" | "failed" | "cancelled";
+  completedAt?: number;
+  limits: DAGRunLimits;
+  counters: DAGRunCounters;
+  nodeIndex: Map<string, number>;
+  nodeSessions: Map<string, NodeSessionState>;
+}
+
+export interface NodeSessionState {
+  sessionId: string;
+  attempt: number;
+  parentSessionId?: string;
+  forkedFromEntryUuid?: string;
+  resumeInstruction?: string;
+  status: string;
+}
+
+export interface CheckpointResumeRequest {
+  entryUuid?: string;
+  last?: number;
+  instruction: string;
+  sessionId?: string;
+}
+
+export type CheckpointResumeResult =
+  | {
+      status: "scheduled";
+      runId: string;
+      nodeId: string;
+      sessionId: string;
+      parentSessionId?: string;
+      attempt: number;
+      entryUuid?: string;
+      keptEntries: number;
+      totalEntries: number;
+      instruction: string;
+    }
+  | { status: "unavailable"; reason: string };
+
+export interface DAGRunLimits {
+  max_dispatches: number;
+  max_handoffs: number;
+  max_corrections_per_node: number;
+  max_edge_traversals: number;
+  max_tool_calls_per_node: number;
+}
+
+export interface DAGRunCounters {
+  dispatches: number;
+  handoffs: number;
+  edge_traversals: Record<string, number>;
+  corrections: Record<string, number>;
+  dispatch_retries: Record<string, number>;
+  gateway_iterations: Record<string, number>;
+  abort_reason?: string;
+}
+
+export interface AppendRunNodeRequest {
+  node: DAGGraphNode;
+  agentConfig?: DAGAgentConfig;
+}
+
+export interface AppendRunNodeResult {
+  runId: string;
+  nodeId: string;
+  ready: boolean;
+  dispatched: boolean;
+  nodeCount: number;
+}
+
+export interface CreateActiveRunOptions {
+  initialPrompt?: string;
+}
+
+const store = new Map<string, ActiveRun>();
+
+const DEFAULT_LIMITS: DAGRunLimits = {
+  max_dispatches: 30,
+  max_handoffs: 50,
+  max_corrections_per_node: 2,
+  max_edge_traversals: 3,
+  max_tool_calls_per_node: 0,
+};
+const MAX_DISPATCH_RETRIES_PER_NODE = 1;
+const RECOVERABLE_NODE_STATES: ReadonlySet<string> = new Set([
+  "PENDING",
+  "READY",
+  "RUNNING",
+  "COMPLETED",
+  "FAILED",
+  "CANCELLED",
+  "SKIPPED",
+]);
+
+function _limitValue(raw: Record<string, unknown> | undefined, key: keyof DAGRunLimits, fallback: number): number {
+  const value = raw?.[key];
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+function _resolveLimits(raw: unknown): DAGRunLimits {
+  const value = typeof raw === "object" && raw !== null && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : undefined;
+  return {
+    max_dispatches: _limitValue(value, "max_dispatches", DEFAULT_LIMITS.max_dispatches),
+    max_handoffs: _limitValue(value, "max_handoffs", DEFAULT_LIMITS.max_handoffs),
+    max_corrections_per_node: _limitValue(value, "max_corrections_per_node", DEFAULT_LIMITS.max_corrections_per_node),
+    max_edge_traversals: _limitValue(value, "max_edge_traversals", DEFAULT_LIMITS.max_edge_traversals),
+    max_tool_calls_per_node: _limitValue(value, "max_tool_calls_per_node", DEFAULT_LIMITS.max_tool_calls_per_node),
+  };
+}
+
+function _initialCounters(): DAGRunCounters {
+  return {
+    dispatches: 0,
+    handoffs: 0,
+    edge_traversals: {},
+    corrections: {},
+    dispatch_retries: {},
+    gateway_iterations: {},
+  };
+}
+
+function _buildNodeIndex(nodes: DAGGraphNode[]): Map<string, number> {
+  return new Map(nodes.map((node, index) => [node.node_id, index]));
+}
+
+function _safeIndexSegment(value: unknown, fallback: string): string {
+  const raw = typeof value === "string" && value.trim() ? value.trim() : fallback;
+  return raw.replace(/[^A-Za-z0-9._:-]/g, "-").replace(/^-+|-+$/g, "") || fallback;
+}
+
+function _projectKey(run: ActiveRun): string {
+  const workspace = run.workspace ?? {};
+  return _safeIndexSegment(
+    workspace.project_key ?? workspace.projectKey ?? workspace.project_id ?? workspace.projectId,
+    "default",
+  );
+}
+
+function _newSessionId(runId: string, nodeId: string): string {
+  return _safeIndexSegment(`dag-${runId}-${nodeId}-${randomUUID()}`, `dag-${randomUUID()}`);
+}
+
+function _nodeConfiguredSessionId(node: DAGGraphNode | undefined): string | undefined {
+  const extra = node?.extra ?? {};
+  const raw = extra.session_id ?? extra.sessionId;
+  return typeof raw === "string" && raw.trim() ? _safeIndexSegment(raw, raw.trim()) : undefined;
+}
+
+function _entryToNodeSession(entry: DagSessionIndexEntry): NodeSessionState {
+  return {
+    sessionId: entry.session_id,
+    attempt: Number.isFinite(entry.attempt) && entry.attempt > 0 ? entry.attempt : 1,
+    parentSessionId: entry.parent_session_id ?? undefined,
+    forkedFromEntryUuid: entry.forked_from_entry_uuid ?? undefined,
+    resumeInstruction: entry.resume_instruction ?? undefined,
+    status: entry.status || "active",
+  };
+}
+
+function _persistNodeSession(run: ActiveRun, nodeId: string, state: NodeSessionState): NodeSessionState {
+  const entry = upsertDagSessionIndex({
+    run_id: run.runId,
+    node_id: nodeId,
+    project_key: _projectKey(run),
+    session_id: state.sessionId,
+    attempt: state.attempt,
+    parent_session_id: state.parentSessionId ?? null,
+    forked_from_entry_uuid: state.forkedFromEntryUuid ?? null,
+    resume_instruction: state.resumeInstruction ?? null,
+    status: state.status,
+  });
+  const persisted = _entryToNodeSession(entry);
+  run.nodeSessions.set(nodeId, persisted);
+  return persisted;
+}
+
+function _ensureNodeSession(run: ActiveRun, nodeId: string): NodeSessionState {
+  const current = run.nodeSessions.get(nodeId);
+  if (current) return current;
+
+  const persisted = getDagSessionIndex(run.runId, nodeId);
+  if (persisted) {
+    const state = _entryToNodeSession(persisted);
+    run.nodeSessions.set(nodeId, state);
+    return state;
+  }
+
+  const node = run.dagRun.graph.nodes.find((candidate) => candidate.node_id === nodeId);
+  const state: NodeSessionState = {
+    sessionId: _nodeConfiguredSessionId(node) ?? _newSessionId(run.runId, nodeId),
+    attempt: 1,
+    status: "active",
+  };
+  return _persistNodeSession(run, nodeId, state);
+}
+
+function _markNodeSessionStatus(run: ActiveRun, nodeId: string, status: string): void {
+  const current = run.nodeSessions.get(nodeId);
+  if (!current) return;
+  _persistNodeSession(run, nodeId, { ...current, status });
+}
+
+function _instructionPreview(instruction: string): string {
+  return instruction.replace(/\s+/g, " ").trim().slice(0, 240);
+}
+
+function _snapshotNodeStates(run: ActiveRun): Map<string, string> {
+  return new Map(run.dagRun.nodeStates);
+}
+
+function _nodeName(run: ActiveRun, nodeId: string): string {
+  return run.dagRun.graph.nodes.find((node) => node.node_id === nodeId)?.name ?? nodeId;
+}
+
+function _uiNodeStatus(status: string): string {
+  return status.toLowerCase();
+}
+
+function _uiRunStatus(run: ActiveRun): string {
+  return run.status === "active" ? "running" : run.status;
+}
+
+function _emitStatusUpdate(run: ActiveRun): void {
+  emit("dag:status_update", {
+    runId: run.runId,
+    run_id: run.runId,
+    dag_run_id: run.runId,
+    status: _uiRunStatus(run),
+    nodes: Array.from(run.dagRun.nodeStates.entries()).map(([nodeId, status]) => ({
+      id: nodeId,
+      name: _nodeName(run, nodeId),
+      status: _uiNodeStatus(status),
+    })),
+    timestamp: new Date().toISOString(),
+  });
+}
+
+function _emitNodeStateChanges(run: ActiveRun, before: Map<string, string>): void {
+  const timestamp = new Date().toISOString();
+  for (const [nodeId, state] of run.dagRun.nodeStates.entries()) {
+    const previous = before.get(nodeId);
+    if (previous === state) continue;
+    emit("dag:node_state_changed", {
+      runId: run.runId,
+      run_id: run.runId,
+      dag_run_id: run.runId,
+      nodeId,
+      node_id: nodeId,
+      node_name: _nodeName(run, nodeId),
+      status: _uiNodeStatus(state),
+      previousStatus: previous ? _uiNodeStatus(previous) : undefined,
+      previous_status: previous ? _uiNodeStatus(previous) : undefined,
+      timestamp,
+    });
+  }
+  _emitStatusUpdate(run);
+}
+
+export function _clearActiveRuns(): void {
+  store.clear();
+}
+
+export function createActiveRun(
+  runId: string,
+  parsedDAG: ParsedDAG,
+  options: CreateActiveRunOptions = {},
+): ActiveRun {
+  const dagRun = createDAGRun(parsedDAG, runId);
+  seedInitialPrompt(dagRun, options.initialPrompt);
+  const run: ActiveRun = {
+    runId,
+    workflowId: parsedDAG.meta.workflow_id,
+    workflowName: parsedDAG.meta.name,
+    nodeCount: parsedDAG.graph.nodes.length,
+    agents: parsedDAG.meta.agents
+      ? { ...parsedDAG.meta.agents }
+      : undefined,
+    workspace: parsedDAG.meta.workspace
+      ? { ...parsedDAG.meta.workspace }
+      : undefined,
+    scorecard: parsedDAG.meta.scorecard
+      ? { ...parsedDAG.meta.scorecard }
+      : undefined,
+    dagRun,
+    createdAt: Date.now(),
+    status: "active",
+    limits: _resolveLimits(parsedDAG.meta.limits),
+    counters: _initialCounters(),
+    nodeIndex: _buildNodeIndex(parsedDAG.graph.nodes),
+    nodeSessions: new Map(),
+  };
+  store.set(runId, run);
+  writeRunMetadata(runId, serializeRunMetadata(run));
+  emit("dag:run_created", {
+    runId,
+    workflowId: run.workflowId,
+    nodeCount: run.nodeCount,
+  });
+  emit("dag:engine_started", {
+    runId,
+    workflowId: run.workflowId,
+    limits: { ...run.limits },
+  });
+  for (const nodeId of getReadyNodes(dagRun)) {
+    emit("dag:node_ready", { runId, nodeId });
+  }
+  _emitStatusUpdate(run);
+  return run;
+}
+
+export function seedInitialPrompt(
+  dagRun: DAGRun,
+  prompt: string | undefined,
+): void {
+  if (prompt === undefined || prompt.trim().length === 0) return;
+  for (const nodeId of getReadyNodes(dagRun)) {
+    const mailbox = dagRun.mailboxes.get(nodeId);
+    if (!mailbox) continue;
+    const values = mailbox.get("prompt") ?? [];
+    values.push(prompt);
+    mailbox.set("prompt", values);
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Cold recovery — rebuild an ActiveRun from persisted state after a restart.
+//
+//  The persisted RunMetadata covers nearly every ActiveRun field, but four
+//  DAGRun Maps are process-local and NOT serialized (mailboxes, afterSatisfied,
+//  inputSatisfied, loopSources). Rather than hand-writing reconstruction and
+//  risking loop-gateway wake-ups or dependency-satisfaction edge cases, we
+//  rebuild a minimal DAGRun (all nodes PENDING, empty Maps) and replay the
+//  persisted dag_handoffs through the engine's own `handoff()` — which drives
+//  mailbox pushes, inputSatisfied marking, afterDep satisfaction, tryPromote
+//  and loop wake-ups exactly as it did the first time. The authoritative
+//  nodeStates snapshot from metadata is then layered on top so transient
+//  states (RUNNING) are preserved long enough to be demoted.
+// ---------------------------------------------------------------------------
+
+/** Rebuilds a DAGRun's non-persisted Maps by replaying handoff history.
+ * Caller must have set every node to a fresh state (we use PENDING) and
+ * supplied empty afterSatisfied/inputSatisfied/mailboxes. */
+function _replayHandoffsInto(
+  dagRun: DAGRun,
+  handoffs: Array<{ fromNode: string; port: string; content?: unknown }>,
+): void {
+  for (const record of handoffs) {
+    if (!dagRun.nodeStates.has(record.fromNode)) continue;
+    handoff(dagRun, record.fromNode, record.port, record.content);
+  }
+}
+
+function _graphFromPersisted(data: PersistedGraphData): {
+  nodes: DAGGraphNode[];
+  edges: DAGEdge[];
+  loopSources: Set<string>;
+} {
+  const nodes = data.nodes.map((node): DAGGraphNode => ({ ...node }));
+  const edges = data.edges.map((edge): DAGEdge => ({ ...edge }));
+  const loopSources = new Set(
+    nodes.filter((n) => n.node_type === "loop_gateway").map((n) => n.node_id),
+  );
+  return { nodes, edges, loopSources };
+}
+
+function _isRecoverableNodeState(value: string): value is NodeState {
+  return RECOVERABLE_NODE_STATES.has(value);
+}
+
+function _rebuildDagRunFromPersisted(metadata: PersistedRunMetadata, graphData: PersistedGraphData): {
+  dagRun: DAGRun;
+  nodes: DAGGraphNode[];
+} {
+  const { nodes, edges, loopSources } = _graphFromPersisted(graphData);
+  const graph = { nodes, edges };
+
+  // Build a DAGRun in a neutral state, then replay history through the engine.
+  const nodeStates = new Map<string, NodeState>();
+  const afterSatisfied = new Map<string, Set<string>>();
+  const inputSatisfied = new Map<string, Set<string>>();
+  const mailboxes = new Map<string, Map<string, unknown[]>>();
+  for (const node of nodes) {
+    nodeStates.set(node.node_id, "PENDING");
+    afterSatisfied.set(node.node_id, new Set());
+    inputSatisfied.set(node.node_id, new Set());
+    mailboxes.set(node.node_id, new Map());
+  }
+  const dagRun: DAGRun = {
+    runId: metadata.runId,
+    graph,
+    loopSources,
+    nodeStates,
+    handoffedNodes: new Set(metadata.handoffedNodes),
+    afterSatisfied,
+    inputSatisfied,
+    mailboxes,
+  };
+
+  const snapshot = loadRunSnapshot(metadata.runId);
+  if (snapshot && snapshot.handoffs.length > 0) {
+    _replayHandoffsInto(dagRun, snapshot.handoffs);
+  }
+
+  // Layer the authoritative node-state snapshot on top of the replay. The replay
+  // only knows COMPLETED/terminal transitions; transient READY/RUNNING state is
+  // taken from disk and orphaned RUNNING nodes are demoted in a separate step.
+  for (const [nodeId, persistedState] of Object.entries(metadata.nodeStates)) {
+    if (!nodeStates.has(nodeId)) continue;
+    if (_isRecoverableNodeState(persistedState)) nodeStates.set(nodeId, persistedState);
+  }
+
+  return { dagRun, nodes };
+}
+
+function _applyOrphanedNodeDemotion(run: ActiveRun): string[] {
+  const demotedFromRunning = Array.from(run.dagRun.nodeStates.entries())
+    .filter(([, state]) => state === "RUNNING")
+    .map(([nodeId]) => nodeId);
+
+  // Apply RUNNING→FAILED demotion: mark sessions and emit the standard
+  // node-failed signal so downstream edges/on_failure are routed.
+  for (const nodeId of demotedFromRunning) {
+    const current = run.nodeSessions.get(nodeId);
+    if (current) {
+      _persistNodeSession(run, nodeId, { ...current, status: "failed" });
+    }
+    failNode(run.dagRun, nodeId, { error: "node lost: manager process restarted" });
+    emit("dag:node_failed", {
+      runId: run.runId,
+      nodeId,
+      reason: "node lost: manager process restarted",
+    });
+  }
+
+  // If demoting orphaned nodes made the run terminal, mark it failed.
+  if (demotedFromRunning.length > 0 && isRunTerminal(run.dagRun)) {
+    run.status = "failed";
+    run.completedAt = Date.now();
+    emit("dag:run_failed", {
+      runId: run.runId,
+      nodeId: demotedFromRunning[0],
+      reason: "run failed during cold recovery (orphaned running nodes)",
+    });
+    deprovisionProvisionedForRun(run.runId);
+  }
+
+  return demotedFromRunning;
+}
+
+export type RestoreActiveRunResult =
+  | { status: "restored"; run: ActiveRun; demotedFromRunning: string[] }
+  | { status: "skipped"; reason: string };
+
+/** Reconstruct a single ActiveRun from persisted metadata and replay it into
+ * the in-memory store. Only `status: "active"` runs are recoverable. */
+export function restoreActiveRun(
+  metadata: PersistedRunMetadata,
+): RestoreActiveRunResult {
+  if (metadata.status !== "active") {
+    return { status: "skipped", reason: `run is ${metadata.status}` };
+  }
+  if (!metadata.graph) {
+    return { status: "skipped", reason: "missing persisted graph" };
+  }
+  if (store.has(metadata.runId)) {
+    return { status: "skipped", reason: "run already active in this process" };
+  }
+
+  const { dagRun, nodes } = _rebuildDagRunFromPersisted(metadata, metadata.graph);
+  const run: ActiveRun = {
+    runId: metadata.runId,
+    workflowId: metadata.workflowId,
+    workflowName: metadata.workflowName,
+    nodeCount: metadata.nodeCount,
+    agents: metadata.agents
+      ? { ...metadata.agents }
+      : undefined,
+    workspace: metadata.workspace ? { ...metadata.workspace } : undefined,
+    scorecard: metadata.scorecard ? { ...metadata.scorecard } : undefined,
+    dagRun,
+    createdAt: metadata.createdAt,
+    status: "active",
+    limits: metadata.limits ?? { ...DEFAULT_LIMITS },
+    counters: metadata.counters ?? _initialCounters(),
+    nodeIndex: _buildNodeIndex(nodes),
+    nodeSessions: new Map(),
+  };
+
+  // Restore per-node sessions from dag_session_index.
+  for (const entry of listDagSessionIndex(metadata.runId)) {
+    run.nodeSessions.set(entry.node_id, _entryToNodeSession(entry));
+  }
+
+  store.set(metadata.runId, run);
+
+  const demotedFromRunning = _applyOrphanedNodeDemotion(run);
+  writeRunMetadata(metadata.runId, serializeRunMetadata(run));
+
+  emit("dag:run_recovered", {
+    runId: metadata.runId,
+    recoveredAt: Date.now(),
+    demotedFromRunning,
+    reason: demotedFromRunning.length
+      ? "orphaned running nodes demoted to failed"
+      : undefined,
+  });
+  _emitStatusUpdate(run);
+
+  return { status: "restored", run, demotedFromRunning };
+}
+
+export interface ColdRecoverySummary {
+  recovered: string[];
+  failed: string[];
+  skipped: string[];
+}
+
+/** Scan all persisted runs and restore every still-active one into the
+ * in-memory store. Safe to call at startup. Idempotent. */
+export function recoverAllActiveRuns(): ColdRecoverySummary {
+  const summary: ColdRecoverySummary = { recovered: [], failed: [], skipped: [] };
+  for (const runId of listPersistedRunIds()) {
+    try {
+      const metadata = loadRunMetadata(runId);
+      if (!metadata) {
+        summary.skipped.push(runId);
+        continue;
+      }
+      const result = restoreActiveRun(metadata);
+      if (result.status === "restored") {
+        if (result.run.status === "failed") {
+          summary.failed.push(runId);
+        } else {
+          summary.recovered.push(runId);
+        }
+      } else {
+        summary.skipped.push(runId);
+      }
+    } catch (err) {
+      // A single corrupt run must not block recovery of the rest.
+      console.error(
+        `[homerail_manager] cold recovery skipped run ${runId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      summary.skipped.push(runId);
+    }
+  }
+  return summary;
+}
+
+/** Re-dispatch READY nodes of every recovered active run. Intended to be
+ * called once, after the first worker/node reconnects, so dispatch actually
+ * finds a target instead of immediately failing. */
+export function dispatchRecoveredRuns(dispatcher: DAGDispatcher): number {
+  let dispatched = 0;
+  for (const run of store.values()) {
+    if (run.status !== "active") continue;
+    dispatched += dispatchReadyNodes(run.runId, dispatcher);
+  }
+  return dispatched;
+}
+
+export function getActiveRun(runId: string): ActiveRun | undefined {
+  return store.get(runId);
+}
+
+export function getCurrentNodeSession(runId: string, nodeId: string): NodeSessionState | undefined {
+  const run = store.get(runId);
+  if (!run || !run.dagRun.nodeStates.has(nodeId)) return undefined;
+  return _ensureNodeSession(run, nodeId);
+}
+
+export function isCurrentNodeSession(runId: string, nodeId: string, sessionId: string | undefined): boolean {
+  if (!sessionId) return true;
+  const current = getCurrentNodeSession(runId, nodeId);
+  return !current || current.sessionId === sessionId;
+}
+
+export function listActiveRuns(): ActiveRun[] {
+  return Array.from(store.values());
+}
+
+export function completeActiveRun(runId: string): ActiveRun | undefined {
+  const run = store.get(runId);
+  if (!run) return undefined;
+  const before = _snapshotNodeStates(run);
+  run.status = "completed";
+  run.completedAt = Date.now();
+  for (const nodeId of run.nodeSessions.keys()) {
+    _markNodeSessionStatus(run, nodeId, "completed");
+  }
+  writeRunMetadata(runId, serializeRunMetadata(run));
+  _emitNodeStateChanges(run, before);
+  emit("dag:run_completed", { runId });
+  emit("dag:engine_completed", { runId });
+  deprovisionProvisionedForRun(runId);
+  return run;
+}
+
+export function cancelActiveRun(runId: string): ActiveRun | undefined {
+  const run = store.get(runId);
+  if (!run) return undefined;
+  if (run.status !== "active") return run;
+  const before = _snapshotNodeStates(run);
+  for (const [nodeId, state] of run.dagRun.nodeStates.entries()) {
+    if (state === "RUNNING" || state === "READY") {
+      run.dagRun.nodeStates.set(nodeId, "CANCELLED");
+      _markNodeSessionStatus(run, nodeId, "cancelled");
+    } else if (state === "PENDING") {
+      run.dagRun.nodeStates.set(nodeId, "SKIPPED");
+    }
+  }
+  run.status = "cancelled";
+  run.completedAt = Date.now();
+  writeRunMetadata(runId, serializeRunMetadata(run));
+  _emitNodeStateChanges(run, before);
+  emit("dag:run_cancelled", { runId });
+  deprovisionProvisionedForRun(runId);
+  return run;
+}
+
+export function abortActiveRun(runId: string, reason: string, nodeId?: string): ActiveRun | undefined {
+  const run = store.get(runId);
+  if (!run) return undefined;
+  if (run.status !== "active") return run;
+  const before = _snapshotNodeStates(run);
+  if (nodeId && run.dagRun.nodeStates.has(nodeId)) {
+    run.dagRun.nodeStates.set(nodeId, "FAILED");
+    _markNodeSessionStatus(run, nodeId, "failed");
+  }
+  for (const [id, state] of run.dagRun.nodeStates.entries()) {
+    if (id === nodeId) continue;
+    if (state === "READY" || state === "RUNNING") {
+      run.dagRun.nodeStates.set(id, "CANCELLED");
+      _markNodeSessionStatus(run, id, "cancelled");
+    } else if (state === "PENDING") {
+      run.dagRun.nodeStates.set(id, "SKIPPED");
+    }
+  }
+  run.status = "failed";
+  run.completedAt = Date.now();
+  run.counters.abort_reason = reason;
+  writeRunMetadata(runId, serializeRunMetadata(run));
+  _emitNodeStateChanges(run, before);
+  emit("dag:engine_aborted", { runId, nodeId, reason });
+  emit("dag:run_failed", { runId, nodeId: nodeId ?? "", reason });
+  deprovisionProvisionedForRun(runId);
+  return run;
+}
+
+export function failActiveRun(runId: string, nodeId: string, reason: string): ActiveRun | undefined {
+  const run = store.get(runId);
+  if (!run) return undefined;
+  if (run.status !== "active") return run;
+  const before = _snapshotNodeStates(run);
+  const readyBefore = new Set(getReadyNodes(run.dagRun));
+  failNode(run.dagRun, nodeId, { error: reason });
+  _markNodeSessionStatus(run, nodeId, "failed");
+  writeRunMetadata(runId, serializeRunMetadata(run));
+  _emitNodeStateChanges(run, before);
+  emit("dag:node_failed", { runId, nodeId, reason });
+
+  for (const readyNodeId of getReadyNodes(run.dagRun)) {
+    if (!readyBefore.has(readyNodeId)) {
+      emit("dag:node_ready", { runId, nodeId: readyNodeId });
+    }
+  }
+
+  if (isRunTerminal(run.dagRun)) {
+    run.status = "failed";
+    run.completedAt = Date.now();
+    writeRunMetadata(runId, serializeRunMetadata(run));
+    _emitStatusUpdate(run);
+    emit("dag:run_failed", { runId, nodeId, reason });
+    deprovisionProvisionedForRun(runId);
+  }
+  return run;
+}
+
+export type NodeCorrectionResult =
+  | { status: "scheduled"; run: ActiveRun; attempt: number; maxAttempts: number }
+  | { status: "exhausted"; run: ActiveRun; attempts: number; maxAttempts: number }
+  | { status: "unavailable"; reason: string };
+
+function _correctionPrompt(nodeId: string, reason: string, attempt: number, maxAttempts: number): string {
+  return [
+    `Correction attempt ${attempt}/${maxAttempts} for DAG node ${nodeId}.`,
+    `Previous attempt ended without a valid DAG handoff: ${reason}`,
+    "Re-run the node using the original inputs and finish by calling the handoff tool with one of the declared output ports.",
+  ].join("\n");
+}
+
+export function requestNodeCorrection(
+  runId: string,
+  nodeId: string,
+  reason: string,
+): NodeCorrectionResult {
+  const run = store.get(runId);
+  if (!run) return { status: "unavailable", reason: `Unknown run: ${runId}` };
+  if (run.status !== "active") return { status: "unavailable", reason: `Run is not active: ${run.status}` };
+  if (!run.dagRun.nodeStates.has(nodeId)) return { status: "unavailable", reason: `Unknown node: ${nodeId}` };
+
+  const maxAttempts = run.limits.max_corrections_per_node;
+  const previousAttempts = run.counters.corrections[nodeId] ?? 0;
+  if (previousAttempts >= maxAttempts) {
+    return { status: "exhausted", run, attempts: previousAttempts, maxAttempts };
+  }
+
+  const before = _snapshotNodeStates(run);
+  const attempt = previousAttempts + 1;
+  run.counters.corrections[nodeId] = attempt;
+  const mailbox = run.dagRun.mailboxes.get(nodeId);
+  if (mailbox) {
+    const values = mailbox.get("correction") ?? [];
+    values.push(_correctionPrompt(nodeId, reason, attempt, maxAttempts));
+    mailbox.set("correction", values);
+  }
+  run.dagRun.nodeStates.set(nodeId, "READY");
+  run.dagRun.handoffedNodes.delete(nodeId);
+  writeRunMetadata(runId, serializeRunMetadata(run));
+  _emitNodeStateChanges(run, before);
+  emit("dag:node_correction_requested", { runId, nodeId, reason, attempt, maxAttempts });
+  emit("dag:node_ready", { runId, nodeId });
+  return { status: "scheduled", run, attempt, maxAttempts };
+}
+
+function _defaultSuccessPort(run: ActiveRun, nodeId: string): string {
+  const edge = run.dagRun.graph.edges.find((candidate) =>
+    candidate.from_node === nodeId &&
+    candidate.label !== "after_dep" &&
+    candidate.condition !== "on_failure" &&
+    !isFailurePort(candidate.from_port)
+  );
+  return edge?.from_port || "done";
+}
+
+export function autoHandoffAfterCorrectionExhausted(
+  runId: string,
+  nodeId: string,
+  reason: string,
+): ActiveRun | undefined {
+  const run = store.get(runId);
+  if (!run || run.status !== "active" || !run.dagRun.nodeStates.has(nodeId)) return undefined;
+  const port = _defaultSuccessPort(run, nodeId);
+  const next = handoffActiveRun(runId, nodeId, port, {
+    auto_handoff: true,
+    reason,
+  });
+  if (next) {
+    emit("dag:node_auto_handoff", { runId, nodeId, port, reason });
+  }
+  return next;
+}
+
+export function recordNodeDispatchRetry(runId: string, nodeId: string, reason: string): boolean {
+  const run = store.get(runId);
+  if (!run || run.status !== "active" || !run.dagRun.nodeStates.has(nodeId)) return false;
+  const previousAttempts = run.counters.dispatch_retries[nodeId] ?? 0;
+  if (previousAttempts >= MAX_DISPATCH_RETRIES_PER_NODE) return false;
+  const attempt = previousAttempts + 1;
+  run.counters.dispatch_retries[nodeId] = attempt;
+  writeRunMetadata(runId, serializeRunMetadata(run));
+  emit("dag:node_dispatch_retry", {
+    runId,
+    nodeId,
+    reason,
+    attempt,
+    maxAttempts: MAX_DISPATCH_RETRIES_PER_NODE,
+  });
+  return true;
+}
+
+export function checkpointResumeActiveRun(
+  runId: string,
+  nodeId: string,
+  request: CheckpointResumeRequest,
+): CheckpointResumeResult {
+  const run = store.get(runId);
+  if (!run) return { status: "unavailable", reason: `Run is not active in this Manager process: ${runId}` };
+  if (run.status !== "active") return { status: "unavailable", reason: `Run is terminal: ${runId}` };
+  if (!run.dagRun.nodeStates.has(nodeId)) return { status: "unavailable", reason: `Unknown node: ${nodeId}` };
+  const instruction = typeof request.instruction === "string" ? request.instruction.trim() : "";
+  if (!instruction) return { status: "unavailable", reason: "Missing required field: instruction" };
+
+  const before = _snapshotNodeStates(run);
+  const parent = _ensureNodeSession(run, nodeId);
+  const requestedSessionId = typeof request.sessionId === "string" && request.sessionId.trim()
+    ? _safeIndexSegment(request.sessionId, request.sessionId.trim())
+    : undefined;
+  if (requestedSessionId && requestedSessionId === parent.sessionId) {
+    return {
+      status: "unavailable",
+      reason: "checkpoint resume requires a new forked session id; refusing to reuse the parent session",
+    };
+  }
+  let fork;
+  const nextSession: NodeSessionState = {
+    sessionId: requestedSessionId ?? _newSessionId(runId, nodeId),
+    attempt: parent.attempt + 1,
+    parentSessionId: parent.sessionId,
+    forkedFromEntryUuid: undefined,
+    resumeInstruction: instruction,
+    status: "active",
+  };
+  try {
+    fork = checkpointForkSession({
+      runId,
+      nodeId,
+      parentSessionId: parent.sessionId,
+      newSessionId: nextSession.sessionId,
+      entryUuid: typeof request.entryUuid === "string" && request.entryUuid.trim()
+        ? request.entryUuid.trim()
+        : undefined,
+      last: request.last,
+    });
+    nextSession.forkedFromEntryUuid = fork.entryUuid;
+  } catch (err) {
+    return {
+      status: "unavailable",
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+  _persistNodeSession(run, nodeId, nextSession);
+
+  const mailbox = run.dagRun.mailboxes.get(nodeId);
+  if (mailbox) {
+    mailbox.set("checkpoint_resume", [instruction]);
+  }
+  run.dagRun.nodeStates.set(nodeId, "READY");
+  run.dagRun.handoffedNodes.delete(nodeId);
+
+  writeRunMetadata(runId, serializeRunMetadata(run));
+  _emitNodeStateChanges(run, before);
+  emit("dag:checkpoint_resume", {
+    runId,
+    nodeId,
+    sessionId: nextSession.sessionId,
+    parentSessionId: nextSession.parentSessionId,
+    attempt: nextSession.attempt,
+    entryUuid: fork.entryUuid,
+    instructionPreview: _instructionPreview(instruction),
+  });
+  emit("dag:node_ready", { runId, nodeId });
+
+  return {
+    status: "scheduled",
+    runId,
+    nodeId,
+    sessionId: nextSession.sessionId,
+    parentSessionId: nextSession.parentSessionId,
+    attempt: nextSession.attempt,
+    entryUuid: fork.entryUuid,
+    keptEntries: fork.keptEntries,
+    totalEntries: fork.totalEntries,
+    instruction,
+  };
+}
+
+export function handoffActiveRun(
+  runId: string,
+  fromNode: string,
+  port: string,
+  content: unknown,
+): ActiveRun | undefined {
+  const run = store.get(runId);
+  if (!run) return undefined;
+  if (run.counters.handoffs >= run.limits.max_handoffs) {
+    abortActiveRun(runId, `max_handoffs (${run.limits.max_handoffs}) exceeded`, fromNode);
+    throw new Error(`max_handoffs (${run.limits.max_handoffs}) exceeded`);
+  }
+  const before = _snapshotNodeStates(run);
+  const readyBefore = new Set(getReadyNodes(run.dagRun));
+  run.counters.handoffs++;
+
+  for (const edge of run.dagRun.graph.edges) {
+    if (edge.from_node !== fromNode || edge.to_node === "" || edge.label === "after_dep") continue;
+    if (!edgeMatchesHandoff(edge, port)) continue;
+    if (!_isBackwardEdge(run, edge)) continue;
+    const key = `${edge.from_node}/${edge.from_port}->${edge.to_node}/${edge.to_port}`;
+    const nextCount = (run.counters.edge_traversals[key] ?? 0) + 1;
+    run.counters.edge_traversals[key] = nextCount;
+    if (nextCount > run.limits.max_edge_traversals) {
+      abortActiveRun(runId, `max_edge_traversals (${run.limits.max_edge_traversals}) exceeded for ${key}`, fromNode);
+      throw new Error(`max_edge_traversals (${run.limits.max_edge_traversals}) exceeded for ${key}`);
+    }
+  }
+
+  const transition = handoff(run.dagRun, fromNode, port, content);
+  _markNodeSessionStatus(run, fromNode, transition.terminalFailure ? "failed" : "completed");
+  appendHandoff(runId, { runId, fromNode, port, content, timestamp: Date.now() });
+  writeRunMetadata(runId, serializeRunMetadata(run));
+  _emitNodeStateChanges(run, before);
+  emit("dag:handoff", { runId, fromNode, port });
+  if (transition.terminalFailure) {
+    emit("dag:terminal_failure_handoff", { runId, fromNode, port });
+  }
+
+  for (const nodeId of getReadyNodes(run.dagRun)) {
+    if (!readyBefore.has(nodeId)) {
+      emit("dag:node_ready", { runId, nodeId });
+    }
+  }
+
+  if (run.status === "active" && isRunTerminal(run.dagRun)) {
+    if (transition.terminalFailure) {
+      run.status = "failed";
+      run.completedAt = Date.now();
+      writeRunMetadata(runId, serializeRunMetadata(run));
+      _emitStatusUpdate(run);
+      emit("dag:run_failed", { runId, nodeId: fromNode, reason: `terminal failure handoff on port ${port}` });
+      deprovisionProvisionedForRun(runId);
+    } else {
+      completeActiveRun(runId);
+    }
+  }
+
+  return run;
+}
+
+export function getActiveRunCount(): number {
+  let count = 0;
+  for (const run of store.values()) {
+    if (run.status === "active") count++;
+  }
+  return count;
+}
+
+function _afterDepEdges(node: DAGGraphNode): DAGEdge[] {
+  return node.after.map((fromNode) => ({
+    from_node: fromNode,
+    from_port: "done",
+    to_node: node.node_id,
+    to_port: "task",
+    condition: "on_success",
+    label: "after_dep",
+  }));
+}
+
+function _isBackwardEdge(run: ActiveRun, edge: DAGEdge): boolean {
+  const fromIndex = run.nodeIndex.get(edge.from_node);
+  const toIndex = run.nodeIndex.get(edge.to_node);
+  return fromIndex !== undefined && toIndex !== undefined && fromIndex > toIndex;
+}
+
+export function appendRunNode(
+  runId: string,
+  request: AppendRunNodeRequest,
+): AppendRunNodeResult | undefined {
+  const run = store.get(runId);
+  if (!run || run.status !== "active") return undefined;
+  const node = request.node;
+  const before = _snapshotNodeStates(run);
+  if (run.dagRun.nodeStates.has(node.node_id)) {
+    throw new Error(`Node already exists in run graph: ${node.node_id}`);
+  }
+  for (const dep of node.after) {
+    if (!run.dagRun.nodeStates.has(dep)) {
+      throw new Error(`Unknown after dependency: ${dep}`);
+    }
+  }
+
+  const afterEdges = _afterDepEdges(node);
+  const outputEdges = _normalizeOutputsToEdges(node.outputs as Record<string, DAGOutputRoute>, node.node_id);
+  const nextGraph = {
+    nodes: [...run.dagRun.graph.nodes, node],
+    edges: [...run.dagRun.graph.edges, ...afterEdges, ...outputEdges],
+  };
+  assertGraphValid(nextGraph);
+
+  run.dagRun.graph.nodes.push(node);
+  run.dagRun.graph.edges.push(...afterEdges, ...outputEdges);
+  run.nodeIndex.set(node.node_id, run.dagRun.graph.nodes.length - 1);
+  run.dagRun.afterSatisfied.set(
+    node.node_id,
+    new Set(node.after.filter((dep) => run.dagRun.handoffedNodes.has(dep))),
+  );
+  run.dagRun.inputSatisfied.set(node.node_id, new Set<string>());
+  run.dagRun.mailboxes.set(node.node_id, new Map<string, unknown[]>());
+  const depsSatisfied = node.after.every((dep) => run.dagRun.handoffedNodes.has(dep));
+  run.dagRun.nodeStates.set(node.node_id, depsSatisfied ? "READY" : "PENDING");
+  run.nodeCount = run.dagRun.graph.nodes.length;
+  if (request.agentConfig) {
+    run.agents = { ...(run.agents ?? {}), [node.agent]: request.agentConfig };
+  }
+
+  writeRunMetadata(runId, serializeRunMetadata(run));
+  _emitNodeStateChanges(run, before);
+  emit("dag:node_added", { runId, nodeId: node.node_id, after: node.after });
+  if (depsSatisfied) emit("dag:node_ready", { runId, nodeId: node.node_id });
+
+  return {
+    runId,
+    nodeId: node.node_id,
+    ready: depsSatisfied,
+    dispatched: false,
+    nodeCount: run.nodeCount,
+  };
+}
+
+export interface CancelAllResult {
+  cancelled: string[];
+  activeBefore: number;
+  activeAfter: number;
+}
+
+export function cancelAllActiveRuns(): CancelAllResult {
+  const activeBefore = getActiveRunCount();
+  const cancelled: string[] = [];
+  for (const run of store.values()) {
+    if (run.status === "active") {
+      cancelActiveRun(run.runId);
+      cancelled.push(run.runId);
+    }
+  }
+  return { cancelled, activeBefore, activeAfter: getActiveRunCount() };
+}
+
+export function injectActiveRun(
+  runId: string,
+  nodeId: string,
+  instruction: string,
+  mode: string,
+): InjectResult | undefined {
+  const run = store.get(runId);
+  if (!run) return undefined;
+  if (run.status !== "active") return undefined;
+  const node = run.dagRun.graph.nodes.find((n) => n.node_id === nodeId);
+  if (!node) return undefined;
+
+  const result: InjectResult = {
+    runId,
+    nodeId,
+    instruction,
+    mode,
+    timestamp: Date.now(),
+    delivered: false,
+  };
+
+  writeRunMetadata(runId, serializeRunMetadata(run));
+  emit("dag:instruction_injected", {
+    runId,
+    nodeId,
+    instruction,
+    mode,
+  });
+
+  const target = findDispatchTarget(runId, nodeId);
+  if (target && target.targetType && target.targetId) {
+    const registryEntry =
+      target.targetType === "worker"
+        ? getWorker(target.targetId)
+        : getNode(target.targetId);
+    const socket = registryEntry?.socket;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(
+        JSON.stringify({
+          type: "inject",
+          data: { runId, nodeId, instruction, mode },
+        }),
+      );
+      result.delivered = true;
+      result.deliveryTargetType = target.targetType;
+      result.deliveryTargetId = target.targetId;
+      emit("dag:instruction_delivered", {
+        runId,
+        nodeId,
+        instruction,
+        mode,
+        targetType: target.targetType,
+        targetId: target.targetId,
+      });
+    } else {
+      result.deliveryGap = "target socket not open";
+      emit("dag:instruction_delivery_failed", {
+        runId,
+        nodeId,
+        instruction,
+        mode,
+        reason: result.deliveryGap,
+      });
+    }
+  } else {
+    result.deliveryGap = "no dispatch target found for node";
+    emit("dag:instruction_delivery_failed", {
+      runId,
+      nodeId,
+      instruction,
+      mode,
+      reason: result.deliveryGap,
+    });
+  }
+
+  return result;
+}
+
+function _nodeInputs(
+  run: DAGRun,
+  nodeId: string,
+): Record<string, unknown[]> {
+  const inputs: Record<string, unknown[]> = {};
+  const mailbox = run.mailboxes.get(nodeId);
+  if (!mailbox) return inputs;
+  for (const [port, values] of mailbox.entries()) {
+    if (values.length > 0) inputs[port] = [...values];
+  }
+  return inputs;
+}
+
+function _isGatewayNode(node: DAGGraphNode): boolean {
+  return node.node_type === "loop_gateway" || node.node_type === "condition_gateway";
+}
+
+function _firstInputValue(inputs: Record<string, unknown[]>): unknown {
+  for (const values of Object.values(inputs)) {
+    if (values.length > 0) return values[values.length - 1];
+  }
+  return undefined;
+}
+
+function _fieldValue(value: unknown, field: string | undefined): unknown {
+  if (!field) return value;
+  let current = value;
+  for (const part of field.split(".").map((item) => item.trim()).filter(Boolean)) {
+    if (typeof current !== "object" || current === null || Array.isArray(current)) return undefined;
+    current = (current as Record<string, unknown>)[part];
+  }
+  return current;
+}
+
+function _conditionGatewayPort(config: DAGGatewayConfig | undefined, input: unknown): string {
+  const selected = _fieldValue(input, config?.field);
+  const routes = config?.routes ?? config?.cases ?? {};
+  const key = selected === undefined || selected === null ? "" : String(selected);
+  if (key && typeof routes[key] === "string" && routes[key]) return routes[key];
+  if (typeof input === "object" && input !== null && !Array.isArray(input)) {
+    const raw = input as Record<string, unknown>;
+    if (typeof raw.port === "string" && raw.port) return raw.port;
+    if (typeof raw.route === "string" && raw.route) return raw.route;
+  }
+  return config?.default_port || "default";
+}
+
+function _loopGatewayItems(config: DAGGatewayConfig | undefined, inputs: Record<string, unknown[]>): unknown[] {
+  if (Array.isArray(config?.items)) return config.items;
+  const fromItemsPort = inputs.items?.find((value) => Array.isArray(value));
+  if (Array.isArray(fromItemsPort)) return fromItemsPort;
+  const first = _firstInputValue(inputs);
+  return Array.isArray(first) ? first : [];
+}
+
+function _executeGatewayNode(runId: string, run: ActiveRun, node: DAGGraphNode): boolean {
+  if (node.node_type === "condition_gateway") {
+    const inputs = _nodeInputs(run.dagRun, node.node_id);
+    const payload = _firstInputValue(inputs);
+    const port = _conditionGatewayPort(node.gateway_config, payload);
+    const next = handoffActiveRun(runId, node.node_id, port, payload);
+    if (!next) return false;
+    emit("dag:gateway_executed", {
+      runId,
+      nodeId: node.node_id,
+      gatewayType: node.node_type,
+      port,
+    });
+    return true;
+  }
+
+  if (node.node_type === "loop_gateway") {
+    const inputs = _nodeInputs(run.dagRun, node.node_id);
+    const items = _loopGatewayItems(node.gateway_config, inputs);
+    const index = run.counters.gateway_iterations[node.node_id] ?? 0;
+    const itemPort = node.gateway_config?.item_port || "next_item";
+    const donePort = node.gateway_config?.done_port || "done";
+    const port = index < items.length ? itemPort : donePort;
+    const payload = index < items.length
+      ? { item: items[index], index, total: items.length }
+      : { total: items.length, completed: true };
+    if (index < items.length) {
+      run.counters.gateway_iterations[node.node_id] = index + 1;
+    } else {
+      run.dagRun.loopSources.delete(node.node_id);
+    }
+    const next = handoffActiveRun(runId, node.node_id, port, payload);
+    if (!next) return false;
+    emit("dag:gateway_executed", {
+      runId,
+      nodeId: node.node_id,
+      gatewayType: node.node_type,
+      port,
+    });
+    return true;
+  }
+
+  return false;
+}
+
+type DispatchCredentialResolution =
+  | { ok: true; agentConfig: DAGAgentConfig }
+  | { ok: false; reason: string };
+
+type DispatchEnvelopeBuildResult =
+  | { ok: true; envelope: DispatchEnvelope }
+  | { ok: false; reason: string };
+
+function _isDisabledDirectLlmAgent(agentConfig: DAGAgentConfig): boolean {
+  return isDisabledDirectLlmAgentType(agentConfig.agent_type);
+}
+
+function _isDeterministicDagAgent(agentConfig: DAGAgentConfig): boolean {
+  return normalizeManagerAgentRuntimeAgentType(agentConfig.agent_type) === "deterministic";
+}
+
+function _withDispatchCredentials(agentConfig: DAGAgentConfig): DispatchCredentialResolution {
+  if (_isDisabledDirectLlmAgent(agentConfig)) {
+    return {
+      ok: false,
+      reason: "direct-llm is disabled for DAG execution. Configure a supported harness-backed agent_type for this runtime.",
+    };
+  }
+  if (_isDeterministicDagAgent(agentConfig)) {
+    return { ok: true, agentConfig: { ...agentConfig, agent_type: "deterministic" } };
+  }
+  const provider = agentConfig.llm?.provider;
+  const model = agentConfig.llm?.model ?? agentConfig.model;
+  try {
+    const resolved = resolveAgentRuntimeConfig({
+      surface: "dag",
+      settingId: agentConfig.llm_setting_id,
+      providerName: provider,
+      modelName: model,
+      agentType: agentConfig.agent_type,
+    });
+    return {
+      ok: true,
+      agentConfig: {
+        ...agentConfig,
+        agent_type: resolved.agent_type,
+        llm: {
+          ...agentConfig.llm,
+          provider: resolved.provider_name,
+          model: resolved.model,
+          api_key: resolved.api_key,
+          base_url: resolved.base_url,
+          protocol: resolved.protocol,
+        },
+      },
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+function _buildDispatchEnvelope(run: ActiveRun, nodeId: string): DispatchEnvelopeBuildResult {
+  if (run.status !== "active") return { ok: false, reason: `run ${run.runId} is not active` };
+  if (getNodeState(run.dagRun, nodeId) !== "READY") {
+    return { ok: false, reason: `node ${nodeId} is not READY` };
+  }
+  const node = run.dagRun.graph.nodes.find((n) => n.node_id === nodeId);
+  if (!node) return { ok: false, reason: `unknown node ${nodeId}` };
+  if (_isGatewayNode(node)) {
+    return { ok: false, reason: `gateway node ${nodeId} is not worker-dispatchable` };
+  }
+
+  const agentId = node.agent;
+  const agentConfig = run.agents?.[agentId] ?? {};
+  const credentials = _withDispatchCredentials(agentConfig);
+  if (!credentials.ok) return credentials;
+
+  const inputs = _nodeInputs(run.dagRun, nodeId);
+  const nodeSession = _ensureNodeSession(run, nodeId);
+  const dispatchInputs = nodeSession.resumeInstruction
+    ? { ...inputs, checkpoint_resume: [nodeSession.resumeInstruction] }
+    : inputs;
+  const outgoingEdges = run.dagRun.graph.edges.filter(
+    (e) => e.from_node === nodeId && e.label !== "after_dep",
+  );
+
+  return {
+    ok: true,
+    envelope: {
+      runId: run.runId,
+      nodeId,
+      sessionId: nodeSession.sessionId,
+      agentId,
+      agentConfig: credentials.agentConfig,
+      inputs: dispatchInputs,
+      outgoingEdges,
+      checkpointResume: nodeSession.resumeInstruction
+        ? {
+            parentSessionId: nodeSession.parentSessionId,
+            entryUuid: nodeSession.forkedFromEntryUuid,
+            instruction: nodeSession.resumeInstruction,
+            attempt: nodeSession.attempt,
+          }
+        : undefined,
+      workflowId: run.workflowId,
+      workflowName: run.workflowName,
+      workspace: run.workspace,
+      image: node.image,
+      container_group: node.container_group,
+      requiredCapabilities: node.requires?.capabilities,
+    },
+  };
+}
+
+export function buildCurrentDispatchEnvelope(
+  runId: string,
+  nodeId: string,
+): DispatchEnvelopeBuildResult {
+  const run = store.get(runId);
+  if (!run) return { ok: false, reason: `unknown run ${runId}` };
+  return _buildDispatchEnvelope(run, nodeId);
+}
+
+export function dispatchReadyNodes(
+  runId: string,
+  dispatcher: DAGDispatcher,
+): number {
+  const run = store.get(runId);
+  if (!run) return 0;
+
+  let count = 0;
+  const before = _snapshotNodeStates(run);
+  const ready = getReadyNodes(run.dagRun);
+  for (const nodeId of ready) {
+    const node = run.dagRun.graph.nodes.find((n) => n.node_id === nodeId);
+    if (!node) continue;
+    if (_isGatewayNode(node)) {
+      if (_executeGatewayNode(runId, run, node)) count++;
+      continue;
+    }
+
+    const built = _buildDispatchEnvelope(run, nodeId);
+    if (!built.ok) {
+      failActiveRun(runId, nodeId, built.reason);
+      continue;
+    }
+    if (run.counters.dispatches >= run.limits.max_dispatches) {
+      abortActiveRun(runId, `max_dispatches (${run.limits.max_dispatches}) exceeded`, nodeId);
+      break;
+    }
+    run.counters.dispatches++;
+
+    const envelope = built.envelope;
+
+    let result = dispatcher.dispatch(envelope);
+    if (result.status === "failed") {
+      const retryable = result.retryable !== false;
+      if (retryable && recordNodeDispatchRetry(runId, nodeId, result.reason)) {
+        if (run.counters.dispatches >= run.limits.max_dispatches) {
+          abortActiveRun(runId, `max_dispatches (${run.limits.max_dispatches}) exceeded`, nodeId);
+          break;
+        }
+        run.counters.dispatches++;
+        result = dispatcher.dispatch({
+          ...envelope,
+          inputs: {
+            ...envelope.inputs,
+            dispatch_retry: [
+              `Retrying DAG node ${nodeId} after transient dispatch failure: ${result.reason}`,
+            ],
+          },
+        });
+      }
+      if (result.status === "failed") {
+        failActiveRun(runId, nodeId, result.reason);
+        continue;
+      }
+    }
+    if (result.status !== "dispatched") continue;
+    startNode(run.dagRun, nodeId);
+    _markNodeSessionStatus(run, nodeId, "running");
+    emit("dag:node_dispatched", { runId, nodeId, agentId: envelope.agentId, sessionId: envelope.sessionId });
+    count++;
+  }
+  if (count > 0) {
+    writeRunMetadata(runId, serializeRunMetadata(run));
+    _emitNodeStateChanges(run, before);
+  }
+  return count;
+}
+
+export function markNodeDispatched(
+  runId: string,
+  nodeId: string,
+): boolean {
+  const run = store.get(runId);
+  if (!run || run.status !== "active") return false;
+
+  if (getNodeState(run.dagRun, nodeId) !== "READY") return false;
+  const node = run.dagRun.graph.nodes.find((n) => n.node_id === nodeId);
+  if (!node) return false;
+
+  const before = _snapshotNodeStates(run);
+  startNode(run.dagRun, nodeId);
+  const nodeSession = _ensureNodeSession(run, nodeId);
+  _markNodeSessionStatus(run, nodeId, "running");
+  emit("dag:node_dispatched", { runId, nodeId, agentId: node.agent, sessionId: nodeSession.sessionId });
+  writeRunMetadata(runId, serializeRunMetadata(run));
+  _emitNodeStateChanges(run, before);
+  return true;
+}

@@ -1,0 +1,24 @@
+widget_id = "voice-memo"
+widget_type = "memo"
+schema_version = 1
+title = "任务记录"
+status = "clarifying"
+summary = "用户想调查过去 24 小时的 AI 新闻。"
+next_action = "询问交付形式"
+ready_to_execute = false
+
+known_facts = [
+  "时间范围是过去 24 小时",
+]
+
+open_questions = [
+  "交付形式是口头摘要还是文档",
+]
+
+[[todo]]
+text = "确认范围"
+done = true
+
+[[todo]]
+text = "确认交付形式"
+done = false

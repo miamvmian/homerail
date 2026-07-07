@@ -1,0 +1,4 @@
+interface:
+  display_name: "HomeRail Install Ops"
+  short_description: "Deploy and verify local-source HomeRail."
+  default_prompt: "Use $homerail-install-ops to deploy HomeRail from a local checkout and run a smoke DAG."

@@ -1,0 +1,23 @@
+{
+  "name": "homerail",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Voice-first local agent orchestration runtime for auditable DAG workflows.",
+  "license": "MIT",
+  "scripts": {
+    "install:all": "npm --prefix homerail_protocol ci && npm --prefix homerail_manager ci && npm --prefix homerail_node ci && npm --prefix homerail_worker ci && npm --prefix homerail_cli ci && npm --prefix agent-ui ci",
+    "build:packages": "npm --prefix homerail_protocol run build && npm --prefix homerail_manager run build && npm --prefix homerail_node run build && npm --prefix homerail_worker run build && npm --prefix homerail_cli run build && npm --prefix agent-ui run build",
+    "build": "npm run build:packages",
+    "test:packages": "npm --prefix homerail_protocol test && npm --prefix homerail_manager test && npm --prefix homerail_node test && npm --prefix homerail_worker test && npm --prefix homerail_cli test && npm --prefix agent-ui test",
+    "test": "npm run build:packages && npm run test:packages",
+    "typecheck": "npm --prefix homerail_protocol run typecheck && npm --prefix homerail_manager run typecheck && npm --prefix homerail_node run typecheck && npm --prefix homerail_worker run typecheck && npm --prefix homerail_cli run typecheck && npm --prefix agent-ui run typecheck",
+    "e2e:agent-ui": "npm --prefix agent-ui run e2e",
+    "audit": "npm --registry=https://registry.npmjs.org --prefix homerail_protocol audit --audit-level=high && npm --registry=https://registry.npmjs.org --prefix homerail_manager audit --audit-level=high && npm --registry=https://registry.npmjs.org --prefix homerail_node audit --audit-level=high && npm --registry=https://registry.npmjs.org --prefix homerail_worker audit --audit-level=high && npm --registry=https://registry.npmjs.org --prefix homerail_cli audit --audit-level=high && npm --registry=https://registry.npmjs.org --prefix agent-ui audit --audit-level=high",
+    "ci": "npm run typecheck && npm run build:packages && npm run test:packages",
+    "smoke": "npm run ci"
+  },
+  "engines": {
+    "node": ">=20",
+    "npm": ">=10"
+  }
+}

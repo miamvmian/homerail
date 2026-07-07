@@ -1,0 +1,12 @@
+{
+  "chunk": {
+    "line": "Hello World"
+  },
+  "data": {},
+  "finished": false,
+  "id": "00000000-0000-0000-0000-000000000005",
+  "request_id": "00000000-0000-0000-0000-000000000001",
+  "sequence": 1,
+  "timestamp": "2026-01-01T00:00:00+00:00",
+  "type": "stream"
+}

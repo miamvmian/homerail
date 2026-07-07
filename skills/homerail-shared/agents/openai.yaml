@@ -1,0 +1,4 @@
+interface:
+  display_name: "HomeRail Shared"
+  short_description: "Shared HomeRail CLI, service, security, and local-source rules."
+  default_prompt: "Use $homerail-shared while installing, configuring, or operating HomeRail."

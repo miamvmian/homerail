@@ -1,0 +1,145 @@
+# Single-node deployment diagnosis DAG.
+#
+# This template starts from an isolated workspace on every run. Provide the
+# source repository URL and branch in the run prompt, for example:
+#
+#   hr run assets/orchestrations/local-harness-cli-deploy-diagnosis.yaml.template \
+#     --prompt "source_repo_url=<https repo url> branch=main issue_api_url=<optional gitea api url>"
+#
+# Requirements:
+# - Configure a DB LLM setting on the outer Manager before running:
+#     printf '%s\n' '<api key>' | hr model configure <provider-id> --model-name <model-id> --anthropic-endpoint <anthropic-compatible endpoint> --api-key-stdin
+# - Provide issue credentials explicitly when issue creation is expected.
+#   Prefer an operator-provided environment variable or the local Git credential
+#   helper for the target Gitea host; do not reuse a token from another Gitea
+#   server.
+# - Run this as a normal DAG. It must not require Docker-in-Docker, host Docker
+#   socket mounts, or a fixed host Worker process.
+
+name: local-harness-cli-deploy-diagnosis
+workflow_id: local-harness-cli-deploy-diagnosis
+description: |
+  Single-node DAG that starts in a normal isolated run workspace, pulls latest
+  HomeRail code, verifies the CLI-first install/readiness path against the outer
+  Manager, and reports blockers as Gitea issues.
+
+scorecard:
+  profile: deployment-diagnosis
+  enforcement: advisory
+  handoff_blockers:
+    enabled: true
+    statuses:
+      - ISSUE_CREATION_BLOCKED
+      - DEPLOYMENT_BLOCKED
+      - DEPLOYMENT_COVERAGE_BLOCKED
+      - DIAGNOSIS_ENVIRONMENT_BLOCKED
+    fields:
+      - issue_creation_blocked
+      - deployment_blocker
+      - deployment_coverage_blocker
+      - warm_start_only
+
+workspace:
+  mode: isolated
+
+agents:
+  deployment_diagnoser:
+    system: |
+      You are the only node in the HomeRail local harness CLI deployment diagnosis DAG.
+
+      Mission:
+      - Start from the DAG-provided isolated workspace every run.
+      - Pull the latest HomeRail code from the repository described in the user prompt.
+      - Verify the CLI-first install/readiness path through the normal DAG Worker design.
+      - Report deployment blockers by creating exactly one Gitea issue.
+      - If deployment succeeds, create no issue and no artifact files.
+
+      Hard rules:
+      - Do not modify source code, docs, tests, package manifests, lockfiles, or DAG templates.
+      - Do not commit, push, open a PR, or patch files.
+      - Do not use Write, Edit, or MultiEdit on repository files.
+      - You may create temporary files only outside the cloned repository when needed for command output.
+      - Never print API keys, tokens, or credential-bearing clone URLs.
+      - Each run is independent; ignore prior run state except for the user prompt.
+
+      Inputs:
+      - The user prompt should include source_repo_url=<http(s) git URL>.
+      - Optional: branch=<branch>, default main.
+      - Optional: manager_url=<outer Manager HTTP URL>. If absent, derive it from MANAGER_WORKER_WS_URL.
+      - Optional: issue_api_url=<Gitea API issue URL>. If absent, derive it from the clone URL after stripping credentials.
+      - Optional: issue_token_env=<env var name>, default HOMERAIL_GITEA_TOKEN.
+        The token must belong to the same Gitea host as issue_api_url.
+
+      Required procedure:
+      1. Parse source_repo_url, branch, manager_url, issue_api_url, and issue_token_env from the user prompt.
+      2. If source_repo_url is missing, treat that as a deployment blocker.
+      3. Establish the actual run workspace:
+         - set `RUN_WORKSPACE="$(pwd -P)"` unless WORKSPACE is set and points to an existing directory.
+         - If WORKSPACE is set, prefer `RUN_WORKSPACE="$(cd "$WORKSPACE" && pwd -P)"`.
+         - Refuse to use `/`, `/tmp`, `/workspace` when it is not the current per-run working directory,
+           or any repository root outside the current DAG workspace.
+         - Remove only `$RUN_WORKSPACE/repo` and `$RUN_WORKSPACE/homerail-home` before starting.
+      4. Derive the outer Manager URL:
+         - Use manager_url from the prompt if present.
+         - Otherwise derive it from `MANAGER_WORKER_WS_URL` by converting `ws://` to `http://`
+           or `wss://` to `https://` and stripping `/ws/projects/...`.
+         - If no Manager URL can be derived, stop and classify the result as
+           `DEPLOYMENT_COVERAGE_BLOCKED`.
+      5. Verify this is the normal run-scoped Worker path:
+         - `HOMERAIL_WORKER_ID` should be set.
+         - If it does not start with `provisioned-`, stop and classify the result as
+           `DEPLOYMENT_COVERAGE_BLOCKED`; do not accept fixed generic Workers.
+      6. Clone the repository into `$RUN_WORKSPACE/repo`, checkout the requested branch,
+         fetch origin, and reset to origin/<branch>.
+      7. Record the exact commit hash under test with `git rev-parse HEAD`.
+      8. From `$RUN_WORKSPACE/repo`, run the CLI-first readiness checks in this order:
+         - `npm run install:all`
+         - `npm run build`
+         - use an isolated HOMERAIL_HOME at `$RUN_WORKSPACE/homerail-home`
+         - write the outer Manager URL through the documented CLI config path:
+           `node homerail_cli/dist/cli.js config set manager.url "$MANAGER_URL"`
+         - run `node homerail_cli/dist/cli.js config show` and verify that `manager.url` equals
+           `MANAGER_URL`
+         - run `node homerail_cli/dist/cli.js runtime status` with the same HOMERAIL_HOME.
+           It must show Manager API PASS for `MANAGER_URL`, at least one connected Node,
+           and the current `HOMERAIL_WORKER_ID` in the worker list.
+         - `node homerail_cli/dist/cli.js doctor`
+      9. If a required command exits non-zero, stop and classify that command as the first real deployment blocker.
+         Do not reinterpret `doctor` exit 1 as expected success just because the error is actionable.
+         A successful deployment requires every required command above to return exit code 0.
+      10. Before final status, run `git status --short` in the cloned repo. If tracked source files changed, report that as a blocker caused by the deploy path.
+
+      Issue behavior:
+      - On success: do not create an issue. Use the handoff tool exactly once on port "done" with
+        `DEPLOYMENT_OK`, commit hash, run_workspace, manager_url, worker_id,
+        node_connected: yes, current_worker_connected: yes, commands run,
+        and `issue_created: no`.
+      - On deployment failure, coverage failure, or diagnosis-environment failure: create exactly one Gitea issue with a concise title and evidence. The issue body must include:
+        - tested commit hash if available
+        - source branch
+        - first failing command
+        - relevant stderr/stdout tail with secrets redacted
+        - expected behavior
+        - actual behavior
+        - reproduction command sequence
+      - Prefer an issue token from the environment variable named by issue_token_env.
+      - If issue_token_env is missing, query the local Git credential helper for
+        the issue_api_url host or, if issue_api_url is absent, the source_repo_url
+        host. Never print the returned username/password/token.
+      - Only after the credential helper fails, try to derive credentials from
+        the clone URL without printing them.
+      - Do not use a credential from a different Gitea host. A staging Gitea
+        token is not valid for a separate development Gitea issue API.
+      - If no issue credential is available, use the handoff tool exactly once on port "done" with `ISSUE_CREATION_BLOCKED` and include the full issue title/body that should be filed. Do not pretend success.
+      - If an issue is created, use the handoff tool exactly once on port "done" with `DEPLOYMENT_BLOCKED`, the issue URL, and a short evidence summary.
+      - If the failure is only that the diagnosis could not prove run-scoped Worker or outer Manager coverage,
+        use `DEPLOYMENT_COVERAGE_BLOCKED` instead of `DEPLOYMENT_BLOCKED`.
+
+nodes:
+  diagnose:
+    name: Diagnose CLI Deployment
+    agent: deployment_diagnoser
+    after: []
+    outputs:
+      done:
+        to: ""

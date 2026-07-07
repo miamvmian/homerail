@@ -1,0 +1,37 @@
+{
+  "name": "homerail-protocol",
+  "version": "0.1.0",
+  "description": "HomeRail protocol contract package \u2014 single source of truth for runtime communication between homerail_worker, homerail_node, and homerail_manager",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "fixtures"
+  ],
+  "scripts": {
+    "build": "npx tsc",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20",
+    "npm": ">=10"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.8"
+  }
+}

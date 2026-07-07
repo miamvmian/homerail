@@ -1,0 +1,244 @@
+import { describe, expect, it } from "vitest";
+import {
+  DEFAULT_MANAGER_AGENT_HARNESS,
+  MANAGER_AGENT_PRODUCTION_RUNTIME_AGENT_TYPES,
+  ManagerAgentRuntimePlacement,
+  isDisabledDirectLlmAgentType,
+  isManagerAgentHarness,
+  managerAgentHarnessDefinition,
+  managerAgentRuntimeAgentTypeForHarness,
+  managerAgentRuntimePlacementForHarness,
+  normalizeManagerAgentHarness,
+  normalizeManagerAgentRuntimeAgentType,
+} from "../src/manager-agent.js";
+import { buildManagerAgentSystemPrompt } from "../src/manager-agent-prompt.js";
+import {
+  MANAGER_AGENT_COMMON_VOICE_TOOL_NAMES,
+  MANAGER_AGENT_HOST_VOICE_TOOL_NAMES,
+  MANAGER_AGENT_WIDGET_FILE_TYPES,
+  formatHomeRailPromptHandoff,
+  formatHomeRailPromptToolCall,
+  managerAgentCommonToolCatalog,
+  managerAgentToolSpec,
+  parseHomeRailPromptHandoff,
+  parseHomeRailPromptToolCalls,
+  stripHomeRailPromptMarkers,
+} from "../src/manager-agent-tools.js";
+import {
+  createManagerAgentWidgetFileTools,
+  MANAGER_AGENT_WIDGET_FILE_TOOL_NAMES,
+  type ManagerAgentWidgetFileToolAdapter,
+} from "../src/manager-agent-widget-tools.js";
+
+describe("Manager Agent harness contract", () => {
+  it("keeps canonical public harness ids explicit", () => {
+    expect(DEFAULT_MANAGER_AGENT_HARNESS).toBe("claude_agent_sdk");
+    expect(isManagerAgentHarness("claude_agent_sdk")).toBe(true);
+    expect(isManagerAgentHarness("codex_appserver")).toBe(true);
+    expect(isManagerAgentHarness("kimi_code")).toBe(true);
+    expect(isManagerAgentHarness("claude-sdk")).toBe(false);
+    expect(isManagerAgentHarness("direct-llm")).toBe(false);
+    expect(isManagerAgentHarness("unknown")).toBe(false);
+  });
+
+  it("normalizes legacy aliases in one shared place", () => {
+    expect(normalizeManagerAgentHarness("claude")).toBe("claude_agent_sdk");
+    expect(normalizeManagerAgentHarness("claude-sdk")).toBe("claude_agent_sdk");
+    expect(normalizeManagerAgentHarness("claude-agent-sdk")).toBe("claude_agent_sdk");
+    expect(normalizeManagerAgentHarness("codex")).toBe("codex_appserver");
+    expect(normalizeManagerAgentHarness("codex-appserver")).toBe("codex_appserver");
+    expect(normalizeManagerAgentHarness("kimi")).toBe("kimi_code");
+    expect(normalizeManagerAgentHarness("kimi-code")).toBe("kimi_code");
+    expect(normalizeManagerAgentHarness("unknown")).toBeUndefined();
+  });
+
+  it("declares the only Manager Agent runtime placement boundary", () => {
+    expect(Object.values(ManagerAgentRuntimePlacement)).toEqual(["host", "host_shell", "container"]);
+    expect(managerAgentRuntimePlacementForHarness("codex_appserver")).toBe("host");
+    expect(managerAgentRuntimePlacementForHarness("kimi_code")).toBe("container");
+    expect(managerAgentRuntimePlacementForHarness("claude_agent_sdk")).toBe("container");
+  });
+
+  it("maps public harness ids to runtime agent types", () => {
+    expect(managerAgentRuntimeAgentTypeForHarness("codex_appserver")).toBe("codex_appserver");
+    expect(managerAgentRuntimeAgentTypeForHarness("kimi_code")).toBe("kimi_code");
+    expect(managerAgentRuntimeAgentTypeForHarness("claude_agent_sdk")).toBe("claude-sdk");
+    expect(MANAGER_AGENT_PRODUCTION_RUNTIME_AGENT_TYPES).toEqual([
+      "codex_appserver",
+      "kimi_code",
+      "claude-sdk",
+    ]);
+    expect(managerAgentHarnessDefinition("codex_appserver")).toMatchObject({
+      harness: "codex_appserver",
+      agent_type: "codex_appserver",
+      runtime_placement: "host",
+    });
+  });
+
+  it("normalizes runtime agent_type aliases while preserving unknown custom backends", () => {
+    expect(normalizeManagerAgentRuntimeAgentType("claude-agent-sdk")).toBe("claude-sdk");
+    expect(normalizeManagerAgentRuntimeAgentType("kimi-code")).toBe("kimi_code");
+    expect(normalizeManagerAgentRuntimeAgentType("codex")).toBe("codex_appserver");
+    expect(normalizeManagerAgentRuntimeAgentType("fixture-kimi-code")).toBe("fixture-kimi-code");
+    expect(normalizeManagerAgentRuntimeAgentType("")).toBeUndefined();
+  });
+
+  it("keeps direct-llm disabled outside the public harness set", () => {
+    expect(isDisabledDirectLlmAgentType("direct-llm")).toBe(true);
+    expect(isDisabledDirectLlmAgentType("direct_llm")).toBe(true);
+    expect(normalizeManagerAgentHarness("direct-llm")).toBeUndefined();
+  });
+
+  it("declares shared Manager Agent tool schemas separately from host-only helpers", () => {
+    expect(MANAGER_AGENT_WIDGET_FILE_TYPES).toEqual([
+      "memo",
+      "task_draft",
+      "progress_status",
+      "checklist",
+      "artifact_ref",
+      "timeline",
+    ]);
+    expect(MANAGER_AGENT_COMMON_VOICE_TOOL_NAMES).toContain("update_voice_memo");
+    expect(MANAGER_AGENT_COMMON_VOICE_TOOL_NAMES).toContain("write_widget_file");
+    expect(MANAGER_AGENT_HOST_VOICE_TOOL_NAMES).toEqual([]);
+
+    const chatNames = managerAgentCommonToolCatalog("chat").map((tool) => tool.name);
+    const voiceNames = managerAgentCommonToolCatalog("voice").map((tool) => tool.name);
+    expect(chatNames).toContain("create_and_run");
+    expect(chatNames).not.toContain("write_widget_file");
+    expect(voiceNames).toContain("write_widget_file");
+    expect(voiceNames).toContain("update_voice_memo");
+    expect(managerAgentToolSpec("create_and_run").input_schema.properties).toMatchObject({
+      yamlPath: { type: "string" },
+      workflow_id: { type: "string" },
+      workflowId: { type: "string" },
+      profile: { type: "string" },
+    });
+    expect(managerAgentToolSpec("create_and_run").input_schema.anyOf).toEqual([
+      { required: ["workflow_id"] },
+      { required: ["workflowId"] },
+      { required: ["yamlPath"] },
+    ]);
+    expect(managerAgentToolSpec("write_widget_file").input_schema.properties).toMatchObject({
+      widget_type: { type: "string", enum: MANAGER_AGENT_WIDGET_FILE_TYPES },
+    });
+  });
+
+  it("builds shared handlers for all widget-file tools with adapter-backed side effects", async () => {
+    const calls: string[] = [];
+    const adapter: ManagerAgentWidgetFileToolAdapter = {
+      async updateVoiceMemo() {
+        calls.push("update_voice_memo");
+        return { text: "memo", widget: { id: "voice-memo", type: "list" } };
+      },
+      async validateWidgetFile() {
+        calls.push("validate_widget_file");
+        return { text: "{\"ok\":true}" };
+      },
+      async writeWidgetFile() {
+        calls.push("write_widget_file");
+        return { text: "{\"ok\":true}", widget: { id: "written", type: "list" } };
+      },
+      async readWidgetFile() {
+        calls.push("read_widget_file");
+        return { text: "{\"ok\":true,\"widget_id\":\"written\"}" };
+      },
+      async removeWidgetFile() {
+        calls.push("remove_widget_file");
+        return { text: "{\"ok\":true}", removeWidgetId: "written" };
+      },
+      async showWidgetTomlExample() {
+        calls.push("show_widget_toml_example");
+        return { text: "widget_id = \"example\"" };
+      },
+    };
+    const widgets: Record<string, unknown>[] = [];
+    const removed: string[] = [];
+    const tools = createManagerAgentWidgetFileTools({
+      adapter,
+      context: { projectId: "project-1", sessionId: "session-1" },
+      voiceSurface: {
+        addWidget: (widget) => widgets.push(widget),
+        removeWidget: (id) => removed.push(id),
+      },
+    });
+
+    expect(tools.map((tool) => tool.name)).toEqual([...MANAGER_AGENT_WIDGET_FILE_TOOL_NAMES]);
+    for (const tool of tools) {
+      await tool.handler({
+        widget_type: "checklist",
+        widget_id: "written",
+        toml: "widget_id = \"written\"",
+      });
+    }
+
+    expect(calls).toEqual([...MANAGER_AGENT_WIDGET_FILE_TOOL_NAMES]);
+    expect(widgets).toEqual([
+      { id: "voice-memo", type: "list" },
+      { id: "written", type: "list" },
+    ]);
+    expect(removed).toEqual(["written"]);
+  });
+
+  it("builds one voice prompt contract for host and container harnesses", () => {
+    const prompt = buildManagerAgentSystemPrompt({
+      responseMode: "voice",
+      runtime: { placement: "container", provider: "kimi", model: "kimi-code" },
+      voiceSystem: { source: "system:test", prompt: "VOICE_SYSTEM" },
+      voiceUiRules: { sources: ["user:test"], hash: "abc123", prompt: "VOICE_RULES" },
+    });
+    expect(prompt).toContain("manager-agent container");
+    expect(prompt).toContain("VOICE_SYSTEM");
+    expect(prompt).toContain("Voice UI rules hash: abc123");
+    expect(prompt).toContain("VOICE_RULES");
+    expect(prompt).toContain("Use tool-created widgets for generated UI");
+  });
+
+  it("describes host-shell manager agents separately from containers", () => {
+    const prompt = buildManagerAgentSystemPrompt({
+      runtime: { placement: "host_shell", provider: "kimi", model: "kimi-k2.7" },
+    });
+    expect(prompt).toContain("manager-agent host shell process");
+    expect(prompt).not.toContain("manager-agent container");
+  });
+
+  it("parses HomeRail prompt-mode tool markers as shared protocol data", () => {
+    const create = formatHomeRailPromptToolCall({
+      name: "create_and_run",
+      input: { yamlPath: "assets/orchestrations/public-two-node.yaml.template" },
+    });
+    const finish = formatHomeRailPromptToolCall({
+      name: "finish",
+      input: { text: "done" },
+    });
+    const handoff = formatHomeRailPromptHandoff({
+      port: "done",
+      content: { ok: true },
+      summary: "ok",
+    });
+    const text = [
+      "before",
+      create.replace(/</g, "&lt;").replace(/>/g, "&gt;"),
+      finish,
+      handoff,
+      "after",
+    ].join("\n");
+
+    expect(parseHomeRailPromptToolCalls(text)).toEqual([
+      {
+        name: "create_and_run",
+        input: { yamlPath: "assets/orchestrations/public-two-node.yaml.template" },
+      },
+      {
+        name: "finish",
+        input: { text: "done" },
+      },
+    ]);
+    expect(parseHomeRailPromptHandoff(text)).toEqual({
+      port: "done",
+      content: { ok: true },
+      summary: "ok",
+    });
+    expect(stripHomeRailPromptMarkers(text)).toBe("before\n\n\n\nafter");
+  });
+});

@@ -1,0 +1,14 @@
+widget_id = "review-checklist"
+widget_type = "checklist"
+schema_version = 1
+title = "PR 审查清单"
+status = "doing"
+summary = "用于跟踪当前审查任务的关键步骤。"
+
+[[item]]
+text = "读取 diff"
+done = true
+
+[[item]]
+text = "运行测试"
+done = false

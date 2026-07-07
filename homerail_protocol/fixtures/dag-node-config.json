@@ -1,0 +1,29 @@
+{
+  "agent_type": "claude",
+  "graph_nodes": [
+    "triage",
+    "coder",
+    "tester",
+    "reviewer",
+    "committer"
+  ],
+  "incoming_edges": [
+    {
+      "from_node": "triage",
+      "from_port": "done",
+      "to_node": "coder",
+      "to_port": "in:task"
+    }
+  ],
+  "model": "deepseek-v4-pro",
+  "node_id": "coder",
+  "outgoing_edges": [
+    {
+      "from_node": "coder",
+      "from_port": "done",
+      "to_node": "tester",
+      "to_port": "in:artifact"
+    }
+  ],
+  "session_id": "coder:abc123"
+}

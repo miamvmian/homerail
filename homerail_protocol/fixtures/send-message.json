@@ -1,0 +1,7 @@
+{
+  "content": {
+    "context": "waiting for results",
+    "question": "Did you run the tests?"
+  },
+  "to_node": "tester"
+}

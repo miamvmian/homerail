@@ -1,0 +1,12 @@
+{
+  "data": {},
+  "event_type": "created",
+  "id": "00000000-0000-0000-0000-000000000004",
+  "metadata": {
+    "source": "node1"
+  },
+  "resource_id": "abc123",
+  "resource_type": "container",
+  "timestamp": "2026-01-01T00:00:00+00:00",
+  "type": "event"
+}

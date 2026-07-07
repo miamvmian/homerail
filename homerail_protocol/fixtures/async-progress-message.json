@@ -1,0 +1,14 @@
+{
+  "current_stage": "building",
+  "data": {},
+  "details": {
+    "step": 3
+  },
+  "estimated_remaining": 60.0,
+  "id": "00000000-0000-0000-0000-000000000008",
+  "message": "Compiling...",
+  "operation_id": "op-001",
+  "progress_percentage": 50.0,
+  "timestamp": "2026-01-01T00:00:00+00:00",
+  "type": "async_progress"
+}

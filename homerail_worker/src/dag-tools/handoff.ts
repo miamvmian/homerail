@@ -1,0 +1,108 @@
+/**
+ * handoff DAG tool — send work result to downstream node.
+ * @version 0.1.0
+ */
+
+import type { DagToolDefinition } from "../agent/types.js";
+import type { DagToolsState } from "./index.js";
+
+export function createHandoffTool(state: DagToolsState): DagToolDefinition {
+  return {
+    name: "handoff",
+    description:
+      "将工作成果交接给下游节点。**每轮只能调用一次**，调用后本轮立即结束。" +
+      "根据当前阶段选择正确的输出端口（port），提供交接内容（content）。",
+    input_schema: {
+      type: "object",
+      properties: {
+        port: {
+          type: "string",
+          description: "输出端口名（必须是系统提示中列出的可用端口之一）",
+        },
+        content: {
+          description: "交接内容（JSON 值，任意类型）",
+        },
+        summary: {
+          type: "string",
+          description: "给下游的一句话摘要（可选）",
+        },
+      },
+      required: ["port", "content"],
+    },
+    handler: async (args: Record<string, unknown>) => {
+      const port = String(args.port ?? "");
+      const content = args.content ?? "";
+      const summary = String(args.summary ?? "");
+
+      if (state.yielded) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "错误：本轮已经调用过 handoff，不能重复调用。每轮只能调用一次 handoff，直接结束本轮即可。",
+            },
+          ],
+          is_error: true,
+        };
+      }
+
+      // Validate port
+      if (!state.availablePorts.includes(port)) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `无效的输出端口: ${port}。可用端口: ${state.availablePorts.join(", ")}`,
+            },
+          ],
+          is_error: true,
+        };
+      }
+
+      // Include both TS Manager response-bridge fields and legacy Python
+      // Manager DAG handoff fields while both runtimes coexist.
+      const payload = {
+        type: "node_handoff",
+        runId: state.runId,
+        nodeId: state.nodeId,
+        port,
+        from_node: state.nodeId,
+        from_port: port,
+        session_id: state.sessionId,
+        content,
+        summary,
+      };
+
+      try {
+        state.wsSend(JSON.stringify({
+          type: "response",
+          session_id: state.sessionId,
+          data: payload,
+        }));
+        state.yielded = true;
+        state.handoffData = payload;
+      } catch (err) {
+        return {
+          content: [{ type: "text" as const, text: `交接消息发送失败: ${err}` }],
+          is_error: true,
+        };
+      }
+
+      // Build downstream info
+      const edge = state.outgoingEdges.find((e) => e.from_port === port);
+      let downstreamInfo = "";
+      if (edge?.to_node) {
+        downstreamInfo = `\n下游节点: ${edge.to_node} (端口: ${edge.to_port})`;
+      }
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `交接成功\n端口: ${port}${downstreamInfo}`,
+          },
+        ],
+      };
+    },
+  };
+}

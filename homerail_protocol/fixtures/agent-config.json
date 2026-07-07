@@ -1,0 +1,15 @@
+{
+  "api_key": "<api-key>",
+  "api_timeout_ms": 300000,
+  "base_url": "https://provider.example/v1",
+  "enable_monitoring_hooks": false,
+  "extra": {},
+  "mcp_server_name": "tools",
+  "mcp_servers": {},
+  "mcp_stdio_module": "<mcp-stdio-module>",
+  "metadata": {},
+  "model": "<model-name>",
+  "system_prompt": "You are a coder agent.",
+  "system_prompt_mode": "append",
+  "workspace": "<workspace-path>"
+}

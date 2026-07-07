@@ -1,0 +1,11 @@
+{
+  "data": {},
+  "estimated_duration": 120.0,
+  "id": "00000000-0000-0000-0000-000000000007",
+  "operation_id": "op-001",
+  "queue_position": 1,
+  "request_id": "00000000-0000-0000-0000-000000000001",
+  "status": "queued",
+  "timestamp": "2026-01-01T00:00:00+00:00",
+  "type": "async_response"
+}

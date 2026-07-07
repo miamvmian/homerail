@@ -1,0 +1,359 @@
+import type { DAGEdge, DAGGraphData, ParsedDAG } from "./graph.js";
+
+export type NodeState =
+  | "PENDING"
+  | "READY"
+  | "RUNNING"
+  | "COMPLETED"
+  | "FAILED"
+  | "CANCELLED"
+  | "SKIPPED";
+
+export interface DAGRun {
+  runId: string;
+  graph: DAGGraphData;
+  loopSources: Set<string>;
+  nodeStates: Map<string, NodeState>;
+  handoffedNodes: Set<string>;
+  afterSatisfied: Map<string, Set<string>>;
+  inputSatisfied: Map<string, Set<string>>;
+  mailboxes: Map<string, Map<string, unknown[]>>;
+}
+
+export const FAILURE_PORTS = new Set(["failed", "failure", "rejected", "error"]);
+
+export interface DAGTransitionResult {
+  affectedNodes: string[];
+  routedNodes: string[];
+  terminalFailure?: boolean;
+}
+
+export function isFailurePort(port: string): boolean {
+  return FAILURE_PORTS.has(port.toLowerCase());
+}
+
+export function edgeMatchesHandoff(edge: DAGEdge, port: string): boolean {
+  if (edge.from_port !== port) return false;
+  if (edge.condition === "always") return true;
+  return isFailurePort(port)
+    ? edge.condition === "on_failure"
+    : edge.condition !== "on_failure";
+}
+
+function _incomingAfterDeps(edges: DAGEdge[], nodeId: string): DAGEdge[] {
+  return edges.filter(
+    (e) => e.to_node === nodeId && e.label === "after_dep",
+  );
+}
+
+function _incomingExplicitEdges(edges: DAGEdge[], nodeId: string): DAGEdge[] {
+  return edges.filter(
+    (e) => e.to_node === nodeId && e.label !== "after_dep",
+  );
+}
+
+function _incomingExplicitEdgesFrom(
+  edges: DAGEdge[],
+  nodeId: string,
+  fromNode: string,
+): DAGEdge[] {
+  return _incomingExplicitEdges(edges, nodeId).filter(
+    (e) => e.from_node === fromNode,
+  );
+}
+
+function _initialState(graph: DAGGraphData, nodeId: string): NodeState {
+  const deps = _incomingAfterDeps(graph.edges, nodeId);
+  return deps.length === 0 ? "READY" : "PENDING";
+}
+
+export function createDAGRun(parsedDAG: ParsedDAG, runId: string): DAGRun {
+  const nodeStates = new Map<string, NodeState>();
+  const afterSatisfied = new Map<string, Set<string>>();
+  const inputSatisfied = new Map<string, Set<string>>();
+  const mailboxes = new Map<string, Map<string, unknown[]>>();
+
+  for (const node of parsedDAG.graph.nodes) {
+    nodeStates.set(node.node_id, _initialState(parsedDAG.graph, node.node_id));
+    afterSatisfied.set(node.node_id, new Set<string>());
+    inputSatisfied.set(node.node_id, new Set<string>());
+    mailboxes.set(node.node_id, new Map<string, unknown[]>());
+  }
+
+  return {
+    runId,
+    graph: parsedDAG.graph,
+    loopSources: new Set(parsedDAG.loop_sources),
+    nodeStates,
+    handoffedNodes: new Set<string>(),
+    afterSatisfied,
+    inputSatisfied,
+    mailboxes,
+  };
+}
+
+function _ensureMailbox(run: DAGRun, nodeId: string, port: string): unknown[] {
+  const nodeBox = run.mailboxes.get(nodeId);
+  if (!nodeBox) {
+    throw new Error(`Unknown node: ${nodeId}`);
+  }
+  if (!nodeBox.has(port)) {
+    nodeBox.set(port, []);
+  }
+  return nodeBox.get(port)!;
+}
+
+function _tryPromote(run: DAGRun, nodeId: string): void {
+  if (run.nodeStates.get(nodeId) !== "PENDING") return;
+  const deps = _incomingAfterDeps(run.graph.edges, nodeId);
+  const satisfiedDeps = run.afterSatisfied.get(nodeId);
+  const satisfied = deps.every((e) => satisfiedDeps?.has(e.from_node));
+  if (!satisfied) return;
+
+  const routedInputs = run.inputSatisfied.get(nodeId);
+  for (const dep of deps) {
+    const explicitFromDep = _incomingExplicitEdgesFrom(
+      run.graph.edges,
+      nodeId,
+      dep.from_node,
+    );
+    if (explicitFromDep.length > 0 && !routedInputs?.has(dep.from_node)) {
+      return;
+    }
+  }
+
+  run.nodeStates.set(nodeId, "READY");
+}
+
+function _skipUntakenSatisfiedBranches(run: DAGRun, nodeId: string): void {
+  if (run.nodeStates.get(nodeId) !== "PENDING") return;
+  const deps = _incomingAfterDeps(run.graph.edges, nodeId);
+  const satisfiedDeps = run.afterSatisfied.get(nodeId);
+  const allDepsSatisfied = deps.every((e) => satisfiedDeps?.has(e.from_node));
+  if (!allDepsSatisfied) return;
+
+  const routedInputs = run.inputSatisfied.get(nodeId);
+  const hasUntakenRequiredInput = deps.some((dep) => {
+    const explicitFromDep = _incomingExplicitEdgesFrom(
+      run.graph.edges,
+      nodeId,
+      dep.from_node,
+    );
+    return explicitFromDep.length > 0 && !routedInputs?.has(dep.from_node);
+  });
+  if (hasUntakenRequiredInput) {
+    run.nodeStates.set(nodeId, "SKIPPED");
+  }
+}
+
+function _satisfyAfterDeps(run: DAGRun, fromNode: string): Set<string> {
+  const affected = new Set<string>();
+  for (const edge of run.graph.edges) {
+    if (edge.label !== "after_dep" || edge.from_node !== fromNode) continue;
+    run.afterSatisfied.get(edge.to_node)?.add(fromNode);
+    affected.add(edge.to_node);
+  }
+  return affected;
+}
+
+function _predecessors(run: DAGRun, nodeId: string): string[] {
+  return Array.from(new Set(
+    run.graph.edges
+      .filter((edge) => edge.to_node === nodeId)
+      .map((edge) => edge.from_node),
+  ));
+}
+
+function _hasAlternativePath(run: DAGRun, nodeId: string, excludePred: string): boolean {
+  for (const predId of _predecessors(run, nodeId)) {
+    if (predId === excludePred) continue;
+    const status = run.nodeStates.get(predId);
+    if (
+      status === "COMPLETED" ||
+      status === "RUNNING" ||
+      status === "PENDING" ||
+      status === "READY"
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function _skipDependentNodes(run: DAGRun, failedNodeId: string): void {
+  for (const edge of run.graph.edges) {
+    if (edge.from_node !== failedNodeId) continue;
+    if (edge.condition !== "on_success") continue;
+    if (!edge.to_node) continue;
+    if (run.nodeStates.get(edge.to_node) !== "PENDING") continue;
+    if (_hasAlternativePath(run, edge.to_node, failedNodeId)) continue;
+    run.nodeStates.set(edge.to_node, "SKIPPED");
+    _skipDependentNodes(run, edge.to_node);
+  }
+}
+
+function _wakeLoopSource(run: DAGRun, nodeId: string): void {
+  if (!run.loopSources.has(nodeId)) return;
+  if (run.nodeStates.get(nodeId) !== "RUNNING") return;
+  const mailbox = run.mailboxes.get(nodeId);
+  if (!mailbox) return;
+  const hasData = Array.from(mailbox.values()).some((v) => v.length > 0);
+  if (hasData) {
+    for (const [port, values] of mailbox.entries()) {
+      if (values.length > 1) {
+        mailbox.set(port, [values[values.length - 1]]);
+      }
+    }
+    run.nodeStates.set(nodeId, "READY");
+  }
+}
+
+function _isLoopGateway(run: DAGRun, nodeId: string): boolean {
+  return run.graph.nodes.find((node) => node.node_id === nodeId)?.node_type === "loop_gateway";
+}
+
+function _wakeLoopGatewayReceiver(run: DAGRun, fromNode: string, nodeId: string): void {
+  if (!_isLoopGateway(run, fromNode)) return;
+  const state = run.nodeStates.get(nodeId);
+  if (state !== "READY" && state !== "COMPLETED" && state !== "SKIPPED" && state !== "FAILED") return;
+  const mailbox = run.mailboxes.get(nodeId);
+  if (!mailbox) return;
+  const hasData = Array.from(mailbox.values()).some((v) => v.length > 0);
+  if (hasData) {
+    for (const [port, values] of mailbox.entries()) {
+      if (values.length > 1) {
+        mailbox.set(port, [values[values.length - 1]]);
+      }
+    }
+    if (state !== "READY") {
+      run.nodeStates.set(nodeId, "READY");
+    }
+  }
+}
+
+export function handoff(
+  run: DAGRun,
+  fromNode: string,
+  port: string,
+  content: unknown,
+): DAGTransitionResult {
+  if (!run.nodeStates.has(fromNode)) {
+    throw new Error(`Unknown node: ${fromNode}`);
+  }
+
+  const matchingDownstream = run.graph.edges.filter(
+    (edge) =>
+      edge.from_node === fromNode &&
+      edge.label !== "after_dep" &&
+      edge.to_node !== "" &&
+      edgeMatchesHandoff(edge, port),
+  );
+  const terminalFailure = isFailurePort(port) && matchingDownstream.length === 0;
+  run.handoffedNodes.add(fromNode);
+  run.nodeStates.set(
+    fromNode,
+    terminalFailure
+      ? "FAILED"
+      : run.loopSources.has(fromNode)
+        ? "RUNNING"
+        : "COMPLETED",
+  );
+
+  const affected = terminalFailure ? new Set<string>() : _satisfyAfterDeps(run, fromNode);
+  const mailboxReceivers = new Set<string>();
+  for (const edge of matchingDownstream) {
+    _ensureMailbox(run, edge.to_node, edge.to_port).push(content);
+    run.inputSatisfied.get(edge.to_node)?.add(fromNode);
+    affected.add(edge.to_node);
+    mailboxReceivers.add(edge.to_node);
+  }
+
+  for (const nodeId of affected) {
+    _tryPromote(run, nodeId);
+    _skipUntakenSatisfiedBranches(run, nodeId);
+  }
+  for (const nodeId of mailboxReceivers) {
+    _wakeLoopSource(run, nodeId);
+    _wakeLoopGatewayReceiver(run, fromNode, nodeId);
+  }
+  if (terminalFailure) {
+    _skipDependentNodes(run, fromNode);
+  }
+  return {
+    affectedNodes: Array.from(affected).sort(),
+    routedNodes: Array.from(mailboxReceivers).sort(),
+    terminalFailure,
+  };
+}
+
+export function failNode(
+  run: DAGRun,
+  nodeId: string,
+  errorData: unknown = "",
+): DAGTransitionResult {
+  if (!run.nodeStates.has(nodeId)) {
+    throw new Error(`Unknown node: ${nodeId}`);
+  }
+  run.nodeStates.set(nodeId, "FAILED");
+  const affected = _satisfyAfterDeps(run, nodeId);
+  const mailboxReceivers = new Set<string>();
+  for (const edge of run.graph.edges) {
+    if (edge.from_node !== nodeId) continue;
+    if (edge.label === "after_dep" || edge.to_node === "") continue;
+    if (edge.condition !== "on_failure" && edge.condition !== "always") continue;
+    _ensureMailbox(run, edge.to_node, edge.to_port).push(errorData);
+    run.inputSatisfied.get(edge.to_node)?.add(nodeId);
+    affected.add(edge.to_node);
+    mailboxReceivers.add(edge.to_node);
+  }
+  for (const affectedNode of affected) {
+    _tryPromote(run, affectedNode);
+    _skipUntakenSatisfiedBranches(run, affectedNode);
+  }
+  for (const receiver of mailboxReceivers) {
+    _wakeLoopSource(run, receiver);
+  }
+  _skipDependentNodes(run, nodeId);
+  return {
+    affectedNodes: Array.from(affected).sort(),
+    routedNodes: Array.from(mailboxReceivers).sort(),
+  };
+}
+
+export function isRunTerminal(run: DAGRun): boolean {
+  for (const [id, state] of run.nodeStates) {
+    if (state === "READY") return false;
+    if (state === "FAILED") continue;
+    if (state === "SKIPPED") continue;
+    if (run.loopSources.has(id) && state === "RUNNING") continue;
+    if (state === "RUNNING" || state === "PENDING") return false;
+    if (state !== "COMPLETED") return false;
+  }
+  return true;
+}
+
+export function getReadyNodes(run: DAGRun): string[] {
+  const ready: string[] = [];
+  for (const [id, state] of run.nodeStates) {
+    if (state === "READY") ready.push(id);
+  }
+  return ready.sort();
+}
+
+export function getNodeState(run: DAGRun, nodeId: string): NodeState {
+  const state = run.nodeStates.get(nodeId);
+  if (state === undefined) {
+    throw new Error(`Unknown node: ${nodeId}`);
+  }
+  return state;
+}
+
+export function startNode(run: DAGRun, nodeId: string): void {
+  const state = getNodeState(run, nodeId);
+  if (state !== "READY") {
+    throw new Error(
+      `Cannot start node ${nodeId}: expected READY, got ${state}`,
+    );
+  }
+  run.nodeStates.set(nodeId, "RUNNING");
+}

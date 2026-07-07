@@ -1,0 +1,481 @@
+<script setup lang="ts">
+import { computed, ref } from 'vue'
+import {
+  Loader2,
+  Pencil,
+  Plus,
+  Trash2,
+} from 'lucide-vue-next'
+import { agentSettingsApi } from '@/api/agent'
+import { useAgentStore } from '@/stores/agent-store'
+import { planLabel } from '@/lib/protocol-labels'
+import { useToast } from '@/components/controls/useToast'
+import type { LLMSetting } from '@/api/services/llm-settings-api'
+import type { Provider } from '@/api/types/orchestration-v2.types'
+import CapabilityBadge from './CapabilityBadge.vue'
+import ModelForm from './ModelForm.vue'
+import type { ModelFormPayload } from './ModelForm.vue'
+
+const props = defineProps<{
+  providers: Provider[]
+  llmSettings: LLMSetting[]
+  loading: boolean
+}>()
+
+const emit = defineEmits<{
+  (e: 'refresh'): void
+  (e: 'set-notice', message: string): void
+}>()
+
+const store = useAgentStore()
+const { showToast } = useToast()
+
+const dialogOpen = ref(false)
+const editingSetting = ref<LLMSetting | null>(null)
+const savingId = ref<string | null>(null)
+
+const activeSettings = computed(() => props.llmSettings.filter(s => s.is_active))
+const inactiveSettings = computed(() => props.llmSettings.filter(s => !s.is_active))
+
+function handleManagerProviderChange(event: Event): void {
+  store.setManagerRuntime((event.target as HTMLSelectElement).value)
+}
+
+function handleManagerModelChange(event: Event): void {
+  store.setManagerRuntime(store.managerProviderName, (event.target as HTMLSelectElement).value)
+}
+
+function openCreate(): void {
+  editingSetting.value = null
+  dialogOpen.value = true
+}
+
+function openEdit(setting: LLMSetting): void {
+  editingSetting.value = setting
+  dialogOpen.value = true
+}
+
+function closeDialog(): void {
+  if (savingId.value === 'dialog') return
+  dialogOpen.value = false
+  editingSetting.value = null
+}
+
+function messageOf(err: unknown): string {
+  if (err instanceof Error) return err.message
+  if (err && typeof err === 'object' && 'message' in err) {
+    const message = (err as { message?: unknown }).message
+    if (typeof message === 'string' && message.trim()) return message
+  }
+  return String(err || '操作失败')
+}
+
+async function runAction<T>(key: string, action: () => Promise<T>): Promise<T | undefined> {
+  savingId.value = key
+  try {
+    return await action()
+  } catch (err) {
+    showToast(messageOf(err), 'error', 6000)
+    return undefined
+  } finally {
+    savingId.value = null
+  }
+}
+
+async function handleSubmit(payload: ModelFormPayload): Promise<void> {
+  await runAction('dialog', async () => {
+    if (payload.id) {
+      await agentSettingsApi.updateLLMSetting(payload.id, {
+        provider_id: payload.providerId,
+        model_name: payload.modelName,
+        models: payload.models,
+        display_name: payload.displayName || undefined,
+        endpoint_id: payload.endpointId,
+        endpoint_name: payload.endpointName,
+        plan_type: payload.planType,
+        protocol: payload.protocol,
+        auth_type: payload.authType,
+        key_hint: payload.keyHint,
+        base_url: payload.baseUrl,
+        chat_completions_base_url: payload.chatCompletionsBaseUrl,
+        responses_base_url: payload.responsesBaseUrl,
+        anthropic_base_url: payload.anthropicBaseUrl,
+        resource_id: payload.resourceId,
+        voice_adapter: payload.voiceAdapter,
+        tts_http_url: payload.ttsHttpUrl,
+        tts_realtime_url: payload.ttsRealtimeUrl,
+        tts_bidirectional_url: payload.ttsBidirectionalUrl,
+        asr_realtime_url: payload.asrRealtimeUrl,
+        asr_async_url: payload.asrAsyncUrl,
+        tts_voice: payload.ttsVoice,
+        tts_format: payload.ttsFormat,
+        tts_sample_rate: payload.ttsSampleRate,
+        api_key: payload.apiKey || undefined,
+        is_default: payload.isDefault,
+        is_active: payload.isActive,
+        ...payload.capabilities,
+      })
+    } else {
+      const isCustomNew = !props.providers.some(p => p.id === payload.providerId)
+      if (isCustomNew) {
+        await agentSettingsApi.createProvider({
+          id: payload.providerId,
+          name: payload.providerName,
+          default_model: payload.modelName,
+          base_url: payload.baseUrl,
+          chat_completions_base_url: payload.chatCompletionsBaseUrl,
+          responses_base_url: payload.responsesBaseUrl,
+          anthropic_base_url: payload.anthropicBaseUrl,
+          status: 'active',
+          ...payload.capabilities,
+        })
+      }
+      const modelConfigs = payload.modelConfigs?.length
+        ? payload.modelConfigs
+        : [{
+            modelName: payload.modelName,
+            displayName: payload.displayName,
+            endpointId: payload.endpointId,
+            endpointName: payload.endpointName,
+            protocol: payload.protocol,
+            baseUrl: payload.baseUrl,
+            chatCompletionsBaseUrl: payload.chatCompletionsBaseUrl,
+            responsesBaseUrl: payload.responsesBaseUrl,
+            anthropicBaseUrl: payload.anthropicBaseUrl,
+            resourceId: payload.resourceId,
+            voiceAdapter: payload.voiceAdapter,
+            ttsHttpUrl: payload.ttsHttpUrl,
+            ttsRealtimeUrl: payload.ttsRealtimeUrl,
+            ttsBidirectionalUrl: payload.ttsBidirectionalUrl,
+            asrRealtimeUrl: payload.asrRealtimeUrl,
+            asrAsyncUrl: payload.asrAsyncUrl,
+            ttsVoice: payload.ttsVoice,
+            ttsFormat: payload.ttsFormat,
+            ttsSampleRate: payload.ttsSampleRate,
+            capabilities: payload.capabilities,
+          }]
+      for (const [index, model] of modelConfigs.entries()) {
+        await agentSettingsApi.createLLMSetting({
+          provider_id: payload.providerId,
+          model_name: model.modelName,
+          display_name: model.displayName || undefined,
+          endpoint_id: model.endpointId,
+          endpoint_name: model.endpointName,
+          plan_type: payload.planType,
+          protocol: model.protocol,
+          auth_type: payload.authType,
+          key_hint: payload.keyHint,
+          base_url: model.baseUrl,
+          chat_completions_base_url: model.chatCompletionsBaseUrl,
+          responses_base_url: model.responsesBaseUrl,
+          anthropic_base_url: model.anthropicBaseUrl,
+          resource_id: model.resourceId,
+          voice_adapter: model.voiceAdapter,
+          tts_http_url: model.ttsHttpUrl,
+          tts_realtime_url: model.ttsRealtimeUrl,
+          tts_bidirectional_url: model.ttsBidirectionalUrl,
+          asr_realtime_url: model.asrRealtimeUrl,
+          asr_async_url: model.asrAsyncUrl,
+          tts_voice: model.ttsVoice,
+          tts_format: model.ttsFormat,
+          tts_sample_rate: model.ttsSampleRate,
+          api_key: payload.apiKey,
+          is_default: payload.isDefault && index === 0,
+          is_active: payload.isActive,
+          ...model.capabilities,
+        })
+      }
+    }
+    emit('refresh')
+    await store.loadManagerRuntimeOptions()
+    dialogOpen.value = false
+    editingSetting.value = null
+    emit('set-notice', payload.id ? '模型配置已更新' : `已添加 ${payload.modelConfigs?.length || 1} 个模型配置`)
+  })
+}
+
+async function toggleActive(setting: LLMSetting): Promise<void> {
+  await runAction(`active-${setting.id}`, async () => {
+    await agentSettingsApi.updateLLMSetting(setting.id, { is_active: !setting.is_active })
+    emit('refresh')
+    await store.loadManagerRuntimeOptions()
+  })
+}
+
+async function setDefault(setting: LLMSetting): Promise<void> {
+  await runAction(`default-${setting.id}`, async () => {
+    await agentSettingsApi.updateLLMSetting(setting.id, { is_default: true })
+    emit('refresh')
+    await store.loadManagerRuntimeOptions()
+  })
+}
+
+async function remove(setting: LLMSetting): Promise<void> {
+  if (!window.confirm(`删除模型配置 ${setting.display_name || setting.model_name}？`)) return
+  await runAction(`delete-${setting.id}`, async () => {
+    await agentSettingsApi.deleteLLMSetting(setting.id)
+    emit('refresh')
+    await store.loadManagerRuntimeOptions()
+    emit('set-notice', '模型配置已删除')
+  })
+}
+
+function capabilityList(setting: LLMSetting): Array<{ key: 'llm' | 'asr' | 'tts' | 'audio' | 'vision' | 'video'; active: boolean }> {
+  return [
+    { key: 'llm', active: setting.supports_llm },
+    { key: 'vision', active: setting.supports_image_input },
+    { key: 'asr', active: setting.supports_asr },
+    { key: 'tts', active: setting.supports_tts },
+    { key: 'audio', active: setting.supports_audio_input },
+    { key: 'video', active: setting.supports_video_input },
+  ]
+}
+</script>
+
+<template>
+  <section data-testid="agent-settings-section-providers" class="mt-10 space-y-6">
+    <div class="rounded-lg border border-white/10 bg-[#252525] p-4">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 class="font-semibold">Manager Runtime</h2>
+          <div class="mt-1 text-xs text-gray-500">当前会话使用的模型</div>
+        </div>
+        <span class="rounded-full border border-white/10 px-3 py-1 text-xs text-gray-400">{{ activeSettings.length }} 个可用模型</span>
+      </div>
+      <div class="mt-4 grid gap-3 md:grid-cols-2">
+        <select
+          :value="store.managerProviderName"
+          class="h-10 rounded-md border border-white/10 bg-[#343434] px-3 text-sm outline-none"
+          :disabled="store.managerRuntimeLoading"
+          @change="handleManagerProviderChange"
+        >
+          <option v-for="provider in store.managerProviderOptions" :key="provider" :value="provider">
+            {{ store.managerProviderLabel(provider) }}
+          </option>
+        </select>
+        <select
+          v-model="store.managerModelName"
+          class="h-10 rounded-md border border-white/10 bg-[#343434] px-3 text-sm outline-none"
+          :disabled="store.managerRuntimeLoading"
+          @change="handleManagerModelChange"
+        >
+          <option v-for="model in store.managerModelOptions" :key="model" :value="model">
+            {{ store.managerModelLabel(store.managerProviderName, model) }}
+          </option>
+        </select>
+      </div>
+      <div class="mt-3 text-xs leading-relaxed text-gray-500">
+        切换 runtime 后，新 Manager 会话会使用所选模型。当前已进行中的会话不受影响。
+      </div>
+    </div>
+
+    <div class="rounded-lg border border-white/10 bg-[#252525]">
+      <div class="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
+        <div>
+          <h2 class="font-semibold">已配置模型</h2>
+          <div class="mt-1 text-xs text-gray-500">{{ providers.length }} 个供应商 · {{ llmSettings.length }} 个模型配置</div>
+        </div>
+        <button
+          class="inline-flex items-center gap-2 rounded-md bg-blue-500 px-3 py-2 text-sm text-white hover:bg-blue-400 disabled:opacity-50"
+          :disabled="loading"
+          @click="openCreate"
+        >
+          <Plus class="h-4 w-4" />
+          添加模型
+        </button>
+      </div>
+
+      <div v-if="loading && !llmSettings.length" class="px-4 py-8 text-center text-sm text-gray-500">
+        <Loader2 class="mx-auto h-5 w-5 animate-spin" />
+        <div class="mt-2">加载中...</div>
+      </div>
+
+      <div v-else-if="!llmSettings.length" class="px-4 py-8 text-center text-sm text-gray-500">
+        暂无模型配置，点击右上角添加。
+      </div>
+
+      <template v-else>
+        <div
+          v-for="setting in activeSettings"
+          :key="setting.id"
+          class="group border-b border-white/10 px-4 py-4 last:border-0"
+          :data-testid="`agent-settings-model-item-${setting.id}`"
+        >
+          <div class="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+            <div class="min-w-0 flex-1">
+              <div class="flex items-center gap-2">
+                <span class="font-medium">{{ setting.display_name || setting.model_name }}</span>
+                <span v-if="setting.is_default" class="rounded-full bg-emerald-400/10 px-2 py-0.5 text-[10px] text-emerald-200">默认</span>
+                <span class="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] text-emerald-200">启用</span>
+              </div>
+              <div class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-500">
+                <span>{{ setting.provider_name }}</span>
+                <span>·</span>
+                <span>{{ planLabel(setting.plan_type) }}</span>
+                <span>·</span>
+                <span v-if="setting.models && setting.models.length > 1" class="text-gray-400">
+                  {{ setting.models.length }} 个模型: {{ setting.models.slice(0, 3).join(', ') }}{{ setting.models.length > 3 ? '...' : '' }}
+                </span>
+                <span v-else>{{ setting.model_name }}</span>
+                <span>·</span>
+                <span class="font-mono">{{ setting.api_key_display || '****' }}</span>
+              </div>
+              <div class="mt-2 flex flex-wrap items-center gap-2">
+                <CapabilityBadge
+                  v-for="cap in capabilityList(setting)"
+                  :key="cap.key"
+                  :capability="cap.key"
+                  :active="cap.active"
+                />
+                <span v-if="setting.plan_type === 'custom' || setting.endpoint_id?.endsWith('_custom')" class="rounded-full bg-amber-400/10 px-2 py-0.5 text-[10px] text-amber-200">自定义</span>
+                <span class="rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-gray-300">{{ planLabel(setting.plan_type) }}</span>
+              </div>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2 xl:justify-end">
+              <button
+                class="rounded-md border border-white/10 px-3 py-1.5 text-xs text-gray-300 hover:bg-white/5"
+                :disabled="savingId === `default-${setting.id}`"
+                @click="setDefault(setting)"
+              >
+                <Loader2 v-if="savingId === `default-${setting.id}`" class="inline h-3 w-3 animate-spin" />
+                <span v-else>设为默认</span>
+              </button>
+              <button
+                class="rounded-md border border-white/10 px-3 py-1.5 text-xs text-gray-300 hover:bg-white/5"
+                @click="openEdit(setting)"
+              >
+                <Pencil class="h-3.5 w-3.5" />
+              </button>
+              <button
+                class="rounded-md border border-white/10 px-3 py-1.5 text-xs text-gray-300 hover:bg-white/5"
+                :disabled="savingId === `active-${setting.id}`"
+                @click="toggleActive(setting)"
+              >
+                <Loader2 v-if="savingId === `active-${setting.id}`" class="inline h-3 w-3 animate-spin" />
+                <span v-else>停用</span>
+              </button>
+              <button
+                class="rounded-md border border-red-500/30 px-2 py-1.5 text-red-300 hover:bg-red-500/10"
+                :disabled="savingId === `delete-${setting.id}`"
+                @click="remove(setting)"
+              >
+                <Loader2 v-if="savingId === `delete-${setting.id}`" class="inline h-4 w-4 animate-spin" />
+                <Trash2 v-else class="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="inactiveSettings.length" class="border-t border-dashed border-white/10 px-4 py-2">
+          <div class="text-xs text-gray-500">已停用 ({{ inactiveSettings.length }})</div>
+        </div>
+        <div
+          v-for="setting in inactiveSettings"
+          :key="setting.id"
+          class="group border-b border-white/10 px-4 py-3 opacity-60 last:border-0 hover:opacity-80"
+          :data-testid="`agent-settings-model-item-${setting.id}`"
+        >
+          <div class="flex flex-col gap-2 xl:flex-row xl:items-center xl:justify-between">
+            <div class="min-w-0 flex-1">
+              <div class="text-sm font-medium text-gray-400">{{ setting.display_name || setting.model_name }}</div>
+              <div class="mt-0.5 text-xs text-gray-600">
+                {{ setting.provider_name }}
+                <span v-if="setting.plan_type === 'custom' || setting.endpoint_id?.endsWith('_custom')" class="ml-1 rounded bg-amber-400/10 px-1 text-amber-200/70">自定义</span>
+                · {{ planLabel(setting.plan_type) }} · {{ setting.models && setting.models.length > 1 ? setting.models.length + ' 个模型' : setting.model_name }}
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <button
+                class="rounded-md border border-white/10 px-3 py-1.5 text-xs text-gray-400 hover:bg-white/5"
+                :disabled="savingId === `active-${setting.id}`"
+                @click="toggleActive(setting)"
+              >
+                <Loader2 v-if="savingId === `active-${setting.id}`" class="inline h-3 w-3 animate-spin" />
+                <span v-else>启用</span>
+              </button>
+              <button
+                class="rounded-md border border-red-500/30 px-2 py-1.5 text-red-300/70 hover:bg-red-500/10"
+                :disabled="savingId === `delete-${setting.id}`"
+                @click="remove(setting)"
+              >
+                <Trash2 class="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- 添加/编辑模型：右侧滑入面板（透明遮罩，点击关闭） -->
+    <teleport to="body">
+      <transition name="settings-overlay">
+        <div v-if="dialogOpen" class="settings-model-overlay" @click="closeDialog" />
+      </transition>
+      <transition name="settings-panel">
+        <div v-if="dialogOpen" class="settings-model-panel" data-testid="agent-settings-model-dialog" @click.stop>
+          <div class="flex h-full flex-col">
+            <div class="flex items-center justify-between border-b border-cyan-200/10 px-5 py-4 flex-shrink-0">
+              <h2 class="text-base font-semibold text-cyan-50">{{ editingSetting ? '编辑模型配置' : '添加模型配置' }}</h2>
+              <button class="rounded-md border border-cyan-200/14 px-3 py-1.5 text-sm text-gray-400 transition-colors hover:bg-cyan-200/10 hover:text-white" @click="closeDialog">关闭</button>
+            </div>
+            <div class="min-h-0 flex-1 overflow-y-auto">
+              <ModelForm
+                :providers="providers"
+                :editing="editingSetting"
+                :submitting="savingId === 'dialog'"
+                @submit="handleSubmit"
+                @cancel="closeDialog"
+              />
+            </div>
+          </div>
+        </div>
+      </transition>
+    </teleport>
+  </section>
+</template>
+
+<style scoped>
+/* 透明遮罩：拦截区域外点击，不全黑，微暗化背景 */
+.settings-model-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 59;
+  background: rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(2px);
+}
+
+.settings-model-panel {
+  position: fixed;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: min(640px, 94vw);
+  z-index: 60;
+  /* 匹配设置页主题：#080b0d 基底 + #071012 主区 + 毛玻璃 */
+  background: rgba(7, 16, 18, 0.96);
+  backdrop-filter: blur(24px);
+  border-left: 1px solid rgba(103, 232, 249, 0.12);
+  box-shadow: -24px 0 80px rgba(0, 0, 0, 0.45);
+}
+
+.settings-overlay-enter-active,
+.settings-overlay-leave-active {
+  transition: opacity 200ms ease;
+}
+.settings-overlay-enter-from,
+.settings-overlay-leave-to {
+  opacity: 0;
+}
+
+.settings-panel-enter-active {
+  transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.settings-panel-leave-active {
+  transition: transform 180ms cubic-bezier(0.4, 0, 1, 1);
+}
+.settings-panel-enter-from,
+.settings-panel-leave-to {
+  transform: translateX(100%);
+}
+</style>

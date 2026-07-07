@@ -1,0 +1,19 @@
+# Copy this file and edit model_alias values to match local DB model settings.
+# Sync with:
+#   hr profile sync assets/profiles/example-runtime.profile.yaml.template --workflow public-dev-5node-template
+#
+# `workflow_id` binds this runtime profile to one DAG instance. Keep it aligned
+# with the DAG's stable workflow_id.
+
+profile_id: example-runtime
+workflow_id: public-dev-5node-template
+description: Example DB-backed runtime profile for a DAG workflow.
+
+default:
+  model_alias: local-qwen
+  agent_type: claude-sdk
+
+agents:
+  reviewer:
+    model_alias: kimi-main
+    agent_type: kimi_code

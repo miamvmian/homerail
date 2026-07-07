@@ -1,0 +1,24 @@
+{
+  "description": "将工作成果交接给下游节点。每轮只能调用一次。",
+  "input_schema": {
+    "properties": {
+      "content": {
+        "description": "交接内容"
+      },
+      "port": {
+        "description": "输出端口名",
+        "type": "string"
+      },
+      "summary": {
+        "description": "给下游的一句话摘要",
+        "type": "string"
+      }
+    },
+    "required": [
+      "port",
+      "content"
+    ],
+    "type": "object"
+  },
+  "name": "handoff"
+}

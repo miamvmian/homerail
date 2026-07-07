@@ -1,0 +1,32 @@
+{
+  "name": "homerail-cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HomeRail TypeScript CLI for configuring, running, and inspecting DAG workflows.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/cli.js",
+  "bin": {
+    "hr": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx src/cli.ts"
+  },
+  "engines": {
+    "node": ">=20",
+    "npm": ">=10"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "homerail-protocol": "file:../homerail_protocol"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.22.4",
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.8"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "data": {},
+  "execution_time": 0.5,
+  "id": "00000000-0000-0000-0000-000000000003",
+  "request_id": "00000000-0000-0000-0000-000000000001",
+  "resource_data": {
+    "container_id": "abc123"
+  },
+  "status": "success",
+  "timestamp": "2026-01-01T00:00:00+00:00",
+  "type": "response"
+}
