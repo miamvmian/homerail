@@ -3,7 +3,6 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawnSync } from "node:child_process";
 import { getDataRoot } from "../config/env.js";
 import { encodeJson, getDb, parseJsonRow } from "../persistence/db.js";
 import { getProject } from "../persistence/projects-changes.js";
@@ -22,6 +21,7 @@ import {
   type RunManagerAgentTurnInput,
 } from "./manager-agent-runtime.js";
 import { validateConfigPatch } from "./manager-agent-config.js";
+import { resolveCodexBinary, runCodexCommandSync } from "./codex-binary.js";
 import { managerAgentRuntimePlacementForHarness, normalizeManagerAgentHarness } from "homerail-protocol";
 import {
   listWidgetFileTypes,
@@ -1228,21 +1228,16 @@ export function voiceAgentBootstrapHandler(
 
   // Codex 可用性检测：检查 CLI 是否安装 + 是否有登录态
   if (method === "GET" && pathname === "/api/voice-agent/codex-status") {
-    const codexBin = process.env.HOMERAIL_CODEX_BIN || "codex";
+    const requested = process.env.HOMERAIL_CODEX_BIN || process.env.CODEX_BIN_PATH || "codex";
+    const resolved = resolveCodexBinary(requested);
     let available = false;
     let version: string | undefined;
-    try {
-      const result = spawnSync(codexBin, ["--version"], {
-        timeout: 5_000,
-        encoding: "utf-8",
-        env: process.env,
-      });
+    if (resolved) {
+      const result = runCodexCommandSync(resolved.command, ["--version"]);
       if (result.status === 0) {
         available = true;
         version = (result.stdout || "").trim().split("\n")[0] || undefined;
       }
-    } catch {
-      available = false;
     }
     // 检查登录态：~/.codex/auth.json 存在且非空
     let loggedIn = false;
@@ -1255,7 +1250,7 @@ export function voiceAgentBootstrapHandler(
     } catch {
       loggedIn = false;
     }
-    ok(res, "Codex status checked", { available, logged_in: loggedIn, version });
+    ok(res, "Codex status checked", { available, logged_in: loggedIn, version, binary: resolved?.command ?? requested });
     return true;
   }
 

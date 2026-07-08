@@ -2,7 +2,6 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawnSync } from "node:child_process";
 import { getAllNodes, isDockerCapableNode } from "../node/registry.js";
 import { readManagerAgentConfig } from "../persistence/manager-agent-config.js";
 import { sendLifecycleRequest } from "../node/lifecycle-request.js";
@@ -13,6 +12,7 @@ import {
 } from "./manager-agent-container.js";
 import { hostShellDiagnostics } from "./host-shell-manager-agent.js";
 import { readDagResourceStatus, type DagResourceStatus } from "./dag-resource-status.js";
+import { resolveCodexBinary, runCodexCommandSync } from "./codex-binary.js";
 
 interface ReadinessBlocker {
   code: string;
@@ -73,21 +73,16 @@ function methodNotAllowed(res: http.ServerResponse): void {
 }
 
 function codexStatus(): CodexCheck {
-  const codexBin = process.env.HOMERAIL_CODEX_BIN || "codex";
+  const requested = process.env.HOMERAIL_CODEX_BIN || process.env.CODEX_BIN_PATH || "codex";
+  const resolved = resolveCodexBinary(requested);
   let available = false;
   let version: string | undefined;
-  try {
-    const result = spawnSync(codexBin, ["--version"], {
-      timeout: 5_000,
-      encoding: "utf-8",
-      env: process.env,
-    });
+  if (resolved) {
+    const result = runCodexCommandSync(resolved.command, ["--version"]);
     if (result.status === 0) {
       available = true;
       version = (result.stdout || "").trim().split("\n")[0] || undefined;
     }
-  } catch {
-    available = false;
   }
   let loggedIn = false;
   try {
@@ -99,7 +94,7 @@ function codexStatus(): CodexCheck {
   } catch {
     loggedIn = false;
   }
-  return { available, logged_in: loggedIn, version, binary: codexBin };
+  return { available, logged_in: loggedIn, version, binary: resolved?.command ?? requested };
 }
 
 function dockerCapableNodeIds(): string[] {
