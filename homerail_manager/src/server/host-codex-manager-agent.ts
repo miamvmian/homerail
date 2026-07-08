@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
 import { ensureDefaultWorkspacePath, getHomerailHome } from "../config/env.js";
+import { resolveCodexBinary } from "./codex-binary.js";
 import {
   readWidgetFile,
   removeWidgetFile,
@@ -1192,6 +1193,7 @@ class HostCodexAppServerAdapter {
   private notifications: Array<Record<string, unknown>> = [];
   private notifyWaiters: Array<() => void> = [];
   private codexBin: string;
+  private codexNeedsShell = false;
 
   constructor(codexBin?: string) {
     this.codexBin = codexBin ?? process.env.HOMERAIL_CODEX_BIN ?? process.env.CODEX_BIN_PATH ?? DEFAULT_CODEX_BIN;
@@ -1218,6 +1220,7 @@ class HostCodexAppServerAdapter {
         stdio: ["pipe", "pipe", "pipe"],
         env: this.buildEnv(context),
         cwd: context.workspace ?? process.cwd(),
+        shell: this.codexNeedsShell,
         windowsHide: true,
       });
       this.setupReadline();
@@ -1594,25 +1597,10 @@ class HostCodexAppServerAdapter {
   }
 
   private async validateBinary(): Promise<void> {
-    if (this.codexBin !== DEFAULT_CODEX_BIN && this.codexBin.includes(path.sep)) {
-      if (!fs.existsSync(this.codexBin)) throw new Error(`Codex binary not found at: ${this.codexBin}`);
-      return;
-    }
-    const alternatives = [
-      "/opt/homebrew/bin/codex",
-      path.join(os.homedir(), ".codex", "bin", "codex"),
-      "/usr/local/bin/codex",
-      "/usr/bin/codex",
-    ];
-    for (const alt of alternatives) {
-      if (fs.existsSync(alt)) {
-        this.codexBin = alt;
-        return;
-      }
-    }
-    const fromPath = findExecutableOnPath(this.codexBin);
-    if (fromPath) {
-      this.codexBin = fromPath;
+    const resolved = resolveCodexBinary(this.codexBin);
+    if (resolved) {
+      this.codexBin = resolved.command;
+      this.codexNeedsShell = resolved.needsShell;
       return;
     }
     throw new Error("Codex binary not found. Install codex or set HOMERAIL_CODEX_BIN.");
@@ -1625,14 +1613,4 @@ class HostCodexAppServerAdapter {
       inputSchema: tool.input_schema,
     }));
   }
-}
-
-function findExecutableOnPath(command: string): string | null {
-  const pathEnv = process.env.PATH ?? "";
-  for (const dir of pathEnv.split(path.delimiter)) {
-    if (!dir) continue;
-    const candidate = path.join(dir, command);
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  return null;
 }
