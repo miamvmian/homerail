@@ -65,6 +65,34 @@ describe("resolveCodexBinary", () => {
     });
   });
 
+  it("finds the Codex desktop app installation on Windows", () => {
+    const localAppData = "C:\\Users\\alice\\AppData\\Local";
+    const exe = path.win32.join(localAppData, "Programs", "OpenAI", "Codex", "bin", "codex.exe");
+
+    expect(resolveCodexBinary("codex", {
+      platform: "win32",
+      env: { LOCALAPPDATA: localAppData },
+      homeDir: "C:\\Users\\alice",
+      fileExists: fakeExistingFiles([exe]),
+    })).toEqual({
+      command: exe,
+      requested: "codex",
+      needsShell: false,
+    });
+  });
+
+  it("does not replace an explicit command name with a common Codex installation", () => {
+    const localAppData = "C:\\Users\\alice\\AppData\\Local";
+    const exe = path.win32.join(localAppData, "Programs", "OpenAI", "Codex", "bin", "codex.exe");
+
+    expect(resolveCodexBinary("custom-codex", {
+      platform: "win32",
+      env: { LOCALAPPDATA: localAppData },
+      homeDir: "C:\\Users\\alice",
+      fileExists: fakeExistingFiles([exe]),
+    })).toBeNull();
+  });
+
   it("includes explicit missing paths in not-found messages", () => {
     expect(codexBinaryNotFoundMessage("/wrong/path/codex", {
       platform: "linux",
@@ -75,10 +103,12 @@ describe("resolveCodexBinary", () => {
 
   it("returns a failed result instead of throwing when spawnSync throws", () => {
     const error = new Error("spawn exploded");
+    let spawnOptions: Record<string, unknown> | undefined;
     const result = runCodexCommandSync("C:\\Tools\\codex.cmd", ["--version"], {
       platform: "win32",
       env: {},
-      spawnSyncImpl: (() => {
+      spawnSyncImpl: ((_command, _args, options) => {
+        spawnOptions = options as Record<string, unknown>;
         throw error;
       }) as typeof import("node:child_process").spawnSync,
     });
@@ -87,5 +117,9 @@ describe("resolveCodexBinary", () => {
     expect(result.stdout).toBe("");
     expect(result.stderr).toBe("spawn exploded");
     expect(result.error).toBe(error);
+    expect(spawnOptions).toMatchObject({
+      shell: true,
+      windowsHide: true,
+    });
   });
 });

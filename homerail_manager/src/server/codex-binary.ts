@@ -133,6 +133,12 @@ export function resolveCodexBinary(
     return null;
   }
 
+  if (trimmed !== DEFAULT_CODEX_BIN) {
+    const fromPath = findExecutableOnPath(trimmed, options);
+    if (fromPath) return { command: fromPath, requested: trimmed, needsShell: windowsCommandNeedsShell(fromPath, options.platform) };
+    return null;
+  }
+
   for (const candidate of commonCodexCandidates(options)) {
     const found = existingFile(candidate, options.fileExists);
     if (found) return { command: found, requested: trimmed, needsShell: windowsCommandNeedsShell(found, options.platform) };
@@ -183,6 +189,7 @@ export function runCodexCommandSync(
       encoding: "utf-8",
       env: options.env ?? process.env,
       shell: windowsCommandNeedsShell(command, options.platform ?? process.platform),
+      windowsHide: true,
     });
   } catch (error) {
     return failedSpawnResult(error);
