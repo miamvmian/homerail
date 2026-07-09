@@ -5,6 +5,7 @@ import {
   closeVoiceSession,
   createVoiceSession,
   getCurrentVoiceSession,
+  getCodexModels,
   getVoiceAgentConfig,
   getVoiceSession,
   listVoiceSessions,
@@ -14,6 +15,7 @@ import {
   streamVoiceTurn,
   stopVoiceMonitor,
   updateVoiceAgentConfig,
+  type CodexModel,
   type VoiceAgentConfig,
   type VoiceConversationMessage,
   type VoiceDebugEvent,
@@ -27,6 +29,10 @@ import VoiceSessionProjectSidebar from '@/components/agent/VoiceSessionProjectSi
 import AgentModeTopBar from '@/components/agent/AgentModeTopBar.vue'
 import DagResourceStatusPill from '@/components/agent/DagResourceStatusPill.vue'
 import VoiceDynamicWidget from '@/components/agent/VoiceDynamicWidget.vue'
+import {
+  resolveCodexModelOptions,
+  resolveSelectedCodexModel
+} from '@/components/agent/codex-model-selection'
 import { voiceWs } from '@/api/clients/events-ws'
 import { useOnboardingStatus } from '@/composables/useOnboardingStatus'
 import {
@@ -160,6 +166,10 @@ const voiceSidebarOpen = ref(
 )
 const voiceSettings = ref<VoiceSettings | null>(null)
 const voiceAgentConfig = ref<VoiceAgentConfig | null>(null)
+const codexModels = ref<CodexModel[]>([])
+const codexModelsLoading = ref(false)
+const codexModelsLoaded = ref(false)
+const codexModelsError = ref('')
 const asrLoading = ref(false)
 const asrSaving = ref(false)
 const ttsSaving = ref(false)
@@ -335,9 +345,15 @@ const voiceAgentHarness = computed<VoiceAgentConfig['harness']>(
 )
 const codexHarnessActive = computed(() => voiceAgentHarness.value === 'codex_appserver')
 const kimiHarnessActive = computed(() => voiceAgentHarness.value === 'kimi_code')
-const codexHarnessLabel = computed(
-  () => `Codex / ${voiceAgentConfig.value?.model_name || 'gpt-5.5'}`
-)
+const codexModelOptions = computed<CodexModel[]>(() => resolveCodexModelOptions(
+  codexModels.value,
+  voiceAgentConfig.value?.model_name,
+  codexModelsLoaded.value
+))
+const selectedCodexModel = computed(() => resolveSelectedCodexModel(
+  codexModelOptions.value,
+  voiceAgentConfig.value?.model_name
+))
 const managerAgentModelOptions = computed(() => {
   if (kimiHarnessActive.value) {
     return llmModelOptions.value.filter(isKimiCodeCompatibleSetting)
@@ -889,6 +905,9 @@ function toggleModelMenu(): void {
     return
   }
   modelMenuOpen.value = !modelMenuOpen.value
+  if (modelMenuOpen.value) {
+    void loadCodexModelCatalog().then(() => reconcileCodexModelSelection())
+  }
 }
 
 function closeModelMenuOnOutside(event: PointerEvent): void {
@@ -2177,6 +2196,21 @@ async function refreshManagerStatus(): Promise<void> {
   }
 }
 
+async function loadCodexModelCatalog(): Promise<void> {
+  codexModelsLoading.value = true
+  codexModelsError.value = ''
+  try {
+    const response = await getCodexModels()
+    codexModels.value = response.data?.models ?? []
+    codexModelsLoaded.value = true
+  } catch (err: any) {
+    codexModelsLoaded.value = false
+    codexModelsError.value = err?.message || 'Codex models unavailable'
+  } finally {
+    codexModelsLoading.value = false
+  }
+}
+
 async function loadVoiceRuntime(): Promise<void> {
   asrLoading.value = true
   voiceConfigError.value = ''
@@ -2184,15 +2218,25 @@ async function loadVoiceRuntime(): Promise<void> {
     await store.loadManagerRuntimeOptions()
     const [settingsRes, voiceAgentRes] = await Promise.all([
       getVoiceSettings(),
-      getVoiceAgentConfig().catch(() => null)
+      getVoiceAgentConfig().catch(() => null),
+      loadCodexModelCatalog()
     ])
     voiceSettings.value = settingsRes.data
     voiceAgentConfig.value = voiceAgentRes?.data ?? null
+    await reconcileCodexModelSelection()
   } catch (err: any) {
     voiceConfigError.value = err?.message || '语音设置加载失败'
   } finally {
     asrLoading.value = false
   }
+}
+
+async function reconcileCodexModelSelection(): Promise<void> {
+  if (!codexModelsLoaded.value || voiceAgentConfig.value?.harness !== 'codex_appserver') return
+  const current = voiceAgentConfig.value.model_name
+  if (current && codexModels.value.some(model => model.model === current)) return
+  const fallback = codexModels.value.find(model => model.is_default) ?? codexModels.value[0]
+  if (fallback) await setCodexModel(fallback.model)
 }
 
 function voiceSettingsPayload(
@@ -2311,6 +2355,10 @@ async function changeLlmModel(event: Event): Promise<void> {
 
 async function setVoiceAgentHarness(harness: VoiceAgentConfig['harness']): Promise<void> {
   if (voiceAgentConfig.value?.harness === harness) return
+  if (harness === 'codex_appserver' && !selectedCodexModel.value) {
+    voiceConfigError.value = '当前账号没有可用的 Codex 模型'
+    return
+  }
   voiceAgentSaving.value = true
   voiceConfigError.value = ''
   try {
@@ -2327,16 +2375,20 @@ async function setVoiceAgentHarness(harness: VoiceAgentConfig['harness']): Promi
     const res = await updateVoiceAgentConfig({
       harness,
       llm_setting_id:
-        harness === 'claude_agent_sdk' || harness === 'kimi_code'
-          ? llmSetting?.id || null
-          : voiceAgentConfig.value?.llm_setting_id || null,
+        harness === 'codex_appserver'
+          ? null
+          : harness === 'claude_agent_sdk' || harness === 'kimi_code'
+            ? llmSetting?.id || null
+            : voiceAgentConfig.value?.llm_setting_id || null,
       provider_name:
-        harness === 'claude_agent_sdk' || harness === 'kimi_code'
-          ? llmSetting?.provider_id || (harness === 'kimi_code' ? 'kimi' : null)
-          : voiceAgentConfig.value?.provider_name || null,
+        harness === 'codex_appserver'
+          ? null
+          : harness === 'claude_agent_sdk' || harness === 'kimi_code'
+            ? llmSetting?.provider_id || (harness === 'kimi_code' ? 'kimi' : null)
+            : voiceAgentConfig.value?.provider_name || null,
       model_name:
         harness === 'codex_appserver'
-          ? 'gpt-5.5'
+          ? selectedCodexModel.value
           : llmSetting?.model_name ||
             voiceAgentConfig.value?.model_name ||
             null,
@@ -2368,12 +2420,13 @@ function changeVoiceAgentHarness(event: Event): void {
 }
 
 async function setCodexReasoningEffort(reasoningEffort: CodexReasoningEffort): Promise<void> {
+  if (!selectedCodexModel.value) return
   voiceAgentSaving.value = true
   voiceConfigError.value = ''
   try {
     const res = await updateVoiceAgentConfig({
       harness: 'codex_appserver',
-      model_name: voiceAgentConfig.value?.model_name || 'gpt-5.5',
+      model_name: selectedCodexModel.value,
       reasoning_effort: reasoningEffort
     })
     voiceAgentConfig.value = res.data
@@ -2386,6 +2439,30 @@ async function setCodexReasoningEffort(reasoningEffort: CodexReasoningEffort): P
 
 function handleCodexReasoningEffortChange(event: Event): void {
   void setCodexReasoningEffort((event.target as HTMLSelectElement).value as CodexReasoningEffort)
+}
+
+async function setCodexModel(model: string): Promise<void> {
+  if (!model || voiceAgentConfig.value?.model_name === model) return
+  voiceAgentSaving.value = true
+  voiceConfigError.value = ''
+  try {
+    const response = await updateVoiceAgentConfig({
+      harness: 'codex_appserver',
+      llm_setting_id: null,
+      provider_name: null,
+      model_name: model,
+      reasoning_effort: codexReasoningEffort.value
+    })
+    voiceAgentConfig.value = response.data
+  } catch (err: any) {
+    voiceConfigError.value = err?.message || 'Codex model save failed'
+  } finally {
+    voiceAgentSaving.value = false
+  }
+}
+
+function handleCodexModelChange(event: Event): void {
+  void setCodexModel((event.target as HTMLSelectElement).value)
 }
 
 async function syncVoiceAgentLlmConfig(
@@ -4292,13 +4369,22 @@ function summarizeTask(value: string): string {
                 </select>
                 <select
                   v-if="codexHarnessActive"
-                  value="gpt-5.5"
-                  disabled
-                  title="Codex 使用本机登录态和 app-server SDK"
+                  :value="selectedCodexModel"
+                  :disabled="asrLoading || voiceAgentSaving || codexModelsLoading || !codexModelOptions.length"
+                  :title="codexModelsError || 'Codex model'"
                   data-testid="voice-model-agent-model-select"
+                  @change="handleCodexModelChange"
                 >
-                  <option value="gpt-5.5" class="bg-[#111315] text-white">
-                    {{ codexHarnessLabel }}
+                  <option v-if="!codexModelOptions.length" value="" disabled>
+                    当前账号没有可用的 Codex 模型
+                  </option>
+                  <option
+                    v-for="model in codexModelOptions"
+                    :key="model.id"
+                    :value="model.model"
+                    class="bg-[#111315] text-white"
+                  >
+                    {{ model.display_name }}
                   </option>
                 </select>
                 <select
@@ -4340,7 +4426,7 @@ function summarizeTask(value: string): string {
               </span>
               <select
                 :value="codexReasoningEffort"
-                :disabled="voiceAgentSaving"
+                :disabled="voiceAgentSaving || !selectedCodexModel"
                 title="Codex reasoning effort"
                 data-testid="voice-model-agent-reasoning-select"
                 @change="handleCodexReasoningEffortChange"
