@@ -6,7 +6,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { HomeRailClient } from "../client.js";
 import type { BaseResponse } from "../client.js";
 import {
@@ -1243,6 +1243,17 @@ export function workerImageBuildReason(
   return null;
 }
 
+export function workerImageDockerBuildSpawnOptions(): SpawnSyncOptionsWithStringEncoding {
+  return {
+    cwd: resolveRepoRoot(),
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, ...loadLocalSecrets(), HOMERAIL_HOME: getHomerailHome() },
+    maxBuffer: 20 * 1024 * 1024,
+    windowsHide: true,
+  };
+}
+
 function ensureWorkerImage(forceRebuild = false): void {
   const dockerBin = resolveDockerBinary();
   writeWorkerImageRuntimeStatus("checking", {
@@ -1293,12 +1304,12 @@ function ensureWorkerImage(forceRebuild = false): void {
     "-t",
     WORKER_IMAGE_TAG,
     ".",
-  ], {
-    cwd: resolveRepoRoot(),
-    stdio: "inherit",
-    env: { ...process.env, ...loadLocalSecrets(), HOMERAIL_HOME: getHomerailHome() },
-    windowsHide: true,
-  });
+  ], workerImageDockerBuildSpawnOptions());
+  if (build.stdout) process.stdout.write(build.stdout);
+  if (build.stderr) process.stderr.write(build.stderr);
+  if (build.error) {
+    throw build.error;
+  }
   if (build.status !== 0) {
     throw new Error(`failed to build ${WORKER_IMAGE_TAG}`);
   }

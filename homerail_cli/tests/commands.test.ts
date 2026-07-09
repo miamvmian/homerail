@@ -11,6 +11,7 @@ import {
   shouldAbortStartForModelConfig,
   shouldServeStaticAgentUi,
   workerImageBuildReason,
+  workerImageDockerBuildSpawnOptions,
   workerImageSourceFingerprint,
 } from "../src/commands/runtime.js";
 import { createLaunchAgentPlist, installRuntimeService, uninstallRuntimeService } from "../src/local-service-lifecycle.js";
@@ -1907,6 +1908,15 @@ describe("runtime command", () => {
     expect(dockerMissingMessage("docker")).toContain("Docker CLI was not found");
     expect(dockerMissingMessage("docker")).toContain("HOMERAIL_DOCKER_BIN");
     expect(dockerMissingMessage()).toContain("hr start --no-build-worker-image");
+  });
+
+  it("builds the worker image without inheriting a Windows console", () => {
+    const options = workerImageDockerBuildSpawnOptions();
+    expect(options.stdio).toEqual(["ignore", "pipe", "pipe"]);
+    expect(options.windowsHide).toBe(true);
+    expect(options.encoding).toBe("utf-8");
+    expect(options.maxBuffer).toBeGreaterThanOrEqual(20 * 1024 * 1024);
+    expect(options.env?.HOMERAIL_HOME).toBe(tempHome);
   });
 
   it("serves prebuilt Agent UI statically on Windows when dist exists", () => {
