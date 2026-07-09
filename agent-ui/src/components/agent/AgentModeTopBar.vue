@@ -88,19 +88,23 @@ function startDesktopUpdateWatcher(): void {
   const bridge = desktopBridge()
   if (!bridge?.updateStatus) return
 
-  void bridge.updateStatus()
-    .then((status) => {
-      desktopUpdateStatus.value = status
-    })
-    .catch(() => {
-      desktopUpdateStatus.value = null
-    })
-
   removeUpdateListener = bridge.onUpdateStatus?.((status) => {
     desktopUpdateStatus.value = status
   }) ?? null
 
-  void bridge.checkForUpdates?.().catch(() => undefined)
+  void bridge.updateStatus()
+    .then((status) => {
+      desktopUpdateStatus.value = status
+      if (status.state === 'downloaded' || !bridge.checkForUpdates) return
+      void bridge.checkForUpdates()
+        .then((nextStatus) => {
+          desktopUpdateStatus.value = nextStatus
+        })
+        .catch(() => undefined)
+    })
+    .catch(() => {
+      desktopUpdateStatus.value = null
+    })
 }
 
 function stopDesktopUpdateWatcher(): void {
