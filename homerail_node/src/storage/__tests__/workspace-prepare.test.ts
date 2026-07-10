@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { normalizePath } from "../../platform/paths.js";
 import { prepareWorkerWorkspace } from "../workspace-prepare.js";
 
 describe("prepareWorkerWorkspace", () => {
@@ -19,9 +20,10 @@ describe("prepareWorkerWorkspace", () => {
 
   it("does nothing when no workspace spec is provided", async () => {
     const result = await prepareWorkerWorkspace("run-1/triage", undefined);
+    const expectedRoot = normalizePath(path.join(homerailHome, "workspace", "run-1", "triage"));
 
     expect(result).toEqual({
-      root: path.join(homerailHome, "workspace", "run-1", "triage"),
+      root: expectedRoot,
       prepared: false,
     });
     expect(fs.existsSync(result.root)).toBe(false);
@@ -29,6 +31,8 @@ describe("prepareWorkerWorkspace", () => {
 
   it("clones git workspace into repo under the worker workspace root", async () => {
     const calls: Array<{ command: string; args: string[]; cwd: string }> = [];
+    const expectedRoot = normalizePath(path.join(homerailHome, "workspace", "run-1", "triage"));
+    const expectedRepoPath = path.join(expectedRoot, "repo");
 
     const result = await prepareWorkerWorkspace(
       "run-1/triage",
@@ -45,8 +49,8 @@ describe("prepareWorkerWorkspace", () => {
     );
 
     expect(result.prepared).toBe(true);
-    expect(result.root).toBe(path.join(homerailHome, "workspace", "run-1", "triage"));
-    expect(result.repoPath).toBe(path.join(result.root, "repo"));
+    expect(result.root).toBe(expectedRoot);
+    expect(result.repoPath).toBe(expectedRepoPath);
     expect(calls).toEqual([
       {
         command: "git",
@@ -56,18 +60,19 @@ describe("prepareWorkerWorkspace", () => {
           "dev",
           "--single-branch",
           "https://example.com/acme/project.git",
-          path.join(result.root, "repo"),
+          expectedRepoPath,
         ],
-        cwd: result.root,
+        cwd: expectedRoot,
       },
     ]);
   });
 
   it("creates an empty workspace for isolated mode", async () => {
     const result = await prepareWorkerWorkspace("run-1", { mode: "isolated" });
+    const expectedRoot = normalizePath(path.join(homerailHome, "workspace", "run-1"));
 
     expect(result).toEqual({
-      root: path.join(homerailHome, "workspace", "run-1"),
+      root: expectedRoot,
       prepared: true,
     });
     expect(fs.existsSync(result.root)).toBe(true);
@@ -92,7 +97,10 @@ describe("prepareWorkerWorkspace", () => {
       );
 
       expect(result.prepared).toBe(true);
-      expect(result.repoPath).toBe(path.join(homerailHome, "workspace", "run-local-copy", "repo"));
+      expect(result.repoPath).toBe(path.join(
+        normalizePath(path.join(homerailHome, "workspace", "run-local-copy")),
+        "repo",
+      ));
       expect(fs.readFileSync(path.join(result.repoPath!, "src", "index.ts"), "utf-8")).toContain("value");
       expect(fs.existsSync(path.join(result.repoPath!, ".git", "HEAD"))).toBe(true);
       expect(fs.existsSync(path.join(result.repoPath!, "node_modules"))).toBe(false);
@@ -120,7 +128,7 @@ describe("prepareWorkerWorkspace", () => {
   });
 
   it("does not reclone an existing git workspace", async () => {
-    const root = path.join(homerailHome, "workspace", "run-1");
+    const root = normalizePath(path.join(homerailHome, "workspace", "run-1"));
     const repoPath = path.join(root, "repo");
     fs.mkdirSync(path.join(repoPath, ".git"), { recursive: true });
     const calls: Array<{ command: string; args: string[]; cwd: string }> = [];
