@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { normalizePath } from "../../platform/paths.js";
 import { MockProvider } from "../../providers/mock-provider.js";
 import {
   handleLifecycleRequest,
@@ -381,6 +382,7 @@ describe("handleLifecycleRequest", () => {
     });
 
     it("create worker accepts isolated workspace mode", async () => {
+      const previousHome = process.env.HOMERAIL_HOME;
       const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "homerail-node-isolated-"));
       process.env["HOMERAIL_HOME"] = tempHome;
       const provider = new MockProvider();
@@ -398,6 +400,11 @@ describe("handleLifecycleRequest", () => {
           send,
         );
       } finally {
+        if (previousHome === undefined) {
+          delete process.env.HOMERAIL_HOME;
+        } else {
+          process.env.HOMERAIL_HOME = previousHome;
+        }
         fs.rmSync(tempHome, { recursive: true, force: true });
       }
 
@@ -406,7 +413,9 @@ describe("handleLifecycleRequest", () => {
       expect(provider.containers.size).toBe(1);
       const data = responses[0]!.resource_data!;
       const container = provider.containers.get(String(data.id));
-      expect(container!.config.mounts![0]!.host).toBe(path.join(tempHome, "workspace", "run-isolated"));
+      expect(container!.config.mounts![0]!.host).toBe(
+        normalizePath(path.join(tempHome, "workspace", "run-isolated")),
+      );
     });
 
     it("create worker rejects unsupported workspace preparation modes", async () => {

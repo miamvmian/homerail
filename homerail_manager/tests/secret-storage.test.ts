@@ -16,7 +16,7 @@ import {
   listServers as listMcpServers,
   toPublicServer,
 } from "../src/persistence/mcp-servers.js";
-import { getDb } from "../src/persistence/db.js";
+import { closeDb, getDb } from "../src/persistence/db.js";
 import { createServer as createHttpServer } from "../src/server/http.js";
 
 async function listen(server: http.Server): Promise<number> {
@@ -58,6 +58,7 @@ describe("Manager encrypted secret storage", () => {
     restoreEnv("HOMERAIL_HOME", oldHome);
     restoreEnv("HOMERAIL_MANAGER_SECRET_KEY", oldManagerSecretKey);
     restoreEnv("HOMERAIL_SECRET_KEY", oldSecretKey);
+    closeDb();
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 

@@ -12,7 +12,7 @@ import {
   resolveClaudeSdkBaseUrlForSetting,
   updateSetting,
 } from "../src/persistence/llm-settings.js";
-import { getDb } from "../src/persistence/db.js";
+import { closeDb, getDb } from "../src/persistence/db.js";
 import { createServer } from "../src/server/http.js";
 
 async function listen(server: http.Server): Promise<number> {
@@ -51,6 +51,7 @@ describe("custom LLM providers", () => {
     } else {
       process.env.HOMERAIL_HOME = oldHome;
     }
+    closeDb();
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 

@@ -14,7 +14,7 @@ import {
 } from "../src/server/voice-session-registry.js";
 import { _clearStoredConfig } from "../src/server/voice-agent-bootstrap.js";
 import { _clearStoredVoiceSettings } from "../src/server/voice.js";
-import { getDb } from "../src/persistence/db.js";
+import { closeDb, getDb } from "../src/persistence/db.js";
 import { _clearAllSettings } from "../src/persistence/llm-settings.js";
 import { _clearNodes } from "../src/node/registry.js";
 
@@ -58,6 +58,7 @@ describe("voice session registry", () => {
     _clearStoredVoiceSettings();
     _clearAllSettings();
     _clearNodes();
+    closeDb();
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 

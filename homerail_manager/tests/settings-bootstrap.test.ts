@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { parseDAGYaml } from "../src/orchestration/yaml-loader.js";
+import { closeDb } from "../src/persistence/db.js";
 import { _clearAllPersistence } from "../src/persistence/store.js";
 import { _clearActiveRuns, createActiveRun } from "../src/runtime/active-runs.js";
 import { createServer } from "../src/server/http.js";
@@ -70,6 +71,7 @@ describe("settings bootstrap routes", () => {
     } else {
       process.env.HOMERAIL_ASSET_DIR = oldAssetDir;
     }
+    closeDb();
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 
