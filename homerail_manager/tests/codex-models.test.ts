@@ -175,4 +175,74 @@ describe("Codex model catalog", () => {
     expect(response.status).toBe(200);
     expect(body).toMatchObject({ success: true, data: catalog });
   });
+
+  it("rejects unsupported Codex reasoning efforts before saving Manager Agent config", async () => {
+    const catalog: CodexModelCatalog = {
+      binary: "C:\\Codex\\codex.exe",
+      models: [{
+        id: "gpt-5.5",
+        model: "gpt-5.5",
+        display_name: "GPT-5.5",
+        description: "",
+        is_default: true,
+        default_reasoning_effort: "medium",
+        supported_reasoning_efforts: ["low", "medium", "high", "xhigh"],
+        service_tiers: [],
+      }],
+    };
+    server = http.createServer((req, res) => {
+      managerAgentConfigRoutesHandler(req, res, { loadCodexModels: async () => catalog });
+    });
+    await new Promise<void>((resolve) => server?.listen(0, "127.0.0.1", () => resolve()));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/manager-agent/config`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ harness: "codex_appserver", model_name: "gpt-5.5", reasoning_effort: "minimal" }),
+    });
+    const body = await response.json() as Record<string, unknown>;
+
+    expect(response.status).toBe(400);
+    expect(body).toMatchObject({
+      success: false,
+      error: "Codex model 'gpt-5.5' does not support reasoning effort 'minimal'. Supported values: low, medium, high, xhigh.",
+    });
+  });
+
+  it("rejects legacy Codex reasoning effort values before they can fall back to config.toml", async () => {
+    const catalog: CodexModelCatalog = {
+      binary: "C:\\Codex\\codex.exe",
+      models: [{
+        id: "gpt-5.5",
+        model: "gpt-5.5",
+        display_name: "GPT-5.5",
+        description: "",
+        is_default: true,
+        default_reasoning_effort: "medium",
+        supported_reasoning_efforts: ["low", "medium", "high", "xhigh"],
+        service_tiers: [],
+      }],
+    };
+    server = http.createServer((req, res) => {
+      managerAgentConfigRoutesHandler(req, res, { loadCodexModels: async () => catalog });
+    });
+    await new Promise<void>((resolve) => server?.listen(0, "127.0.0.1", () => resolve()));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/manager-agent/config`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ harness: "codex_appserver", model_name: "gpt-5.5", reasoning_effort: "max" }),
+    });
+    const body = await response.json() as Record<string, unknown>;
+
+    expect(response.status).toBe(400);
+    expect(body).toMatchObject({
+      success: false,
+      error: "Unsupported Manager Agent reasoning effort 'max'. Supported values: minimal, low, medium, high, xhigh.",
+    });
+  });
 });

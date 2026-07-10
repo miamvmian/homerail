@@ -5,7 +5,8 @@ import {
 } from "../persistence/manager-agent-config.js";
 import { resolveManagerAgentConfig } from "./manager-agent-container.js";
 import { normalizeManagerAgentHarness } from "homerail-protocol";
-import { listCodexModels, type CodexModelCatalog } from "./codex-models.js";
+import { listCodexModels, type CodexModel, type CodexModelCatalog } from "./codex-models.js";
+import type { ManagerAgentConfig } from "../persistence/manager-agent-config.js";
 
 interface BaseResponse {
   success: boolean;
@@ -56,6 +57,10 @@ function _string(value: unknown): string | null | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+function isReasoningEffort(value: string): value is ManagerAgentConfig["reasoning_effort"] {
+  return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh";
+}
+
 function validateManagerConfig(config: ReturnType<typeof readManagerAgentConfig>): void {
   if (!config.llm_setting_id && !config.provider_name && config.harness !== "kimi_code") return;
   resolveManagerAgentConfig(
@@ -68,19 +73,74 @@ function validateManagerConfig(config: ReturnType<typeof readManagerAgentConfig>
   );
 }
 
-export function validateConfigPatch(patch: Record<string, unknown>): void {
+function patchedConfig(patch: Record<string, unknown>): ManagerAgentConfig {
   const current = readManagerAgentConfig();
   const settingId = _string(patch.llm_setting_id);
   const providerName = _string(patch.provider_name);
   const modelName = _string(patch.model_name);
+  const reasoningEffort = _string(patch.reasoning_effort);
+  if (reasoningEffort !== undefined && reasoningEffort !== null && !isReasoningEffort(reasoningEffort)) {
+    throw new Error(`Unsupported Manager Agent reasoning effort '${reasoningEffort}'. Supported values: minimal, low, medium, high, xhigh.`);
+  }
   const harness = normalizeManagerAgentHarness(patch.harness) ?? current.harness;
-  validateManagerConfig({
+  const mergedSettingId = settingId === undefined ? current.llm_setting_id : settingId;
+  const mergedProviderName = providerName === undefined ? current.provider_name : providerName;
+  const mergedModelName = modelName === undefined ? current.model_name : modelName;
+  const mergedReasoningEffort = reasoningEffort && isReasoningEffort(reasoningEffort)
+    ? reasoningEffort
+    : current.reasoning_effort;
+  if (harness === "codex_appserver") {
+    return {
+      ...current,
+      harness,
+      llm_setting_id: null,
+      provider_name: null,
+      model_name: mergedSettingId || mergedProviderName ? "gpt-5.5" : mergedModelName ?? "gpt-5.5",
+      reasoning_effort: mergedReasoningEffort,
+    };
+  }
+  return {
     ...current,
     harness,
-    llm_setting_id: settingId === undefined ? current.llm_setting_id : settingId,
-    provider_name: providerName === undefined ? current.provider_name : providerName,
-    model_name: modelName === undefined ? current.model_name : modelName,
-  });
+    llm_setting_id: mergedSettingId,
+    provider_name: mergedProviderName,
+    model_name: mergedModelName,
+    reasoning_effort: mergedReasoningEffort,
+  };
+}
+
+export function validateConfigPatch(patch: Record<string, unknown>): void {
+  validateManagerConfig(patchedConfig(patch));
+}
+
+function codexModelMatches(model: CodexModel, modelName: string): boolean {
+  return model.model === modelName || model.id === modelName;
+}
+
+function validateCodexReasoningEffort(config: ManagerAgentConfig, catalog: CodexModelCatalog): void {
+  if (config.harness !== "codex_appserver") return;
+  const modelName = config.model_name || "gpt-5.5";
+  const model = catalog.models.find((item) => codexModelMatches(item, modelName));
+  if (!model) {
+    throw new Error(`Codex model '${modelName}' is not available for the current account.`);
+  }
+  const supported = model.supported_reasoning_efforts;
+  if (supported.length > 0 && !supported.includes(config.reasoning_effort)) {
+    throw new Error(
+      `Codex model '${modelName}' does not support reasoning effort '${config.reasoning_effort}'. Supported values: ${supported.join(", ")}.`,
+    );
+  }
+}
+
+async function validateConfigPatchWithCatalog(
+  patch: Record<string, unknown>,
+  loadCodexModels: () => Promise<CodexModelCatalog>,
+): Promise<void> {
+  const next = patchedConfig(patch);
+  validateManagerConfig(next);
+  if (next.harness !== "codex_appserver") return;
+  const catalog = await loadCodexModels();
+  validateCodexReasoningEffort(next, catalog);
 }
 
 export function managerAgentConfigRoutesHandler(
@@ -111,9 +171,9 @@ export function managerAgentConfigRoutesHandler(
 
   if (method === "PUT") {
     readJsonBody(req)
-      .then((body) => {
+      .then(async (body) => {
         try {
-          validateConfigPatch(body);
+          await validateConfigPatchWithCatalog(body, options.loadCodexModels ?? listCodexModels);
         } catch (err) {
           badRequest(res, err instanceof Error ? err.message : String(err));
           return;
