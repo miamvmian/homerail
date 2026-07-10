@@ -22,10 +22,10 @@ export default defineConfig({
         'coverage/'
       ],
       thresholds: {
-        branches: 6,
-        functions: 5,
-        lines: 8,
-        statements: 8
+        branches: 9,
+        functions: 9,
+        lines: 11,
+        statements: 11
       }
     },
     testTimeout: 30000,

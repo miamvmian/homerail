@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { closeDb } from "../src/persistence/db.js";
 
 import {
   readWidgetFile,
@@ -34,6 +35,7 @@ describe("Widget File Protocol", () => {
   afterEach(() => {
     if (oldHome === undefined) delete process.env.HOMERAIL_HOME;
     else process.env.HOMERAIL_HOME = oldHome;
+    closeDb();
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 

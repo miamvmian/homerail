@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { _clearActiveRuns } from "../src/runtime/active-runs.js";
 import { createServer } from "../src/server/http.js";
 import { _clearAllSessions, createSession as createAgentSession } from "../src/persistence/agent-sessions.js";
+import { closeDb } from "../src/persistence/db.js";
 import { createSetting, upsertProvider, _clearAllSettings as clearLlmSettings } from "../src/persistence/llm-settings.js";
 import { createProject } from "../src/persistence/projects-changes.js";
 import { ensureDefaultWorkspacePath } from "../src/config/env.js";
@@ -91,6 +92,7 @@ describe("/api/manager/chat", () => {
     else process.env.HOMERAIL_MANAGER_AGENT_HOST_ENTRY = oldHostEntry;
     if (oldHostShell === undefined) delete process.env.HOMERAIL_MANAGER_AGENT_SHELL;
     else process.env.HOMERAIL_MANAGER_AGENT_SHELL = oldHostShell;
+    closeDb();
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 

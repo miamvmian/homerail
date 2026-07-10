@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { getDb } from "../src/persistence/db.js";
+import { closeDb, getDb } from "../src/persistence/db.js";
 import { upsertDagSessionIndex } from "../src/persistence/dag-session-index.js";
 import { _clearAllChanges, _clearAllProjects } from "../src/persistence/projects-changes.js";
 import { createServer } from "../src/server/http.js";
@@ -42,6 +42,7 @@ describe("project settings API contract", () => {
     await close(server);
     if (oldHome === undefined) delete process.env.HOMERAIL_HOME;
     else process.env.HOMERAIL_HOME = oldHome;
+    closeDb();
     fs.rmSync(tmpHome, { recursive: true, force: true });
     fs.rmSync(workspaceDir, { recursive: true, force: true });
   });
