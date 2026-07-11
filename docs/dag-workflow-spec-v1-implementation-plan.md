@@ -31,15 +31,20 @@ Implemented on the Draft PR branch:
   feedback metadata, and explicit success/failure/cancelled terminals;
 - schema, validation, revision, CLI, and Manager Agent access surfaces.
 - all built-in pattern catalog details and generated instances emit strict v1,
-  with runtime graph parity checked against their legacy templates.
+  with runtime graph parity checked against their legacy templates;
+- a tracked provider-neutral v1 example runs through the same path used for
+  normal DAG creation;
+- every public legacy orchestration asset is covered by legacy-to-v1 runtime
+  graph parity, with executable quorum, condition, and bounded-ratchet
+  transition tests.
 
 Still pending before the Draft can be considered ready:
 
-- add tracked standalone v1 examples and migrate selected public assets;
-- broaden legacy/v1 transition parity beyond built-in patterns to every public
-  gateway asset;
-- complete full repository, Docker, Windows, and model-backed validation;
-- finalize public migration/authoring documentation.
+- decide which remaining public legacy assets should stay as compatibility
+  fixtures until runtime profiles and scorecards have independent v1 documents;
+- add fan-out, conditional, foreach, and bounded-while standalone v1 examples;
+- complete Windows and model-backed validation;
+- finalize migration policy and authoring documentation.
 
 ## Phase 0: Freeze Existing Behavior
 

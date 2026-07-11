@@ -73,6 +73,9 @@ the entry contract.
 - Unknown fields fail validation instead of being ignored.
 - Node kinds are `agent`, `condition`, `join`, `foreach`, `while`, and
   `terminal`.
+- `condition.config.field` and `while.config.field` are optional. Omit `field`
+  to route or compare the complete handoff payload; set it to a dotted path to
+  inspect one nested value.
 - Ports declare interfaces. Connections exist only in `spec.edges`.
 - A data edge carries a payload and implies a completion dependency.
 - `depends_on` is only for a completion barrier that carries no payload.

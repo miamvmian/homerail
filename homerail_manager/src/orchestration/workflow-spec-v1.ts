@@ -1094,7 +1094,7 @@ function authoringNode(node: CanonicalNode, canonical: CanonicalWorkflowIR): Rec
     return {
       ...base,
       config: {
-        field: configString(config, "field", "status"),
+        ...(config.field ? { field: config.field } : {}),
         routes: config.routes ?? config.cases ?? {},
         ...(config.default_port || config.default ? { default: config.default_port ?? config.default } : {}),
       },
@@ -1148,7 +1148,7 @@ function authoringNode(node: CanonicalNode, canonical: CanonicalWorkflowIR): Rec
     ...base,
     outputs,
     config: {
-      field: configString(config, "field", "status"),
+      ...(config.field ? { field: config.field } : {}),
       operator: configString(config, "operator", "eq"),
       ...(config.value !== undefined ? { value: config.value } : {}),
       continue_port: continuePort,

@@ -96,7 +96,7 @@ const ConditionNode = Type.Object({
   kind: Type.Literal("condition"),
   ...NodeBase,
   config: Type.Object({
-    field: Type.String({ minLength: 1, maxLength: 256 }),
+    field: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
     routes: Type.Record(Type.String({ minLength: 1, maxLength: 128 }), Identifier, {
       minProperties: 1,
       maxProperties: 128,
@@ -134,7 +134,7 @@ const WhileNode = Type.Object({
   kind: Type.Literal("while"),
   ...NodeBase,
   config: Type.Object({
-    field: Type.String({ minLength: 1, maxLength: 256 }),
+    field: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
     operator: Type.Union([
       Type.Literal("eq"),
       Type.Literal("ne"),
