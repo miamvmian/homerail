@@ -1,10 +1,13 @@
-import { describe, expect, it } from "vitest";
+import Ajv from "ajv";
+import { describe, expect, it, vi } from "vitest";
 import {
   validateHomerailPluginTurnContext,
   validateHomerailPluginUiProjection,
   validateHomerailResolvedPluginDescriptorWire,
   applyHomerailDirectUiProjection,
   validateHomerailDirectUiProjection,
+  validateHomerailDeclarativeRenderer,
+  buildHomerailDeclarativeRendererModel,
   validateHomerailPluginToolInput,
   executeHomerailPluginTool,
   validateHomerailPluginToolExecutionEnvelope,
@@ -93,6 +96,149 @@ function context(): HomerailPluginTurnContextV1 {
 }
 
 describe("HomeRail plugin wire contracts", () => {
+  it("validates the expression-free declarative Renderer DSL", () => {
+    const renderer = {
+      renderer_version: 1,
+      type: "card",
+      title_pointer: "/title",
+      subtitle_pointer: "/summary",
+      sections: [{ id: "body", type: "text", pointer: "/body", max_lines: 4 }, {
+        id: "entries",
+        type: "list",
+        pointer: "/entries",
+        item_title_pointer: "/title",
+        item_detail_pointer: "/description",
+      }, {
+        id: "coverage",
+        type: "metrics",
+        items: [{ label: "Coverage", pointer: "/coverage", format: "percent" }],
+      }],
+    } as const;
+    expect(validateHomerailDeclarativeRenderer(renderer)).toMatchObject({ valid: true });
+    expect(validateHomerailDeclarativeRenderer({ ...renderer, script: "alert(1)" }).valid).toBe(false);
+    expect(validateHomerailDeclarativeRenderer({
+      ...renderer,
+      sections: [renderer.sections[0], renderer.sections[0]],
+    }).errors).toContainEqual(expect.objectContaining({ keyword: "uniqueSectionId" }));
+    expect(buildHomerailDeclarativeRendererModel(renderer, {
+      title: "Release 1.2.3",
+      summary: "Ready.",
+      body: "Portable semantic content.",
+      entries: [{ title: "Shared interpreter", description: "PDK and Agent UI cannot drift." }],
+      coverage: 100,
+    }, { locale: "en-US" })).toMatchObject({
+      title: "Release 1.2.3",
+      subtitle: "Ready.",
+      sections: [
+        { type: "text", text: "Portable semantic content." },
+        { type: "list", items: [{ title: "Shared interpreter" }] },
+        { type: "metrics", items: [{ label: "Coverage", value: "100%" }] },
+      ],
+    });
+  });
+
+  it("rejects plugin schema regexes before evaluating potentially exponential input", () => {
+    const unsafe = {
+      type: "object",
+      properties: {
+        value: { type: "string", maxLength: 120, pattern: "^(a+)+$" },
+      },
+      required: ["value"],
+      additionalProperties: false,
+    };
+    expect(validateHomerailPluginToolInput(unsafe, { value: `${"a".repeat(30)}!` })).toMatchObject({
+      valid: false,
+      errors: [expect.objectContaining({ keyword: "safePattern" })],
+    });
+    expect(validateHomerailPluginToolInput({
+      type: "object",
+      properties: { value: { type: "string", pattern: "^a+$" } },
+      additionalProperties: false,
+    }, { value: "a" })).toMatchObject({
+      valid: false,
+      errors: expect.arrayContaining([expect.objectContaining({ keyword: "safePattern" })]),
+    });
+    expect(validateHomerailPluginToolInput({
+      type: "object",
+      properties: { value: { type: "string", maxLength: 120, pattern: "^a*a*a*a*a*a*a*a*a*b$" } },
+      additionalProperties: false,
+    }, { value: "a".repeat(40) })).toMatchObject({
+      valid: false,
+      errors: [expect.objectContaining({ keyword: "safePattern" })],
+    });
+    expect(validateHomerailPluginToolInput({
+      type: "object",
+      properties: {
+        values: {
+          type: "array",
+          maxItems: 10_000,
+          uniqueItems: true,
+          items: {
+            type: "object",
+            properties: { x: { type: "number" } },
+            additionalProperties: false,
+          },
+        },
+      },
+      additionalProperties: false,
+    }, { values: [] })).toMatchObject({
+      valid: false,
+      errors: expect.arrayContaining([expect.objectContaining({ keyword: "schemaComplexity" })]),
+    });
+    expect(validateHomerailPluginToolInput({
+      type: "object",
+      properties: {
+        values: { type: ["array", "null"], items: { type: "string", maxLength: 10 } },
+      },
+      dependencies: { values: ["other"] },
+      additionalProperties: false,
+    }, { values: [] })).toMatchObject({
+      valid: false,
+      errors: expect.arrayContaining([expect.objectContaining({ keyword: "schemaComplexity" })]),
+    });
+  });
+
+  it("reuses bounded Tool validators without trusting mutable schema identity", () => {
+    const compile = vi.spyOn(Ajv.prototype, "compile");
+    try {
+      const schema = {
+        $comment: "plugin-wire validator cache mutation regression",
+        type: "object",
+        properties: { value: { type: "string", maxLength: 4 } },
+        required: ["value"],
+        additionalProperties: false,
+      };
+      const initialCompiles = compile.mock.calls.length;
+
+      expect(validateHomerailPluginToolInput(schema, { value: "four" })).toMatchObject({ valid: true });
+      expect(compile.mock.calls.length).toBe(initialCompiles + 1);
+      expect(validateHomerailPluginToolInput(schema, { value: "four" })).toMatchObject({ valid: true });
+      expect(compile.mock.calls.length).toBe(initialCompiles + 1);
+
+      schema.properties.value.maxLength = 8;
+      expect(validateHomerailPluginToolInput(schema, { value: "12345678" })).toMatchObject({ valid: true });
+      expect(compile.mock.calls.length).toBe(initialCompiles + 2);
+    } finally {
+      compile.mockRestore();
+    }
+  });
+
+  it("bounds runtime schema validation diagnostics", () => {
+    const properties = Object.fromEntries(Array.from({ length: 128 }, (_, index) => [
+      `field_${index}`,
+      { type: "string", maxLength: 8 },
+    ]));
+    const result = validateHomerailPluginToolInput({
+      type: "object",
+      properties,
+      required: Object.keys(properties),
+      additionalProperties: false,
+    }, {});
+    expect(result.valid).toBe(false);
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors.length).toBeLessThanOrEqual(16);
+  });
+
   it("validates an archived descriptor without following package paths", () => {
     expect(validateHomerailResolvedPluginDescriptorWire(descriptor())).toMatchObject({ valid: true });
     expect(validateHomerailResolvedPluginDescriptorWire({
@@ -250,7 +396,7 @@ describe("HomeRail plugin wire contracts", () => {
     expect(validateHomerailDirectUiProjection(projection)).toMatchObject({ valid: true });
     expect(validateHomerailPluginToolInput({
       type: "object",
-      properties: { id: { type: "string" }, title: { type: "string" } },
+      properties: { id: { type: "string", maxLength: 256 }, title: { type: "string", maxLength: 120 } },
       required: ["id", "title"],
       additionalProperties: false,
     }, { id: "note-1", title: "One" })).toMatchObject({ valid: true });
@@ -295,8 +441,8 @@ describe("HomeRail plugin wire contracts", () => {
       input_schema: {
         type: "object",
         properties: {
-          id: { type: "string" }, title: { type: "string" }, note: { type: "string" },
-          questions: { type: "array", items: { type: "string" } },
+          id: { type: "string", maxLength: 256 }, title: { type: "string", maxLength: 120 }, note: { type: "string", maxLength: 2000 },
+          questions: { type: "array", maxItems: 16, items: { type: "string", maxLength: 500 } },
         },
         required: ["id", "title", "note"],
         additionalProperties: false,
@@ -304,8 +450,8 @@ describe("HomeRail plugin wire contracts", () => {
       output_schema: {
         type: "object",
         properties: {
-          title: { type: "string" }, note: { type: "string" },
-          questions: { type: "array", items: { type: "string" } },
+          title: { type: "string", maxLength: 120 }, note: { type: "string", maxLength: 2000 },
+          questions: { type: "array", maxItems: 16, items: { type: "string", maxLength: 500 } },
         },
         required: ["title", "note"],
         additionalProperties: false,

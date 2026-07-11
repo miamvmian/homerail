@@ -16,6 +16,15 @@ import type {
 } from "../generative-ui/types.js";
 
 export const HOMERAIL_PLUGIN_MANIFEST_VERSION = 1 as const;
+export const HOMERAIL_PLUGIN_ID_PATTERN_SOURCE = "^[a-z0-9]+(?:[.-][a-z0-9]+)+$" as const;
+export const HOMERAIL_PLUGIN_ID_PATTERN = new RegExp(HOMERAIL_PLUGIN_ID_PATTERN_SOURCE);
+
+export function isHomerailPluginId(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length >= 3
+    && value.length <= 160
+    && HOMERAIL_PLUGIN_ID_PATTERN.test(value);
+}
 export type HomerailPluginManifestVersion = typeof HOMERAIL_PLUGIN_MANIFEST_VERSION;
 
 export const HOMERAIL_PLUGIN_API_VERSION = 1 as const;
@@ -208,6 +217,69 @@ export interface HomerailPluginRendererV1 {
     | { type: "core_projection"; file: string };
 }
 
+/**
+ * Safe, expression-free Renderer DSL for data-only plugins. All JSON pointers
+ * are evaluated relative to semantic node.content. HTML, CSS, scripts,
+ * templates, network requests, and arbitrary component imports are absent by
+ * construction.
+ */
+export interface HomerailDeclarativeRendererV1 {
+  renderer_version: 1;
+  type: "card";
+  title_pointer: string;
+  subtitle_pointer?: string;
+  empty_message?: string;
+  sections: HomerailDeclarativeRendererSectionV1[];
+}
+
+export type HomerailDeclarativeRendererSectionV1 =
+  | {
+      id: string;
+      type: "text";
+      label?: string;
+      pointer: string;
+      max_lines?: number;
+    }
+  | {
+      id: string;
+      type: "list";
+      label?: string;
+      pointer: string;
+      item_title_pointer: string;
+      item_detail_pointer?: string;
+      item_badge_pointer?: string;
+      max_items?: number;
+    }
+  | {
+      id: string;
+      type: "metrics";
+      label?: string;
+      items: Array<{
+        label: string;
+        pointer: string;
+        format: "text" | "number" | "percent";
+      }>;
+    }
+  | {
+      id: string;
+      type: "links";
+      label?: string;
+      pointer: string;
+      item_label_pointer: string;
+      item_uri_pointer: string;
+      max_items?: number;
+    };
+
+export type HomerailPluginResolvedRendererSourceV1 =
+  | { type: "builtin"; id: string }
+  | {
+      type: "declarative";
+      file: string;
+      digest: string;
+      document: HomerailDeclarativeRendererV1;
+    }
+  | { type: "custom"; file: string };
+
 export interface HomerailPluginActionV1 {
   id: string;
   intent: string;
@@ -378,7 +450,7 @@ export interface HomerailPluginRendererRegistrationV1 {
   mode: HomerailPluginRendererMode;
   surfaces: GenerativeUiSurface[];
   devices: GenerativeUiDevice[];
-  source: HomerailPluginRendererV1["source"];
+  source: HomerailPluginResolvedRendererSourceV1;
   fallback: HomerailPluginRendererV1["fallback"];
 }
 

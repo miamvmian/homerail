@@ -2,6 +2,7 @@
 
 import {
   HOMERAIL_PLUGIN_MANIFEST_VERSION,
+  HOMERAIL_PLUGIN_ID_PATTERN_SOURCE,
   HomerailPluginConfirmation,
   HomerailPluginEffect,
   HomerailPluginModality,
@@ -35,7 +36,7 @@ const pluginId = {
   type: "string",
   minLength: 3,
   maxLength: 160,
-  pattern: "^[a-z0-9]+(?:[.-][a-z0-9]+)+$",
+  pattern: HOMERAIL_PLUGIN_ID_PATTERN_SOURCE,
 } as const;
 
 const semanticKind = {
@@ -326,6 +327,109 @@ const workflowSchema = {
   additionalProperties: false,
 } as const;
 
+const declarativeJsonPointer = {
+  type: "string",
+  maxLength: 500,
+  pattern: "^(?:/(?:[^~/]|~[01])*)*$",
+} as const;
+const declarativeSha256Digest = {
+  type: "string",
+  minLength: 64,
+  maxLength: 64,
+  pattern: "^[a-f0-9]{64}$",
+} as const;
+const declarativeRendererLabel = { type: "string", minLength: 1, maxLength: 120 } as const;
+const declarativeRendererSectionSchema = {
+  oneOf: [
+    {
+      type: "object",
+      properties: {
+        id: localId,
+        type: { const: "text" },
+        label: declarativeRendererLabel,
+        pointer: declarativeJsonPointer,
+        max_lines: { type: "integer", minimum: 1, maximum: 12 },
+      },
+      required: ["id", "type", "pointer"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        id: localId,
+        type: { const: "list" },
+        label: declarativeRendererLabel,
+        pointer: declarativeJsonPointer,
+        item_title_pointer: declarativeJsonPointer,
+        item_detail_pointer: declarativeJsonPointer,
+        item_badge_pointer: declarativeJsonPointer,
+        max_items: { type: "integer", minimum: 1, maximum: 32 },
+      },
+      required: ["id", "type", "pointer", "item_title_pointer"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        id: localId,
+        type: { const: "metrics" },
+        label: declarativeRendererLabel,
+        items: {
+          type: "array",
+          minItems: 1,
+          maxItems: 8,
+          items: {
+            type: "object",
+            properties: {
+              label: declarativeRendererLabel,
+              pointer: declarativeJsonPointer,
+              format: { type: "string", enum: ["text", "number", "percent"] },
+            },
+            required: ["label", "pointer", "format"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["id", "type", "items"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        id: localId,
+        type: { const: "links" },
+        label: declarativeRendererLabel,
+        pointer: declarativeJsonPointer,
+        item_label_pointer: declarativeJsonPointer,
+        item_uri_pointer: declarativeJsonPointer,
+        max_items: { type: "integer", minimum: 1, maximum: 16 },
+      },
+      required: ["id", "type", "pointer", "item_label_pointer", "item_uri_pointer"],
+      additionalProperties: false,
+    },
+  ],
+} as const;
+
+export const homerailDeclarativeRendererSchema = {
+  $id: "homerail-declarative-renderer-v1",
+  type: "object",
+  properties: {
+    renderer_version: { const: 1 },
+    type: { const: "card" },
+    title_pointer: declarativeJsonPointer,
+    subtitle_pointer: declarativeJsonPointer,
+    empty_message: { type: "string", minLength: 1, maxLength: 240 },
+    sections: {
+      type: "array",
+      minItems: 1,
+      maxItems: 12,
+      items: declarativeRendererSectionSchema,
+    },
+  },
+  required: ["renderer_version", "type", "title_pointer", "sections"],
+  additionalProperties: false,
+} as const;
+
 const rendererSourceSchema = {
   oneOf: [
     {
@@ -338,6 +442,34 @@ const rendererSourceSchema = {
       type: "object",
       properties: { type: { const: "declarative" }, file: packagePath },
       required: ["type", "file"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: { type: { const: "custom" }, file: packagePath },
+      required: ["type", "file"],
+      additionalProperties: false,
+    },
+  ],
+} as const;
+
+const resolvedRendererSourceSchema = {
+  oneOf: [
+    {
+      type: "object",
+      properties: { type: { const: "builtin" }, id: localId },
+      required: ["type", "id"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        type: { const: "declarative" },
+        file: packagePath,
+        digest: declarativeSha256Digest,
+        document: { $ref: "homerail-declarative-renderer-v1" },
+      },
+      required: ["type", "file", "digest", "document"],
       additionalProperties: false,
     },
     {
@@ -738,7 +870,7 @@ const rendererRegistrationSchema = {
       uniqueItems: true,
       items: { type: "string", enum: Object.values(GenerativeUiDevice) },
     },
-    source: rendererSourceSchema,
+    source: resolvedRendererSourceSchema,
     fallback: rendererFallbackSchema,
   },
   required: [
@@ -987,5 +1119,6 @@ export const homerailPluginSchemas: Record<string, Record<string, unknown>> = {
   "homerail-plugin-ui-projection-v1": homerailPluginUiProjectionSchema as Record<string, unknown>,
   "homerail-resolved-plugin-descriptor-v1": homerailResolvedPluginDescriptorSchema as Record<string, unknown>,
   "homerail-direct-ui-projection-v1": homerailDirectUiProjectionSchema as Record<string, unknown>,
+  "homerail-declarative-renderer-v1": homerailDeclarativeRendererSchema as Record<string, unknown>,
   "homerail-plugin-tool-execution-envelope-v1": homerailPluginToolExecutionEnvelopeSchema as Record<string, unknown>,
 };

@@ -3,7 +3,9 @@
   "type": "object",
   "properties": {
     "legacy_widget": {
-      "type": "object"
+      "type": "object",
+      "maxProperties": 128,
+      "additionalProperties": true
     }
   },
   "required": ["legacy_widget"],

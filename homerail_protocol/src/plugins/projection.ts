@@ -1,4 +1,4 @@
-import AjvModule, { type ErrorObject } from "ajv";
+import AjvModule, { type ErrorObject, type ValidateFunction } from "ajv";
 import {
   GENERATIVE_UI_IR_VERSION,
   GenerativeUiActorType,
@@ -9,6 +9,7 @@ import {
   validateHomerailDirectUiProjection,
   validateHomerailPluginToolExecutionEnvelope,
 } from "./validation.js";
+import { analyzeHomerailPluginSchemaPolicy } from "./schema-policy.js";
 import type {
   HomerailDirectUiProjectionResultV1,
   HomerailDirectUiProjectionV1,
@@ -21,18 +22,52 @@ import type {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const AjvClass = (AjvModule as any).default || AjvModule;
 
+const TOOL_INPUT_VALIDATOR_CACHE_MAX_ENTRIES = 64;
+const TOOL_INPUT_VALIDATION_MAX_ERRORS = 16;
+const toolInputValidatorCache = new Map<string, ValidateFunction>();
+
 function normalizedAjvErrors(errors: ErrorObject[] | null | undefined): HomerailPluginValidationError[] {
-  return (errors ?? []).map((entry) => ({
+  return (errors ?? []).slice(0, TOOL_INPUT_VALIDATION_MAX_ERRORS).map((entry) => ({
     path: entry.instancePath || "",
     message: entry.message || "Tool input is invalid",
     keyword: entry.keyword || "toolInputSchema",
   }));
 }
 
+function cachedToolInputValidator(schema: Record<string, unknown>): ValidateFunction {
+  // This is deliberately the complete schema, not an object-identity or short
+  // hash key. Re-serializing the validated snapshot on every call makes an
+  // in-place schema mutation select a different validator without collisions.
+  const key = JSON.stringify(schema);
+  const cached = toolInputValidatorCache.get(key);
+  if (cached) {
+    toolInputValidatorCache.delete(key);
+    toolInputValidatorCache.set(key, cached);
+    return cached;
+  }
+
+  // Ajv memoizes by schema object identity internally. Give every cache miss an
+  // isolated instance and snapshot so neither that memoization nor a later
+  // caller mutation can return a validator compiled for stale schema content.
+  const ajv = new AjvClass({ allErrors: false, strict: true, coerceTypes: false });
+  const validate = ajv.compile(schema) as ValidateFunction;
+  toolInputValidatorCache.set(key, validate);
+  while (toolInputValidatorCache.size > TOOL_INPUT_VALIDATOR_CACHE_MAX_ENTRIES) {
+    const oldest = toolInputValidatorCache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    toolInputValidatorCache.delete(oldest);
+  }
+  return validate;
+}
+
 export function validateHomerailPluginToolInput(
   schema: Record<string, unknown>,
   value: unknown,
 ): HomerailPluginValidationResult<Record<string, unknown>> {
+  const schemaIssues = analyzeHomerailPluginSchemaPolicy(schema);
+  if (schemaIssues.length) {
+    return { valid: false, errors: schemaIssues.map((issue) => ({ ...issue })) };
+  }
   const analysis = analyzeGenerativeUiJsonValue(value, {
     limits: { max_bytes: 128 * 1024, max_depth: 32, max_values: 100_000 },
   });
@@ -49,8 +84,10 @@ export function validateHomerailPluginToolInput(
     return { valid: false, errors: [{ path: "", message: "Tool input must be an object", keyword: "type" }] };
   }
   try {
-    const ajv = new AjvClass({ allErrors: true, strict: false, coerceTypes: false });
-    const validate = ajv.compile(schema);
+    // Compile only a private snapshot that corresponds exactly to the cache key.
+    // structuredClone also fails closed for proxies and other non-wire objects.
+    const schemaSnapshot = structuredClone(schema);
+    const validate = cachedToolInputValidator(schemaSnapshot);
     if (!validate(stable)) return { valid: false, errors: normalizedAjvErrors(validate.errors) };
   } catch {
     return { valid: false, errors: [{ path: "", message: "Tool input schema failed safely", keyword: "toolInputSchema" }] };

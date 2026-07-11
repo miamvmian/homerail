@@ -6,6 +6,7 @@ import {
   HomerailPluginRendererMode,
   HomerailPluginRuntimeTrust,
   type HomerailPluginCompatibilityTargetV1,
+  type HomerailDeclarativeRendererV1,
   type HomerailDirectUiProjectionV1,
   type HomerailPluginHandlerV1,
   type HomerailPluginManifestV1,
@@ -834,6 +835,25 @@ export function validateHomerailDirectUiProjection(
       ));
     }
   }
+  return errors.length ? { valid: false, errors } : validation;
+}
+
+export function validateHomerailDeclarativeRenderer(
+  value: unknown,
+): HomerailPluginValidationResult<HomerailDeclarativeRendererV1> {
+  const validation = validatePluginWireValue<HomerailDeclarativeRendererV1>(
+    "homerail-declarative-renderer-v1",
+    value,
+  );
+  if (!validation.value) return validation;
+  const ids = new Set<string>();
+  const errors: HomerailPluginValidationError[] = [];
+  validation.value.sections.forEach((section, index) => {
+    if (ids.has(section.id)) {
+      errors.push(error(`/sections/${index}/id`, `duplicate section id: ${section.id}`, "uniqueSectionId"));
+    }
+    ids.add(section.id);
+  });
   return errors.length ? { valid: false, errors } : validation;
 }
 
