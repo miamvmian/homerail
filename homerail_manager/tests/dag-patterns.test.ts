@@ -106,9 +106,10 @@ describe("built-in DAG patterns", () => {
 
     expect(reviewer?.system).toContain("not the human decision maker");
     expect(reviewer?.system).toContain("handoff tool on done");
-    expect(reviewer?.system).toContain("key must be named status");
-    expect(reviewer?.system).toContain("literal value must be awaiting_human_review");
-    expect(reviewer?.system).toContain("do not rename, nest, or substitute");
+    expect(reviewer?.system).toContain("top-level status awaiting_human_review");
+    expect(reviewer?.system).toContain("review_boundary is human_review");
+    expect(reviewer?.system).toContain("every proposal has status awaiting_human_review");
+    expect(reviewer?.system).toContain("Never emit approved, rejected, signed, or applied status");
   });
 
   it("requires ratchet improvers to preserve an upstream synthetic scope", () => {

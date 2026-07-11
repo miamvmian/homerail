@@ -104,6 +104,25 @@ function matchingHandoffs(handoffs, node, port) {
   return handoffs.filter((handoff) => handoffNode(handoff) === node && handoff.port === port);
 }
 
+function preservesHumanReviewBoundary(value) {
+  if (typeof value !== "object" || value === null) return false;
+  const forbidden = new Set(["approved", "rejected", "signed", "applied"]);
+  const proposals = Array.isArray(value.proposals) ? value.proposals : [];
+  const statuses = [value.status, value.decision, value.approval, value.outcome]
+    .concat(proposals.map((proposal) =>
+      typeof proposal === "object" && proposal !== null ? proposal.status : undefined
+    ))
+    .filter((status) => typeof status === "string")
+    .map((status) => status.toLowerCase());
+  if (statuses.some((status) => forbidden.has(status))) return false;
+  if (value.status === "awaiting_human_review") return true;
+  return value.review_boundary === "human_review"
+    && proposals.length > 0
+    && proposals.every((proposal) =>
+      typeof proposal === "object" && proposal !== null && proposal.status === "awaiting_human_review"
+    );
+}
+
 function semanticFailures(patternId, handoffs) {
   const failures = [];
   for (const requirement of semanticRequirements[patternId]) {
@@ -136,7 +155,7 @@ function semanticFailures(patternId, handoffs) {
   }
   if (patternId === "compost") {
     const review = parseContent(matchingHandoffs(handoffs, "human_review", "done").at(-1)?.content);
-    if (typeof review !== "object" || review === null || review.status !== "awaiting_human_review") {
+    if (!preservesHumanReviewBoundary(review)) {
       failures.push("compost terminal did not preserve the awaiting_human_review boundary");
     }
   }

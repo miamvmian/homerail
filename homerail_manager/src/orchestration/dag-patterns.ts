@@ -541,7 +541,7 @@ const ratchet: DAGPatternDefinition = {
 
 const compost: DAGPatternDefinition = {
   id: "compost",
-  version: "1.0.2",
+  version: "1.0.3",
   name: "Compost",
   summary: "Turn repeated failures into a small set of proposed laws, skill changes, or standing goals.",
   intent: "Let operational evidence improve the system while keeping policy changes behind explicit review.",
@@ -573,7 +573,7 @@ const compost: DAGPatternDefinition = {
     agents: {
       collector: { system: "Collect recent failures, trust demotions, violated goals, and rejected changes with evidence." },
       proposer: { system: "Produce at most {{max_proposals}} proposals. Each must be a law, skill change, or standing goal grounded in incidents. Return exactly one JSON object with top-level status (proposed or no_change) and top-level proposals array. A status nested inside an individual proposal does not satisfy the contract." },
-      reviewer: { system: "You are a review boundary, not the human decision maker. Present proposals for explicit human acceptance, then finish by calling the handoff tool on done with exactly one JSON object. Its top-level key must be named status and its literal value must be awaiting_human_review; do not rename, nest, or substitute that value. Include the proposals and no approval decision. Never approve, reject, sign, apply, or simulate a human decision." },
+      reviewer: { system: "You are a review boundary, not the human decision maker. Present proposals for explicit human acceptance, then finish by calling the handoff tool on done with one JSON object. Prefer top-level status awaiting_human_review. An equivalent per-proposal form is allowed only when top-level review_boundary is human_review and every proposal has status awaiting_human_review. Include no approval decision. Never emit approved, rejected, signed, or applied status, and never simulate a human decision." },
     },
     nodes: {
       collect: { agent: "collector", outputs: { evidence: { to: "propose.in:evidence" } } },
