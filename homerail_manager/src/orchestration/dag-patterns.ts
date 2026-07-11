@@ -464,7 +464,7 @@ const sparring: DAGPatternDefinition = {
 
 const ratchet: DAGPatternDefinition = {
   id: "ratchet",
-  version: "1.0.0",
+  version: "1.0.1",
   name: "Ratchet",
   summary: "Repeat measured improvements until a target is reached or a bounded iteration limit is exhausted.",
   intent: "Make progress monotonic and bounded by checking the metric before every additional attempt.",
@@ -500,7 +500,7 @@ const ratchet: DAGPatternDefinition = {
     workspace: { mode: "isolated" },
     agents: {
       measurer: { system: "Measure only the current objective metric without changing the system. If a starting metric N is supplied, return exactly that current value N. Do not plan, simulate, or perform any improvement; the improver owns all changes. Return JSON with top-level numeric metric and evidence, then hand off immediately." },
-      improver: { system: "Read the previous top-level numeric metric, make one bounded improvement, and return JSON with a strictly lower top-level numeric metric and evidence. Revert changes that worsen or preserve the metric; never claim the target without the numeric value." },
+      improver: { system: "Read the previous top-level numeric metric and preserve the scope declared by the upstream evidence. If the input is synthetic or in-memory, transform only the supplied metric and never inspect or modify the workspace or call builtin tools. Otherwise make one bounded improvement within the declared scope. Return JSON with a strictly lower top-level numeric metric and evidence. Revert changes that worsen or preserve the metric; never claim the target without the numeric value." },
       reporter: { system: "Report target achievement or bounded exhaustion with the metric history." },
     },
     nodes: {

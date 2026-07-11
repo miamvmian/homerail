@@ -109,6 +109,15 @@ describe("built-in DAG patterns", () => {
     expect(reviewer?.system).toContain("top-level status awaiting_human_review");
   });
 
+  it("requires ratchet improvers to preserve an upstream synthetic scope", () => {
+    const pattern = instantiateDAGPattern("ratchet");
+    const improver = pattern.parsed.meta.agents.improver;
+
+    expect(improver?.system).toContain("preserve the scope declared by the upstream evidence");
+    expect(improver?.system).toContain("synthetic or in-memory");
+    expect(improver?.system).toContain("never inspect or modify the workspace");
+  });
+
   it("rejects unknown, incorrectly typed, and out-of-range parameters", () => {
     expect(() => instantiateDAGPattern("missing")).toThrow("DAG pattern not found");
     expect(() => instantiateDAGPattern("quorum", { surprise: true })).toThrow("Unknown pattern parameter");
