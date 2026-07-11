@@ -15,10 +15,12 @@ import {
   type VoiceUiRules,
 } from "./host-codex-manager-agent.js";
 import { listManagerSkills, type ManagerSkillSummary } from "./manager-skills.js";
+import { assemblePluginTurnContext } from "../plugins/context-assembler.js";
 import {
   managerAgentRuntimePlacementForHarness,
   normalizeManagerAgentHarness,
   type ManagerAgentRuntimePlacement,
+  type HomerailPluginTurnContextV1,
 } from "homerail-protocol";
 
 export type ManagerAgentResponseMode = "chat" | "voice";
@@ -35,6 +37,7 @@ export interface RunManagerAgentTurnInput {
   agent_config: ManagerAgentRuntimeConfig;
   voice_ui_rules?: VoiceUiRules;
   manager_skills?: ManagerSkillSummary[];
+  plugin_context?: HomerailPluginTurnContextV1;
 }
 
 export interface RunManagerAgentTurnResult {
@@ -81,7 +84,10 @@ export async function runManagerAgentTurn(
   options?: ManagerAgentContainerOptions,
 ): Promise<RunManagerAgentTurnResult> {
   const runtimePlacement = managerAgentRuntimePlacement(input.agent_config);
-  const managerSkills = input.manager_skills ?? listManagerSkills();
+  const pluginContext = input.plugin_context ?? assemblePluginTurnContext(undefined, {
+    modality: input.response_mode === "voice" ? "voice" : "text",
+  });
+  const managerSkills = input.manager_skills ?? listManagerSkills(pluginContext);
   if (runtimePlacement === "host") {
     try {
       const result = await runHostCodexManagerAgentTurn({
@@ -96,6 +102,7 @@ export async function runManagerAgentTurn(
         response_mode: input.response_mode,
         voice_ui_rules: input.voice_ui_rules,
         manager_skills: managerSkills,
+        plugin_context: pluginContext,
       });
       return {
         result,
@@ -149,6 +156,7 @@ export async function runManagerAgentTurn(
         voice_ui_rules: input.voice_ui_rules,
         voice_system_contract: input.response_mode === "voice" ? loadVoiceSystemContract() : undefined,
         manager_skills: managerSkills,
+        plugin_context: pluginContext,
       });
       return {
         result,
@@ -191,6 +199,7 @@ export async function runManagerAgentTurn(
       voice_ui_rules: input.voice_ui_rules,
       voice_system_contract: input.response_mode === "voice" ? loadVoiceSystemContract() : undefined,
       manager_skills: managerSkills,
+      plugin_context: pluginContext,
     });
     return {
       result,
@@ -223,7 +232,10 @@ export async function* runManagerAgentTurnStream(
   }
 
   try {
-    const managerSkills = input.manager_skills ?? listManagerSkills();
+    const pluginContext = input.plugin_context ?? assemblePluginTurnContext(undefined, {
+      modality: input.response_mode === "voice" ? "voice" : "text",
+    });
+    const managerSkills = input.manager_skills ?? listManagerSkills(pluginContext);
     for await (const event of runHostCodexManagerAgentTurnStream({
       message: input.message,
       project_id: input.project_id ?? undefined,
@@ -236,6 +248,7 @@ export async function* runManagerAgentTurnStream(
       response_mode: input.response_mode,
       voice_ui_rules: input.voice_ui_rules,
       manager_skills: managerSkills,
+      plugin_context: pluginContext,
     })) {
       if (event.type === "commentary") {
         yield { type: "commentary", text: event.text };

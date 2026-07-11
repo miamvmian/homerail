@@ -12,7 +12,14 @@ import {
   resolveManagerAgentConfig,
   type ManagerAgentContainerOptions,
 } from "./manager-agent-container.js";
-import { getUserVoiceRulesPath, loadVoiceUiRules, writeVoiceMemoWidget, type VoiceUiRules } from "./host-codex-manager-agent.js";
+import {
+  composeVoiceUiRules,
+  getUserVoiceRulesPath,
+  loadUserVoiceUiRulesOverlay,
+  loadVoiceUiRules,
+  writeVoiceMemoWidget,
+  type VoiceUiRules,
+} from "./host-codex-manager-agent.js";
 import {
   ManagerAgentRuntimeError,
   managerAgentRuntimePlacement,
@@ -27,7 +34,13 @@ import {
   type ManagerAgentConfigRoutesOptions,
 } from "./manager-agent-config.js";
 import { resolveCodexBinary, runCodexCommandSync } from "./codex-binary.js";
-import { managerAgentRuntimePlacementForHarness, normalizeManagerAgentHarness } from "homerail-protocol";
+import {
+  managerAgentRuntimePlacementForHarness,
+  managerAgentPluginOwnedLegacyWidgetType,
+  normalizeManagerAgentHarness,
+  type GenerativeUiNodeV1,
+  type HomerailPluginTurnContextV1,
+} from "homerail-protocol";
 import {
   listWidgetFileTypes,
   readWidgetFile,
@@ -54,6 +67,11 @@ import {
   persistentGenerativeUiDocumentService,
   type GenerativeUiShadowSnapshotV1,
 } from "../generative-ui/shadow-service.js";
+import { acceptPluginToolExecution } from "../plugins/execution-broker.js";
+import {
+  assembleLegacyWidgetReservations,
+  assemblePluginTurnContext,
+} from "../plugins/context-assembler.js";
 
 interface BaseResponse {
   success: boolean;
@@ -93,6 +111,8 @@ interface VoiceWidget {
 }
 
 interface VoiceUiRulesSnapshot {
+  format_version?: 1;
+  content_kind?: "user_overlay";
   hash: string;
   sources: string[];
   prompt_path: string;
@@ -131,6 +151,7 @@ interface VoiceWorkspace {
   debug_events: Array<{ id: string; level: "debug" | "info" | "warning" | "error"; code: string; message: string; created_at: string }>;
   progress_brief: { status: string; short_text: string; updated_at: string };
   widgets: VoiceWidget[];
+  plugin_nodes?: GenerativeUiNodeV1[];
   ui_events: Array<Record<string, unknown>>;
   codex_monitor_status?: "idle" | "running" | "done" | "failed";
   codex_monitor_run_id?: string | null;
@@ -279,16 +300,19 @@ function voiceUiRulesSnapshotPath(projectId: string | null | undefined, sessionI
 }
 
 function createVoiceUiRulesSnapshot(sessionId: string, projectId?: string | null): VoiceUiRulesSnapshot {
-  const rules = loadVoiceUiRules();
+  const overlay = loadUserVoiceUiRulesOverlay();
+  const rules = composeVoiceUiRules(overlay.prompt, overlay.sources);
   const promptPath = voiceUiRulesSnapshotPath(projectId, sessionId);
   fs.mkdirSync(path.dirname(promptPath), { recursive: true });
-  fs.writeFileSync(promptPath, rules.prompt, { encoding: "utf8", mode: 0o600 });
+  fs.writeFileSync(promptPath, overlay.prompt, { encoding: "utf8", mode: 0o600 });
   try {
     fs.chmodSync(promptPath, 0o600);
   } catch {
     // Best effort only; some mounted filesystems ignore chmod.
   }
   return {
+    format_version: 1,
+    content_kind: "user_overlay",
     hash: rules.hash,
     sources: rules.sources,
     prompt_path: promptPath,
@@ -296,20 +320,45 @@ function createVoiceUiRulesSnapshot(sessionId: string, projectId?: string | null
   };
 }
 
+function userOverlayFromLegacyVoiceRulesSnapshot(content: string): string {
+  const marker = "## User Voice UI Rules";
+  const index = content.indexOf(marker);
+  if (index < 0) {
+    // Recovery for an interrupted migration: the file may already contain the
+    // extracted overlay while the workspace metadata still has the old shape.
+    // A real old full snapshot always carries the baseline heading.
+    return content.includes("## Baseline Voice UI Rules") ? "" : content.trim();
+  }
+  const lines = content.slice(index + marker.length).trim().split("\n");
+  if (lines[0]?.startsWith("The following user rules are editable assets.")) lines.shift();
+  return lines.join("\n").trim();
+}
+
 function ensureWorkspaceVoiceUiRules(workspace: VoiceWorkspace): VoiceUiRules {
   if (!workspace.voice_ui_rules || !fs.existsSync(workspace.voice_ui_rules.prompt_path)) {
     workspace.voice_ui_rules = createVoiceUiRulesSnapshot(workspace.session_id, workspace.project_id);
   }
-  const prompt = fs.readFileSync(workspace.voice_ui_rules.prompt_path, "utf8").trim();
-  if (!prompt) {
-    workspace.voice_ui_rules = createVoiceUiRulesSnapshot(workspace.session_id, workspace.project_id);
-    return ensureWorkspaceVoiceUiRules(workspace);
+  let overlay = fs.readFileSync(workspace.voice_ui_rules.prompt_path, "utf8");
+  if (
+    workspace.voice_ui_rules.format_version !== 1
+    || workspace.voice_ui_rules.content_kind !== "user_overlay"
+  ) {
+    overlay = userOverlayFromLegacyVoiceRulesSnapshot(overlay);
+    fs.writeFileSync(workspace.voice_ui_rules.prompt_path, overlay, { encoding: "utf8", mode: 0o600 });
+    const migrated = composeVoiceUiRules(
+      overlay,
+      workspace.voice_ui_rules.sources.filter((source) => source.startsWith("user:")),
+    );
+    workspace.voice_ui_rules = {
+      ...workspace.voice_ui_rules,
+      format_version: 1,
+      content_kind: "user_overlay",
+      hash: migrated.hash,
+      sources: migrated.sources,
+    };
   }
-  return {
-    prompt,
-    sources: workspace.voice_ui_rules.sources,
-    hash: workspace.voice_ui_rules.hash,
-  };
+  const userSources = workspace.voice_ui_rules.sources.filter((source) => source.startsWith("user:"));
+  return composeVoiceUiRules(overlay, userSources);
 }
 
 function readVoiceUiRulesAsset(createTemplate = false): Record<string, unknown> {
@@ -580,6 +629,7 @@ function newWorkspace(projectId?: string | null): VoiceWorkspace {
     debug_events: [],
     progress_brief: { status: "idle", short_text: "", updated_at: timestamp },
     widgets: [],
+    plugin_nodes: [],
     ui_events: [],
     codex_monitor_status: "idle",
     codex_monitor_run_id: null,
@@ -881,7 +931,7 @@ function normalizeWidget(raw: unknown): VoiceWidget | null {
   const explicitId = String(item.id || "").trim();
   // 无显式 id 时基于 type+title 生成稳定 id，让同类型同标题的 widget 能被后续覆盖而非重复堆积
   const id = explicitId || `widget-${type}-${title.slice(0, 24)}`;
-  return {
+  const widget: VoiceWidget = {
     id,
     type,
     title: shortText(title, 80),
@@ -893,6 +943,7 @@ function normalizeWidget(raw: unknown): VoiceWidget | null {
     active_step: activeStep,
     data: objectValue(item.data) ?? {},
   };
+  return widget;
 }
 
 function applyTaskDraftPatch(workspace: VoiceWorkspace, raw: unknown, fallbackText: string): boolean {
@@ -936,7 +987,12 @@ function applyTaskDraftPatch(workspace: VoiceWorkspace, raw: unknown, fallbackTe
   return true;
 }
 
-function applyVoiceSurfaceFromResult(workspace: VoiceWorkspace, result: Record<string, unknown>, fallbackText: string): boolean {
+function applyVoiceSurfaceFromResult(
+  workspace: VoiceWorkspace,
+  result: Record<string, unknown>,
+  fallbackText: string,
+  pluginContext: HomerailPluginTurnContextV1,
+): boolean {
   const surface = objectValue(result.voice_surface);
   let changed = false;
   const taskDraft = objectValue(surface?.task_draft) ?? objectValue(result.task_draft) ?? objectValue(result.task_draft_patch);
@@ -952,17 +1008,129 @@ function applyVoiceSurfaceFromResult(workspace: VoiceWorkspace, result: Record<s
     changed = true;
   }
 
+  const rawPluginProjections = Array.isArray(surface?.plugin_projections) ? surface.plugin_projections : [];
+  const acceptedPluginProjections: Array<{ node: GenerativeUiNodeV1; legacyWidget: VoiceWidget | null }> = [];
+  const pluginProjectionCommitEnabled = effectiveGenerativeUiShadowEnabled(workspace);
+  if (rawPluginProjections.length && !pluginProjectionCommitEnabled) {
+    appendDebugEvent(
+      workspace,
+      "plugin_projection_mode_rejected",
+      "Plugin projections cannot commit while Generative UI shadow mode is off",
+      "warning",
+    );
+  }
+  for (const rawEnvelope of pluginProjectionCommitEnabled ? rawPluginProjections : []) {
+    try {
+      const { envelope, node } = acceptPluginToolExecution(rawEnvelope, pluginContext);
+      const legacyWidget = envelope.projection.legacy_widget
+        ? normalizeWidget(envelope.projection.legacy_widget)
+        : null;
+      if (envelope.projection.legacy_widget && !legacyWidget) {
+        throw new Error(`Plugin legacy bridge is invalid after execution acceptance: ${node.id}`);
+      }
+      acceptedPluginProjections.push({ node, legacyWidget });
+    } catch (cause) {
+      appendDebugEvent(
+        workspace,
+        "plugin_projection_rejected",
+        cause instanceof Error ? cause.message : String(cause),
+        "warning",
+      );
+    }
+  }
+
+  const safePluginProjections: typeof acceptedPluginProjections = [];
+  const batchIdentities = new Map<string, string>();
+  for (const accepted of acceptedPluginProjections) {
+    // Node identity follows the canonical Document reducer: an id may be
+    // updated by a newer package from the same plugin as long as its semantic
+    // Kind is unchanged. Package version is provenance, not node ownership.
+    const identityKey = `${accepted.node.owner.id}\u0000${accepted.node.kind}`;
+    const batchIdentity = batchIdentities.get(accepted.node.id);
+    const existingPluginNode = (workspace.plugin_nodes ?? []).find((node) => node.id === accepted.node.id);
+    const existingWidget = workspace.widgets.find((widget) => widget.id === accepted.node.id);
+    const ownershipConflict = (
+      (batchIdentity !== undefined && batchIdentity !== identityKey)
+      || (
+        existingPluginNode !== undefined
+        && (
+          existingPluginNode.owner.id !== accepted.node.owner.id
+          || existingPluginNode.kind !== accepted.node.kind
+        )
+      )
+      || (existingWidget !== undefined && existingPluginNode === undefined)
+    );
+    if (ownershipConflict) {
+      appendDebugEvent(
+        workspace,
+        "plugin_projection_ownership_rejected",
+        `Plugin projection cannot take over an existing UI id: ${accepted.node.id}`,
+        "warning",
+      );
+      continue;
+    }
+    batchIdentities.set(accepted.node.id, identityKey);
+    safePluginProjections.push(accepted);
+  }
+  const claimedPluginNodeIds = new Set(safePluginProjections.map((accepted) => accepted.node.id));
+
   // 优先用 voice_surface.widgets；只有 surface 缺失时才回退到顶层 result.widgets，
-  // 避免两边同一数据被各生成一个 id 导致重复卡片。
+  // 避免两边同一数据被各生成一个 id 导致重复卡片。插件兼容 Widget
+  // 只能在 broker 验收后从 execution envelope 物化，不能走通用 Widget 通道。
   const rawWidgets = Array.isArray(surface?.widgets) && surface.widgets.length
     ? surface.widgets
     : (Array.isArray(result.widgets) ? result.widgets : []);
+  let pluginPolicyCatalog: { legacy_widget_reservations: ReturnType<typeof assembleLegacyWidgetReservations> } | undefined;
+  let pluginPolicyUnavailable = false;
+  if (rawWidgets.length && effectiveGenerativeUiShadowEnabled(workspace)) {
+    try {
+      pluginPolicyCatalog = { legacy_widget_reservations: assembleLegacyWidgetReservations() };
+    } catch (cause) {
+      pluginPolicyUnavailable = true;
+      appendDebugEvent(
+        workspace,
+        "plugin_widget_policy_unavailable",
+        cause instanceof Error ? cause.message : String(cause),
+        "warning",
+      );
+    }
+  }
   for (const rawWidget of rawWidgets) {
     const widget = normalizeWidget(rawWidget);
     if (widget) {
+      if (claimedPluginNodeIds.has(widget.id)) continue;
+      if (pluginPolicyUnavailable) continue;
+      const pluginOwnedType = managerAgentPluginOwnedLegacyWidgetType(pluginPolicyCatalog, widget);
+      if (pluginOwnedType) {
+        appendDebugEvent(
+          workspace,
+          "plugin_widget_bypass_rejected",
+          `Plugin-owned Widget type requires an accepted plugin execution: ${pluginOwnedType}`,
+          "warning",
+        );
+        continue;
+      }
+      if ((workspace.plugin_nodes ?? []).some((node) => node.id === widget.id)) {
+        appendDebugEvent(
+          workspace,
+          "plugin_widget_conflict_rejected",
+          `Legacy Widget cannot replace a semantic plugin node without an accepted plugin execution: ${widget.id}`,
+          "warning",
+        );
+        continue;
+      }
       upsertWidget(workspace, widget);
       changed = true;
     }
+  }
+
+  for (const accepted of safePluginProjections) {
+    if (accepted.legacyWidget) upsertWidget(workspace, accepted.legacyWidget);
+    const nodes = workspace.plugin_nodes ??= [];
+    const existing = nodes.findIndex((candidate) => candidate.id === accepted.node.id);
+    if (existing >= 0) nodes[existing] = accepted.node;
+    else nodes.push(accepted.node);
+    changed = true;
   }
 
   const removeIds = [
@@ -971,6 +1139,9 @@ function applyVoiceSurfaceFromResult(workspace: VoiceWorkspace, result: Record<s
   ].map((item) => String(item || "").trim()).filter(Boolean);
   for (const id of removeIds) {
     removeWidget(workspace, id);
+    if (workspace.plugin_nodes) {
+      workspace.plugin_nodes = workspace.plugin_nodes.filter((node) => node.id !== id);
+    }
     changed = true;
   }
   return changed;
@@ -1046,18 +1217,28 @@ function reactivateGenerativeUiShadowIfReleased(workspace: VoiceWorkspace): void
   }
 }
 
+function effectiveGenerativeUiShadowEnabled(workspace: VoiceWorkspace): boolean {
+  if (workspace.generative_ui_mode !== "shadow" || workspace.generative_ui_shadow_released) return false;
+  try {
+    const globalMode = resolveConfiguredGenerativeUiModeDetails(
+      readManagerAgentConfig().generative_ui_mode,
+    ).effective_mode;
+    return resolveSessionGenerativeUiMode(workspace.generative_ui_mode, globalMode) === "shadow";
+  } catch {
+    // A broken or emergency-off global setting must preserve the legacy path.
+    return false;
+  }
+}
+
 function reconcileGenerativeUiShadow(workspace: VoiceWorkspace): void {
   // Existing and explicitly-off sessions take the exact legacy path without
   // reading config or touching the in-memory Document Service.
-  if (workspace.generative_ui_mode !== "shadow" || workspace.generative_ui_shadow_released) return;
+  if (!effectiveGenerativeUiShadowEnabled(workspace)) return;
   try {
-    const globalMode = resolveConfiguredGenerativeUiMode(
-      readManagerAgentConfig().generative_ui_mode,
-    );
-    if (resolveSessionGenerativeUiMode(workspace.generative_ui_mode, globalMode) !== "shadow") return;
     const snapshot = generativeUiShadowService.reconcile({
       sessionId: workspace.session_id,
       widgets: workspace.widgets,
+      nodes: workspace.plugin_nodes ?? [],
       checkedAt: workspace.updated_at,
     });
     if (snapshot) recordShadowSnapshot(workspace, snapshot);
@@ -1065,6 +1246,7 @@ function reconcileGenerativeUiShadow(workspace: VoiceWorkspace): void {
     const snapshot = generativeUiShadowService.recordFailure({
       sessionId: workspace.session_id,
       widgets: workspace.widgets,
+      nodes: workspace.plugin_nodes ?? [],
       checkedAt: workspace.updated_at,
     }, cause);
     appendShadowDebugEvent(
@@ -1085,16 +1267,7 @@ function activeGenerativeUiCursor(sessionId: string): number {
 }
 
 function shouldStreamGenerativeUiShadow(workspace: VoiceWorkspace): boolean {
-  if (workspace.generative_ui_mode !== "shadow" || workspace.generative_ui_shadow_released) return false;
-  try {
-    const globalMode = resolveConfiguredGenerativeUiModeDetails(
-      readManagerAgentConfig().generative_ui_mode,
-    ).effective_mode;
-    return resolveSessionGenerativeUiMode(workspace.generative_ui_mode, globalMode) === "shadow";
-  } catch {
-    // Projection must remain best effort and must never break the legacy stream.
-    return false;
-  }
+  return effectiveGenerativeUiShadowEnabled(workspace);
 }
 
 function streamCommittedGenerativeUiTransactions(
@@ -1190,8 +1363,13 @@ async function submitVoiceWorkspaceToManagerAgent(
   }
 
   let result: Record<string, unknown>;
+  let pluginContext: HomerailPluginTurnContextV1;
   try {
     const voiceUiRules = ensureWorkspaceVoiceUiRules(workspace);
+    pluginContext = assemblePluginTurnContext(undefined, {
+      modality: "voice",
+      legacy_compatibility_mode: !effectiveGenerativeUiShadowEnabled(workspace),
+    });
     const turnInput: RunManagerAgentTurnInput = {
       message,
       project_id: workspace.project_id ?? undefined,
@@ -1202,6 +1380,7 @@ async function submitVoiceWorkspaceToManagerAgent(
       history: managerAgentHistory(workspace),
       agent_config: agentConfig,
       voice_ui_rules: voiceUiRules,
+      plugin_context: pluginContext,
     };
     if (realtimeHooks?.onSpeech) {
       let streamResult: Awaited<ReturnType<typeof runManagerAgentTurn>> | undefined;
@@ -1273,7 +1452,7 @@ async function submitVoiceWorkspaceToManagerAgent(
     short_text: runIds.length ? "主 Agent 已启动执行" : shortText(reply, 80),
     updated_at: updatedAt,
   };
-  applyVoiceSurfaceFromResult(workspace, result, reply);
+  applyVoiceSurfaceFromResult(workspace, result, reply, pluginContext!);
   const spoken = voiceSpokenText(
     typeof result.spoken_text === "string" && result.spoken_text.trim() ? result.spoken_text.trim() : reply,
     runIds,

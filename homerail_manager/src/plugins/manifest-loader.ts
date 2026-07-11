@@ -11,6 +11,7 @@ import {
   HomerailPluginRuntimeTrust,
   collectHomerailPluginFileReferences,
   validateHomerailPluginCompatibility,
+  validateHomerailDirectUiProjection,
   validateHomerailPluginManifest,
   type HomerailPluginManifestV1,
   type HomerailResolvedPluginDescriptorV1,
@@ -35,6 +36,7 @@ export interface LoadPluginPackageOptions {
   source: "builtin" | "installed" | "development";
   trusted_builtin_ids?: ReadonlySet<string>;
   builtin_renderer_ids?: ReadonlySet<string>;
+  legacy_bridge_plugin_ids?: ReadonlySet<string>;
 }
 
 function readBoundedFile(file: string, maxBytes: number): Buffer {
@@ -197,6 +199,46 @@ export function loadPluginPackage(
       schema,
     };
   });
+  for (const tool of manifest.tools) {
+    if (tool.handler.type !== "projection") continue;
+    const projection = parseJsonObject(buffers.get(tool.handler.file)!, tool.handler.file);
+    const projectionValidation = validateHomerailDirectUiProjection(projection);
+    if (!projectionValidation.valid || !projectionValidation.value) {
+      throw new Error(`Invalid declarative Tool projection ${tool.id}: ${JSON.stringify(projectionValidation.errors)}`);
+    }
+    if (
+      projectionValidation.value.legacy_bridge
+      && (
+        options.source !== "builtin"
+        || !options.legacy_bridge_plugin_ids?.has(manifest.id)
+      )
+    ) {
+      throw new Error(`Legacy UI bridges are restricted to approved builtin migrations: ${manifest.id}:${tool.id}`);
+    }
+    const target = manifest.kinds.find((kind) => (
+      kind.kind === projectionValidation.value!.kind
+      && kind.versions.some((version) => version.version === projectionValidation.value!.kind_version)
+    ));
+    if (!target) throw new Error(`Tool projection ${tool.id} targets an undeclared kind version`);
+    const targetVersion = target.versions.find((version) => version.version === projectionValidation.value!.kind_version)!;
+    if (!targetVersion.allowed_surfaces.includes(projectionValidation.value.defaults.surface)) {
+      throw new Error(`Tool projection ${tool.id} defaults to a surface not allowed by its target Kind`);
+    }
+    if (tool.output_schema !== targetVersion.content_schema) {
+      throw new Error(`Tool projection ${tool.id} output_schema must match its target kind content schema`);
+    }
+    const outputSchema = schemas.find((schema) => schema.id === tool.output_schema)?.schema;
+    const outputProperties = outputSchema?.properties;
+    if (
+      projectionValidation.value.legacy_bridge
+      && outputProperties
+      && typeof outputProperties === "object"
+      && !Array.isArray(outputProperties)
+      && Object.prototype.hasOwnProperty.call(outputProperties, "visual")
+    ) {
+      throw new Error(`Legacy UI bridge Tool ${tool.id} cannot reserve the content field visual`);
+    }
+  }
   const skills = manifest.skills.map((declaration) => {
     const content = buffers.get(declaration.path)!.toString("utf8");
     validateSkill(declaration.id, content);

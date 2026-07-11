@@ -1,7 +1,7 @@
 import * as http from "node:http";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { createAgentClient } from "../agent/factory.js";
 import type { AgentEvent, AgentRunContext, DagToolDefinition } from "../agent/types.js";
@@ -10,11 +10,20 @@ import {
   createManagerAgentWidgetFileTools,
   DEFAULT_MANAGER_AGENT_RUNTIME_AGENT_TYPE,
   managerAgentToolSpec,
+  managerAgentPluginOwnedLegacyWidgetType,
+  managerAgentPluginSkillSnapshot,
+  mergeManagerAgentPluginSkillCatalog,
+  executeHomerailPluginTool,
+  validateHomerailPluginTurnContext,
+  homerailPluginTurnContextDigestInput,
+  analyzeGenerativeUiJsonValue,
   normalizeManagerAgentRuntimeAgentType,
   type ManagerAgentWidgetFileToolAdapter,
   type ManagerAgentWidgetFileToolResult,
   type ManagerAgentToolName,
   type ManagerAgentPromptSkill,
+  type HomerailPluginTurnContextV1,
+  type HomerailPluginToolExecutionEnvelopeV1,
 } from "homerail-protocol";
 
 interface ManagerAgentConfig {
@@ -25,6 +34,8 @@ interface ManagerAgentConfig {
   base_url?: string;
   agent_type?: string;
   project_workspace?: string;
+  reasoning_effort?: string;
+  service_tier?: string | null;
 }
 
 interface ChatRequest {
@@ -39,6 +50,7 @@ interface ChatRequest {
   voice_ui_rules?: { prompt?: string; hash?: string; sources?: string[] };
   voice_system_contract?: { prompt?: string; source?: string };
   manager_skills?: ManagerAgentPromptSkill[];
+  plugin_context?: HomerailPluginTurnContextV1;
 }
 
 interface ChatSession {
@@ -66,6 +78,7 @@ interface VoiceSurfaceState {
   taskDraft: Record<string, unknown> | null;
   widgets: Record<string, unknown>[];
   removeWidgetIds: string[];
+  pluginProjections: HomerailPluginToolExecutionEnvelopeV1[];
 }
 
 const sessions = new Map<string, ChatSession>();
@@ -226,6 +239,7 @@ function emptyVoiceSurface(): VoiceSurfaceState {
     taskDraft: null,
     widgets: [],
     removeWidgetIds: [],
+    pluginProjections: [],
   };
 }
 
@@ -334,7 +348,13 @@ export function createManagerTools(state: {
   finalNotes: string[];
   objectiveToolCalls: Array<{ name: string; success: boolean; error?: string; inferred?: boolean }>;
   voiceSurface: VoiceSurfaceState;
-}, responseMode: "chat" | "voice"): DagToolDefinition[] {
+}, responseMode: "chat" | "voice", pluginContext?: HomerailPluginTurnContextV1): DagToolDefinition[] {
+  if (pluginContext && (
+    !validateHomerailPluginTurnContext(pluginContext).valid
+    || pluginContextDigest(pluginContext) !== pluginContext.context_digest
+  )) {
+    throw new Error("Plugin Context failed validation or digest verification in Worker Manager Agent");
+  }
   const tools: DagToolDefinition[] = [
     {
       name: "list_projects",
@@ -348,8 +368,13 @@ export function createManagerTools(state: {
     {
       ...managerAgentToolSpec("list_skills"),
       async handler() {
-        const body = await requestManager("/skills");
-        return { content: [{ type: "text", text: short(body, 12000) }] };
+        const body = await requestManager("/skills?local_only=1");
+        return {
+          content: [{
+            type: "text",
+            text: short(mergeManagerAgentPluginSkillCatalog(body, pluginContext), 12000),
+          }],
+        };
       },
     },
     {
@@ -357,7 +382,14 @@ export function createManagerTools(state: {
       async handler(args) {
         const skillId = String(args.skill_id || "").trim();
         if (!skillId) throw new Error("read_skill requires skill_id");
-        const body = await requestManager(`/skills/${encodeURIComponent(skillId)}`);
+        const pluginSkill = managerAgentPluginSkillSnapshot(pluginContext, skillId);
+        if (skillId.includes(":") && !pluginSkill) {
+          throw new Error(`Plugin Skill is unavailable in this turn: ${skillId}`);
+        }
+        const exactQuery = pluginSkill
+          ? `?plugin_version=${encodeURIComponent(pluginSkill.plugin_version)}&digest=${encodeURIComponent(pluginSkill.digest)}`
+          : "";
+        const body = await requestManager(`/skills/${encodeURIComponent(skillId)}${exactQuery}`);
         return { content: [{ type: "text", text: short(body, 30000) }] };
       },
     },
@@ -619,12 +651,17 @@ export function createManagerTools(state: {
       tools.push({
         ...managerAgentToolSpec(name),
         async handler(args) {
-          state.voiceSurface.widgets.push({
+          const widget = {
             ...args,
             type: name === "show_dynamic_widget"
               ? String(args.type || args.widget_type || widgetType)
               : widgetType,
-          });
+          };
+          const pluginOwnedType = managerAgentPluginOwnedLegacyWidgetType(pluginContext, widget);
+          if (pluginOwnedType) {
+            throw new Error(`Plugin-owned Widget type requires its enabled plugin Tool: ${pluginOwnedType}`);
+          }
+          state.voiceSurface.widgets.push(widget);
           return { content: [{ type: "text", text: "widget updated" }] };
         },
       });
@@ -663,6 +700,15 @@ export function createManagerTools(state: {
     tools.push({
       ...managerAgentToolSpec("update_voice_surface"),
       async handler(args) {
+        const widgets = Array.isArray(args.widgets)
+          ? args.widgets.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+          : [];
+        const pluginOwnedType = widgets
+          .map((widget) => managerAgentPluginOwnedLegacyWidgetType(pluginContext, widget))
+          .find(Boolean);
+        if (pluginOwnedType) {
+          throw new Error(`Plugin-owned Widget type requires its enabled plugin Tool: ${pluginOwnedType}`);
+        }
         const commentary = Array.isArray(args.commentary_texts) ? args.commentary_texts : [];
         for (const item of commentary) {
           const text = String(item || "").trim();
@@ -674,11 +720,7 @@ export function createManagerTools(state: {
         if (args.task_draft && typeof args.task_draft === "object" && !Array.isArray(args.task_draft)) {
           state.voiceSurface.taskDraft = args.task_draft as Record<string, unknown>;
         }
-        if (Array.isArray(args.widgets)) {
-          state.voiceSurface.widgets.push(
-            ...args.widgets.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item)),
-          );
-        }
+        state.voiceSurface.widgets.push(...widgets);
         if (Array.isArray(args.remove_widget_ids)) {
           state.voiceSurface.removeWidgetIds.push(
             ...args.remove_widget_ids.map((item) => String(item || "").trim()).filter(Boolean),
@@ -688,7 +730,32 @@ export function createManagerTools(state: {
       },
     });
   }
+  for (const descriptor of responseMode === "voice" ? pluginContext?.tools ?? [] : []) {
+    if (tools.some((tool) => tool.name === descriptor.wire_id)) {
+      throw new Error(`Plugin Tool wire id collides with an existing Tool: ${descriptor.wire_id}`);
+    }
+    tools.push({
+      name: descriptor.wire_id,
+      description: descriptor.description,
+      input_schema: structuredClone(descriptor.input_schema),
+      async handler(args) {
+        const envelope = executeHomerailPluginTool(descriptor, args);
+        state.voiceSurface.pluginProjections.push(envelope);
+        return { content: [{ type: "text", text: JSON.stringify(envelope) }] };
+      },
+    });
+  }
   return tools;
+}
+
+function pluginContextDigest(context: HomerailPluginTurnContextV1): string {
+  const hash = createHash("sha256");
+  const analysis = analyzeGenerativeUiJsonValue(homerailPluginTurnContextDigestInput(context), {
+    limits: { max_bytes: 4 * 1024 * 1024 },
+    on_token: (chunk) => hash.update(chunk),
+  });
+  if (!analysis.valid) throw new Error("Plugin Context digest input is invalid");
+  return hash.digest("hex");
 }
 
 function normalizeBackend(agentType: string | undefined): string {
@@ -776,7 +843,14 @@ async function handleChat(body: ChatRequest): Promise<Record<string, unknown>> {
   const texts: string[] = [];
   const responseMode = body.response_mode === "voice" ? "voice" : "chat";
   const requiredToolCalls = normalizeRequiredToolCalls(body.required_tool_calls);
-  const tools = createManagerTools(state, responseMode);
+  const pluginContext = body.plugin_context;
+  if (pluginContext) {
+    const validation = validateHomerailPluginTurnContext(pluginContext);
+    if (!validation.valid || pluginContextDigest(pluginContext) !== pluginContext.context_digest) {
+      throw new Error("Plugin Context failed validation or digest verification");
+    }
+  }
+  const tools = createManagerTools(state, responseMode, pluginContext);
   const agent = createAgentClient(normalizeBackend(body.agent_config?.agent_type));
   const config = body.agent_config ?? {};
   const model = String(config.model || config.model_name || "");
@@ -859,6 +933,7 @@ async function handleChat(body: ChatRequest): Promise<Record<string, unknown>> {
           task_draft: state.voiceSurface.taskDraft,
           widgets: state.voiceSurface.widgets,
           remove_widget_ids: state.voiceSurface.removeWidgetIds,
+          plugin_projections: state.voiceSurface.pluginProjections,
         },
         progress: state.voiceSurface.progress,
         task_draft: state.voiceSurface.taskDraft,
@@ -877,10 +952,31 @@ async function handleChat(body: ChatRequest): Promise<Record<string, unknown>> {
         ? state.objectiveToolCalls.length === 0 || state.objectiveToolCalls.some((item) => item.success)
         : requiredToolCalls.every((name) => state.objectiveToolCalls.some((item) => item.name === name && item.success)),
     },
+    effective_config: {
+      harness: normalizeManagerAgentRuntimeAgentType(config.agent_type),
+      response_mode: responseMode,
+      provider: config.provider_name ?? null,
+      model: config.model ?? config.model_name ?? null,
+      reasoning_effort: config.reasoning_effort ?? null,
+      service_tier: config.service_tier ?? null,
+      workspace: projectWorkspace(),
+      voice_system_source: body.voice_system_contract?.source ?? null,
+      voice_system_hash: body.voice_system_contract?.prompt
+        ? createHash("sha256").update(body.voice_system_contract.prompt).digest("hex").slice(0, 16)
+        : null,
+      voice_ui_rules_hash: body.voice_ui_rules?.hash ?? null,
+      voice_ui_rules_sources: body.voice_ui_rules?.sources ?? [],
+      plugin_registry_revision: pluginContext?.registry_revision ?? 0,
+      plugin_context_digest: pluginContext?.context_digest ?? null,
+    },
     tool_calls: toolCalls,
     tool_results: toolResults,
     commentary_texts: state.voiceSurface.commentaryTexts,
     project_id: body.project_id ?? process.env.PROJECT_ID ?? null,
+    plugin_context: pluginContext ? {
+      registry_revision: pluginContext.registry_revision,
+      context_digest: pluginContext.context_digest,
+    } : null,
   };
 }
 

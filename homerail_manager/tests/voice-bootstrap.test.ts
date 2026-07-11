@@ -729,11 +729,21 @@ describe("voice bootstrap routes", () => {
     const createdBody = await created.json() as {
       data: {
         session_id: string;
-        voice_ui_rules: { hash: string; prompt_path: string; sources: string[] };
+        voice_ui_rules: {
+          format_version: number;
+          content_kind: string;
+          hash: string;
+          prompt_path: string;
+          sources: string[];
+        };
       };
     };
     const firstSnapshot = fs.readFileSync(createdBody.data.voice_ui_rules.prompt_path, "utf8");
     expect(firstSnapshot).toContain("SESSION_RULE_A_DO_NOT_RELOAD");
+    expect(createdBody.data.voice_ui_rules).toMatchObject({
+      format_version: 1,
+      content_kind: "user_overlay",
+    });
     expect(createdBody.data.voice_ui_rules.hash).toMatch(/^[a-f0-9]{16}$/);
     expect(createdBody.data.voice_ui_rules.sources.some((source) => source.includes("ui-rules.md"))).toBe(true);
 
@@ -757,6 +767,125 @@ describe("voice bootstrap routes", () => {
     const secondSnapshot = fs.readFileSync(nextBody.data.voice_ui_rules.prompt_path, "utf8");
     expect(secondSnapshot).toContain("SESSION_RULE_B_NEW_SESSION_ONLY");
     expect(secondSnapshot).not.toContain("SESSION_RULE_A_DO_NOT_RELOAD");
+  });
+
+  it("migrates legacy full voice-rule snapshots without reviving the removed builtin Skill", async () => {
+    let seenPrompt = "";
+    _setHostCodexManagerAgentRunnerForTest(async (input) => {
+      seenPrompt = input.voice_ui_rules?.prompt ?? "";
+      return {
+        text: "规则已迁移。",
+        spoken_text: "规则已迁移。",
+        session_id: input.session_id || "host-session-legacy-rules",
+        run_id: null,
+        run_ids: [],
+        objective: { required: false, satisfied: true, tool_calls: [] },
+        tool_calls: [],
+        tool_results: [],
+        commentary_texts: [],
+        voice_surface: { progress: null, task_draft: null, widgets: [], remove_widget_ids: [] },
+        worker_id: "host-codex",
+        container_name: null,
+      };
+    });
+    const port = await listen(server);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    await fetch(`${baseUrl}/api/voice-agent/config`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ harness: "codex_appserver", model_name: "gpt-5.5", reasoning_effort: "low" }),
+    });
+    const created = await fetch(`${baseUrl}/api/voice-agent/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const createdBody = await created.json() as {
+      data: { session_id: string; voice_ui_rules: { prompt_path: string } };
+    };
+    const legacyPrompt = [
+      "## Baseline Voice UI Rules",
+      "OLD_BASELINE",
+      "## Voice Generative UI Skill",
+      "OLD_TOPIC_OUTLINE_BYPASS_INSTRUCTION",
+      "## User Voice UI Rules",
+      "The following user rules are editable assets. Apply them as a voice-surface preference overlay unless they conflict with safety or truthful execution.",
+      "LEGACY_USER_OVERLAY_ONLY",
+    ].join("\n\n");
+    fs.writeFileSync(createdBody.data.voice_ui_rules.prompt_path, legacyPrompt, "utf8");
+    const row = getDb().prepare("SELECT data FROM voice_agent_sessions WHERE session_id = ?")
+      .get(createdBody.data.session_id) as { data: string };
+    const workspace = JSON.parse(row.data) as {
+      voice_ui_rules: Record<string, unknown> & { sources: string[] };
+    };
+    delete workspace.voice_ui_rules.format_version;
+    delete workspace.voice_ui_rules.content_kind;
+    workspace.voice_ui_rules.sources = ["baseline:builtin", "skill:builtin", "user:/legacy/ui-rules.md"];
+    getDb().prepare("UPDATE voice_agent_sessions SET data = ? WHERE session_id = ?")
+      .run(JSON.stringify(workspace), createdBody.data.session_id);
+
+    const turn = await fetch(`${baseUrl}/api/voice-agent/sessions/${createdBody.data.session_id}/turn`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "继续。" }),
+    });
+    expect(turn.status).toBe(200);
+    expect(seenPrompt).toContain("LEGACY_USER_OVERLAY_ONLY");
+    expect(seenPrompt).not.toContain("OLD_TOPIC_OUTLINE_BYPASS_INSTRUCTION");
+    expect(fs.readFileSync(createdBody.data.voice_ui_rules.prompt_path, "utf8")).toBe("LEGACY_USER_OVERLAY_ONLY");
+  });
+
+  it("recovers an extracted user overlay after an interrupted legacy snapshot migration", async () => {
+    let seenPrompt = "";
+    _setHostCodexManagerAgentRunnerForTest(async (input) => {
+      seenPrompt = input.voice_ui_rules?.prompt ?? "";
+      return {
+        text: "规则已恢复。",
+        spoken_text: "规则已恢复。",
+        session_id: input.session_id || "host-session-interrupted-rules",
+        run_id: null,
+        run_ids: [],
+        objective: { required: false, satisfied: true, tool_calls: [] },
+        tool_calls: [],
+        tool_results: [],
+        commentary_texts: [],
+        voice_surface: { progress: null, task_draft: null, widgets: [], remove_widget_ids: [] },
+        worker_id: "host-codex",
+        container_name: null,
+      };
+    });
+    const port = await listen(server);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    await fetch(`${baseUrl}/api/voice-agent/config`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ harness: "codex_appserver", model_name: "gpt-5.5", reasoning_effort: "low" }),
+    });
+    const created = await fetch(`${baseUrl}/api/voice-agent/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const createdBody = await created.json() as {
+      data: { session_id: string; voice_ui_rules: { prompt_path: string } };
+    };
+    fs.writeFileSync(createdBody.data.voice_ui_rules.prompt_path, "INTERRUPTED_USER_OVERLAY", "utf8");
+    const row = getDb().prepare("SELECT data FROM voice_agent_sessions WHERE session_id = ?")
+      .get(createdBody.data.session_id) as { data: string };
+    const workspace = JSON.parse(row.data) as { voice_ui_rules: Record<string, unknown> };
+    delete workspace.voice_ui_rules.format_version;
+    delete workspace.voice_ui_rules.content_kind;
+    getDb().prepare("UPDATE voice_agent_sessions SET data = ? WHERE session_id = ?")
+      .run(JSON.stringify(workspace), createdBody.data.session_id);
+
+    expect((await fetch(`${baseUrl}/api/voice-agent/sessions/${createdBody.data.session_id}/turn`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "继续。" }),
+    })).status).toBe(200);
+    expect(seenPrompt).toContain("INTERRUPTED_USER_OVERLAY");
+    expect(fs.readFileSync(createdBody.data.voice_ui_rules.prompt_path, "utf8"))
+      .toBe("INTERRUPTED_USER_OVERLAY");
   });
 
   it("passes the selected project workspace to host Codex voice turns", async () => {

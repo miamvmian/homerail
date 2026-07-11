@@ -29,7 +29,9 @@ import { PersistentGenerativeUiDocumentService } from "./persistent-document-ser
 import {
   compileLegacyWidgetToGenerativeUiNode,
   type LegacyVoiceWidget,
+  type LegacyWidgetSemanticProjector,
 } from "./legacy-widget-compiler.js";
+import { getGenerativeUiKindRegistry } from "./kind-registry.js";
 
 const LEGACY_SHADOW_KINDS = new Set([
   "com.homerail.core/task_summary",
@@ -91,6 +93,8 @@ export type GenerativeUiShadowSnapshotV1 =
 export interface ReconcileLegacyWidgetShadowInput {
   sessionId: string;
   widgets: readonly LegacyVoiceWidget[];
+  /** Trusted semantic projections accepted by Manager, keyed by the same UI id. */
+  nodes?: readonly GenerativeUiNodeV1[];
   checkedAt: string;
 }
 
@@ -108,7 +112,10 @@ function transactionId(documentId: string, nextRevision: number): string {
   return `legacy-shadow-${digest}-${nextRevision}`;
 }
 
-function legacyWidgetsFingerprint(widgets: readonly LegacyVoiceWidget[]): string {
+function shadowInputFingerprint(
+  widgets: readonly LegacyVoiceWidget[],
+  nodes: readonly GenerativeUiNodeV1[],
+): string {
   if (widgets.length > MAX_LEGACY_SHADOW_WIDGETS) {
     throw new Error(`legacy shadow supports at most ${MAX_LEGACY_SHADOW_WIDGETS} widgets per snapshot`);
   }
@@ -123,6 +130,18 @@ function legacyWidgetsFingerprint(widgets: readonly LegacyVoiceWidget[]): string
     if (!analysis.valid) {
       throw new Error(`legacy widget shadow preflight failed: ${analysis.error?.keyword || "jsonValue"}`);
     }
+  });
+  if (nodes.length > MAX_LEGACY_SHADOW_WIDGETS) {
+    throw new Error(`legacy shadow supports at most ${MAX_LEGACY_SHADOW_WIDGETS} semantic nodes per snapshot`);
+  }
+  nodes.forEach((node, index) => {
+    hash.update(`node:${index};`);
+    const analysis = analyzeGenerativeUiJsonValue(node, {
+      path: `/nodes/${index}`,
+      limits: { max_bytes: GENERATIVE_UI_MAX_NODE_CONTENT_BYTES },
+      on_token: (value) => hash.update(value),
+    });
+    if (!analysis.valid) throw new Error(`semantic shadow preflight failed: ${analysis.error?.keyword || "jsonValue"}`);
   });
   return hash.digest("hex");
 }
@@ -179,20 +198,40 @@ export const validateLegacyShadowKind: GenerativeUiKindValidatorV1 = (node) => {
   return [];
 };
 
-function targetNodes(widgets: readonly LegacyVoiceWidget[]): GenerativeUiNodeV1[] {
+function targetNodes(
+  widgets: readonly LegacyVoiceWidget[],
+  semanticNodes: readonly GenerativeUiNodeV1[] = [],
+  projector?: LegacyWidgetSemanticProjector,
+): GenerativeUiNodeV1[] {
   const seen = new Set<string>();
-  return widgets.map((widget) => {
-    const node = compileLegacyWidgetToGenerativeUiNode(widget);
+  const semanticById = new Map<string, GenerativeUiNodeV1>();
+  for (const node of semanticNodes) {
+    if (semanticById.has(node.id)) throw new Error(`duplicate semantic node id: ${node.id}`);
+    semanticById.set(node.id, structuredClone(node));
+  }
+  const result = widgets.map((widget) => {
+    const node = semanticById.get(widget.id) ?? compileLegacyWidgetToGenerativeUiNode(widget, projector);
     if (seen.has(node.id)) throw new Error(`duplicate legacy widget id: ${node.id}`);
     seen.add(node.id);
+    semanticById.delete(node.id);
     return node;
   });
+  for (const node of semanticById.values()) {
+    if (seen.has(node.id)) throw new Error(`duplicate semantic node id: ${node.id}`);
+    seen.add(node.id);
+    result.push(node);
+  }
+  if (result.length > MAX_LEGACY_SHADOW_WIDGETS) {
+    throw new Error(`legacy shadow supports at most ${MAX_LEGACY_SHADOW_WIDGETS} projected nodes per snapshot`);
+  }
+  return result;
 }
 
 function referenceDocument(
   current: GenerativeUiDocumentV1,
   nodes: readonly GenerativeUiNodeV1[],
   checkedAt: string,
+  validateKind: GenerativeUiKindValidatorV1 = validateLegacyShadowKind,
 ): GenerativeUiDocumentV1 {
   const reference: GenerativeUiDocumentV1 = {
     ir_version: GENERATIVE_UI_IR_VERSION,
@@ -211,7 +250,7 @@ function referenceDocument(
     throw new Error(`invalid legacy shadow reference: ${JSON.stringify(validation.errors)}`);
   }
   for (const node of reference.nodes) {
-    const errors = validateLegacyShadowKind(node);
+    const errors = validateKind(node);
     if (errors.length) throw new Error(`invalid legacy shadow kind: ${JSON.stringify(errors)}`);
   }
   return reference;
@@ -229,20 +268,26 @@ export class GenerativeUiShadowService {
   readonly #documentIds = new Map<string, string>();
   readonly #lastAccess = new Map<string, number>();
   readonly #maxActiveDocuments: number;
+  readonly #projectWidget?: LegacyWidgetSemanticProjector;
+  readonly #validateKind: GenerativeUiKindValidatorV1;
   #accessCounter = 0;
   #generationCounter = 0;
 
   constructor(
     maxActiveDocuments = DEFAULT_MAX_ACTIVE_SHADOW_DOCUMENTS,
-    documents: GenerativeUiDocumentStore = new InMemoryGenerativeUiDocumentService(validateLegacyShadowKind),
+    documents?: GenerativeUiDocumentStore,
     documentIdFactory: (sessionId: string, generation: number) => string = legacyShadowDocumentId,
+    projectWidget?: LegacyWidgetSemanticProjector,
+    validateKind: GenerativeUiKindValidatorV1 = validateLegacyShadowKind,
   ) {
     if (!Number.isSafeInteger(maxActiveDocuments) || maxActiveDocuments < 1 || maxActiveDocuments > 512) {
       throw new Error("maxActiveDocuments must be an integer between 1 and 512");
     }
     this.#maxActiveDocuments = maxActiveDocuments;
-    this.#documents = documents;
+    this.#documents = documents ?? new InMemoryGenerativeUiDocumentService(validateKind);
     this.#documentIdFactory = documentIdFactory;
+    this.#projectWidget = projectWidget;
+    this.#validateKind = validateKind;
   }
 
   #touch(sessionId: string): void {
@@ -302,13 +347,19 @@ export class GenerativeUiShadowService {
   reconcile(input: ReconcileLegacyWidgetShadowInput): GenerativeUiShadowSnapshotV1 | null {
     const scope = scopeFor(input.sessionId);
     const allocatedDocumentId = this.#restoreActiveDocumentId(input.sessionId);
-    if (!allocatedDocumentId && input.widgets.length === 0) {
+    const semanticNodes = input.nodes ?? [];
+    if (!allocatedDocumentId && input.widgets.length === 0 && semanticNodes.length === 0) {
       this.#snapshots.delete(input.sessionId);
       this.#successfulFingerprints.delete(input.sessionId);
       this.#lastAccess.delete(input.sessionId);
       return null;
     }
-    if (allocatedDocumentId && !this.#documents.get(allocatedDocumentId, scope) && input.widgets.length === 0) {
+    if (
+      allocatedDocumentId
+      && !this.#documents.get(allocatedDocumentId, scope)
+      && input.widgets.length === 0
+      && semanticNodes.length === 0
+    ) {
       this.#snapshots.delete(input.sessionId);
       this.#successfulFingerprints.delete(input.sessionId);
       this.#lastAccess.delete(input.sessionId);
@@ -319,7 +370,7 @@ export class GenerativeUiShadowService {
       if (!isValidGenerativeUiTimestamp(input.checkedAt)) {
         throw new Error("legacy shadow checkedAt must be a valid RFC 3339 timestamp");
       }
-      const fingerprint = legacyWidgetsFingerprint(input.widgets);
+      const fingerprint = shadowInputFingerprint(input.widgets, semanticNodes);
       if (!allocatedDocumentId) this.#touch(input.sessionId);
       const previous = this.#snapshots.get(input.sessionId);
       if (previous && this.#successfulFingerprints.get(input.sessionId) === fingerprint && previous.status === "ok") {
@@ -348,19 +399,20 @@ export class GenerativeUiShadowService {
     const scope = scopeFor(input.sessionId);
     const documentId = this.#allocateDocumentId(input.sessionId);
     const existing = this.#documents.get(documentId, scope);
-    if (!existing && input.widgets.length === 0) return null;
+    if (!existing && input.widgets.length === 0 && (input.nodes?.length ?? 0) === 0) return null;
     const current = existing ?? this.#documents.createOrGet({
       documentId,
       scope,
       createdAt: input.checkedAt,
       purpose: "legacy_widget_shadow",
     });
-    const expectedNodes = targetNodes(input.widgets);
-    const expected = referenceDocument(current, expectedNodes, input.checkedAt);
+    const expectedNodes = targetNodes(input.widgets, input.nodes, this.#projectWidget);
+    const expected = referenceDocument(current, expectedNodes, input.checkedAt, this.#validateKind);
     const repeated = referenceDocument(
       current,
-      targetNodes(structuredClone(input.widgets)),
+      targetNodes(structuredClone(input.widgets), structuredClone(input.nodes ?? []), this.#projectWidget),
       input.checkedAt,
+      this.#validateKind,
     );
     const repeatReport = compareGenerativeUiShadowDocuments({
       derived: repeated,
@@ -496,13 +548,21 @@ export class GenerativeUiShadowService {
   }
 }
 
+const validatePluginAwareShadowKind: GenerativeUiKindValidatorV1 = (node) => (
+  Object.keys(node.content).length === 1 && node.content.legacy_widget
+    ? validateLegacyShadowKind(node)
+    : getGenerativeUiKindRegistry().validateHistoricalNode(node)
+);
+
 export const persistentGenerativeUiDocumentService = new PersistentGenerativeUiDocumentService(
-  validateLegacyShadowKind,
+  validatePluginAwareShadowKind,
 );
 export const generativeUiShadowService = new GenerativeUiShadowService(
   DEFAULT_MAX_ACTIVE_SHADOW_DOCUMENTS,
   persistentGenerativeUiDocumentService,
   (sessionId) => legacyShadowDocumentId(sessionId, crypto.randomUUID()),
+  undefined,
+  validatePluginAwareShadowKind,
 );
 
 export function _clearGenerativeUiShadowForTest(): void {

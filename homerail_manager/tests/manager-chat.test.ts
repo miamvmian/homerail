@@ -1050,7 +1050,7 @@ describe("/api/manager/chat", () => {
     expect(_compactDeltasForTest(["你好", "，", "我可以帮你启动 DAG。"])).toBe("你好，我可以帮你启动 DAG。");
   });
 
-  it("loads baseline, generative UI skill, and user voice UI rules for host Codex", () => {
+  it("keeps voice rule snapshots to baseline plus the user overlay", () => {
     const userRuleDir = path.join(tmpHome, "asset", "voice-agent");
     fs.mkdirSync(userRuleDir, { recursive: true });
     fs.writeFileSync(
@@ -1066,16 +1066,12 @@ describe("/api/manager/chat", () => {
     const rules = _loadVoiceUiRulesForTest();
 
     expect(rules.sources.some((source) => source.startsWith("baseline:"))).toBe(true);
-    expect(rules.sources.some((source) => source.startsWith("skill:"))).toBe(true);
+    expect(rules.sources.some((source) => source.startsWith("skill:"))).toBe(false);
     expect(rules.sources.some((source) => source.startsWith("user:"))).toBe(true);
     expect(rules.hash).toMatch(/^[a-f0-9]{16}$/);
     expect(rules.prompt).toContain("Voice Agent UI Principles");
-    expect(rules.prompt).toContain("Memo Widget");
-    expect(rules.prompt).toContain("Widget Tool Catalog");
-    expect(rules.prompt).toContain("Memo update contract");
-    expect(rules.prompt).toContain("voice-memo");
-    expect(rules.prompt).toContain("show_dynamic_widget");
-    expect(rules.prompt).toContain("update_voice_memo");
+    expect(rules.prompt).not.toContain("Voice Generative UI Skill");
+    expect(rules.prompt).not.toContain("Widget Tool Catalog");
     expect(rules.prompt).toContain("默认使用 voice-memo");
   });
 

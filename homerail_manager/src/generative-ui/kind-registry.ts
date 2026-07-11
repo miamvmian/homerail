@@ -15,6 +15,7 @@ import {
 } from "homerail-protocol";
 import { getPluginRegistryState, listPluginPackages } from "../persistence/plugins.js";
 import { pluginJsonDigest } from "../plugins/descriptor.js";
+import { ensureBuiltinPluginsSynced } from "../plugins/registry.js";
 import type { GenerativeUiKindCompositionMetadataV1 } from "./surface-composer.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -160,7 +161,7 @@ export class GenerativeUiKindRegistry {
           for (const action of manifest.actions) {
             const capabilityIds = manifest.capabilities
               .filter((capability) => capability.actions.includes(action.id))
-              .map((capability) => capability.id)
+              .map((capability) => qualified(manifest.id, capability.id))
               .sort();
             this.#actions.push({
               plugin_id: manifest.id,
@@ -315,4 +316,15 @@ export class GenerativeUiKindRegistry {
     if (!validation.valid) throw new Error(`Invalid plugin UI projection: ${JSON.stringify(validation.errors)}`);
     return validation.value ?? projection;
   }
+}
+
+let cachedRegistry: GenerativeUiKindRegistry | undefined;
+
+export function getGenerativeUiKindRegistry(): GenerativeUiKindRegistry {
+  ensureBuiltinPluginsSynced();
+  const state = getPluginRegistryState();
+  if (!cachedRegistry || cachedRegistry.fingerprint !== state.fingerprint) {
+    cachedRegistry = new GenerativeUiKindRegistry();
+  }
+  return cachedRegistry;
 }

@@ -24,6 +24,7 @@ import {
 import { managerAgentReadinessRoutesHandler } from "./manager-agent-readiness.js";
 import { setupEventWebSocket } from "./events-websocket.js";
 import { generativeUiRoutesHandler } from "./generative-ui.js";
+import { pluginRoutesHandler } from "./plugins.js";
 import { ChangeOrchestrator } from "../orchestration/change-orchestrator.js";
 import { GraphExecutor } from "../orchestration/graph-executor.js";
 import { WsDispatchAdapter, type WsDispatchAdapterOptions } from "../orchestration/ws-dispatch-adapter.js";
@@ -226,6 +227,10 @@ export function createServer(
     }
 
     if (managerAgentReadinessRoutesHandler(req, res, managerAgentContainerOptions, managerAgentConfigOptions)) {
+      return;
+    }
+
+    if (pluginRoutesHandler(req, res)) {
       return;
     }
 

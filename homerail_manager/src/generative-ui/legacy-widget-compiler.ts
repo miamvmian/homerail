@@ -43,7 +43,10 @@ export interface CompileLegacyVoiceSurfaceInput {
   created_at: string;
   voice_surface: LegacyVoiceSurfacePatch;
   actor?: GenerativeUiActorV1;
+  project_widget?: LegacyWidgetSemanticProjector;
 }
+
+export type LegacyWidgetSemanticProjector = (widget: LegacyVoiceWidget) => GenerativeUiNodeV1 | undefined;
 
 interface LegacyKindMapping {
   owner: GenerativeUiPluginRef;
@@ -154,6 +157,8 @@ const KNOWN_MAPPINGS: Record<string, Omit<LegacyKindMapping, "preferred_visual">
     surface: GenerativeUiSurface.TASK,
     density: GenerativeUiDensity.SUMMARY,
   },
+  // Explicit M0 compatibility kind. New topic outlines use the independent
+  // com.homerail.topic-outline plugin and semantic execution side channel.
   topic_outline: {
     owner: CONTENT_OWNER,
     kind: "com.homerail.content/topic_outline",
@@ -415,8 +420,11 @@ function materializeLegacyWidget(widget: LegacyVoiceWidget): Record<string, unkn
 
 export function compileLegacyWidgetToGenerativeUiNode(
   widget: LegacyVoiceWidget,
+  projector?: LegacyWidgetSemanticProjector,
 ): GenerativeUiNodeV1 {
   assertLegacyWidget(widget);
+  const projected = projector?.(structuredClone(widget));
+  if (projected) return structuredClone(projected);
   const mapping = mappingFor(widget);
   const status = statusFor(widget);
   return {
@@ -453,7 +461,7 @@ export function compileLegacyVoiceSurfaceToGenerativeUiTransaction(
   }
   const operations: GenerativeUiOperationV1[] = [];
   for (const widget of input.voice_surface.widgets ?? []) {
-    operations.push({ op: "put", node: compileLegacyWidgetToGenerativeUiNode(widget) });
+    operations.push({ op: "put", node: compileLegacyWidgetToGenerativeUiNode(widget, input.project_widget) });
   }
   for (const nodeId of input.voice_surface.remove_widget_ids ?? []) {
     if (!nonEmpty(nodeId)) throw new TypeError("legacy remove widget id must be a non-empty string");

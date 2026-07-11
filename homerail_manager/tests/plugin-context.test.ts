@@ -13,6 +13,7 @@ import {
   readArchivedPluginSkill,
 } from "../src/plugins/context-assembler.js";
 import { syncBuiltinPlugins } from "../src/plugins/registry.js";
+import { setPluginEnabled } from "../src/persistence/plugins.js";
 
 function coreNode(): GenerativeUiStoredNodeV1 {
   return {
@@ -58,17 +59,40 @@ describe("Plugin Context and Kind Registry", () => {
     expect(second).toEqual(first);
     expect(first).toMatchObject({
       context_version: 1,
-      registry_revision: 1,
-      enabled_plugins: [{ id: "com.homerail.core", version: "0.1.0" }],
-      skills: [{
-        local_id: "voice-generative-ui",
-        qualified_id: "com.homerail.core:voice-generative-ui",
-      }],
-      tools: [],
+      registry_revision: 2,
+      enabled_plugins: [
+        { id: "com.homerail.core", version: "0.1.0" },
+        { id: "com.homerail.topic-outline", version: "1.0.0" },
+      ],
       actions: [],
       permission_revision: 0,
     });
+    expect(first.skills.map((skill) => skill.qualified_id)).toEqual([
+      "com.homerail.core:voice-generative-ui",
+      "com.homerail.topic-outline:topic-outline",
+    ]);
+    expect(first.tools).toHaveLength(1);
+    expect(first.tools[0]).toMatchObject({
+      plugin_id: "com.homerail.topic-outline",
+      qualified_id: "com.homerail.topic-outline:upsert_topic_outline",
+      wire_id: expect.stringMatching(/^p_[a-f0-9]{10}_upsert_topic_outline$/),
+      description: expect.stringContaining("com.homerail.topic-outline:upsert_topic_outline"),
+      effect: "write",
+      permissions: [],
+      confirmation: "never",
+      handler: { type: "projection" },
+    });
     expect(first.context_digest).toMatch(/^[a-f0-9]{64}$/);
+
+    const text = assemblePluginTurnContext(undefined, { modality: "text" });
+    expect(text.skills.some((skill) => skill.plugin_id === "com.homerail.topic-outline")).toBe(false);
+    expect(text.tools).toEqual([]);
+    const legacyCompatibility = assemblePluginTurnContext(undefined, {
+      modality: "voice",
+      legacy_compatibility_mode: true,
+    });
+    expect(legacyCompatibility.skills.some((skill) => skill.plugin_id === "com.homerail.topic-outline")).toBe(false);
+    expect(legacyCompatibility.tools).toEqual([]);
   });
 
   it("reads a Skill only through the enabled exact plugin snapshot", () => {
@@ -99,9 +123,12 @@ describe("Plugin Context and Kind Registry", () => {
       keyword: "kindRegistry",
     }));
 
-    expect(registry.compositionMetadata()).toHaveLength(9);
+    expect(registry.compositionMetadata()).toEqual(expect.arrayContaining([expect.objectContaining({
+      kind: "com.homerail.topic-outline/outline",
+      kind_version: 1,
+    })]));
     expect(registry.uiProjection()).toMatchObject({
-      registry_revision: 1,
+      registry_revision: 2,
       kinds: expect.arrayContaining([expect.objectContaining({
         kind: "com.homerail.core/task_summary",
         enabled: true,
@@ -109,7 +136,21 @@ describe("Plugin Context and Kind Registry", () => {
       renderers: expect.arrayContaining([expect.objectContaining({
         renderer_id: "core-task-summary",
         enabled: true,
+      }), expect.objectContaining({
+        renderer_id: "topic-outline-main",
+        enabled: true,
       })]),
     });
+
+    setPluginEnabled("com.homerail.topic-outline", false);
+    const disabled = new GenerativeUiKindRegistry();
+    expect(disabled.compositionMetadata().some((entry) => entry.kind === "com.homerail.topic-outline/outline"))
+      .toBe(false);
+    expect(disabled.uiProjection().renderers).toContainEqual(expect.objectContaining({
+      renderer_id: "topic-outline-main",
+      enabled: false,
+    }));
+    expect(assemblePluginTurnContext().tools).toEqual([]);
+    expect(readArchivedPluginSkill("com.homerail.topic-outline:topic-outline")).toBeUndefined();
   });
 });

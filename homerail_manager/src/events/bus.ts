@@ -39,7 +39,8 @@ export type DAGEventType =
   | "dag:cleanup_completed"
   | "dag:cleanup_failed"
   | "dag:run_recovered"
-  | "voice:session_status";
+  | "voice:session_status"
+  | "plugin:registry_changed";
 
 export const DAG_EVENT_TYPES: DAGEventType[] = [
   "dag:run_created",
@@ -83,6 +84,7 @@ export const DAG_EVENT_TYPES: DAGEventType[] = [
   "dag:cleanup_failed",
   "dag:run_recovered",
   "voice:session_status",
+  "plugin:registry_changed",
 ];
 
 export interface RunCreatedPayload {
@@ -381,6 +383,13 @@ export interface VoiceSessionStatusPayload {
   timestamp: string;
 }
 
+export interface PluginRegistryChangedPayload {
+  plugin_id: string;
+  enabled: boolean;
+  registry_revision: number;
+  registry_fingerprint: string;
+}
+
 export type DAGEventPayload =
   | RunCreatedPayload
   | HandoffPayload
@@ -422,7 +431,8 @@ export type DAGEventPayload =
   | CleanupCompletedPayload
   | CleanupFailedPayload
   | RunRecoveredPayload
-  | VoiceSessionStatusPayload;
+  | VoiceSessionStatusPayload
+  | PluginRegistryChangedPayload;
 
 type Handler = (payload: DAGEventPayload) => void;
 
@@ -451,6 +461,14 @@ export function subscribe(
 export function emit(type: DAGEventType, payload: DAGEventPayload): void {
   const list = listeners.get(type) ?? [];
   for (const handler of list) {
-    handler(payload);
+    try {
+      handler(payload);
+    } catch (cause) {
+      // Events are fan-out notifications. A failed WebSocket, logger, or
+      // extension listener must not roll back a producer that already
+      // committed its authoritative state, nor prevent later listeners from
+      // observing the same event.
+      console.error(`event listener failed for ${type}`, cause);
+    }
   }
 }

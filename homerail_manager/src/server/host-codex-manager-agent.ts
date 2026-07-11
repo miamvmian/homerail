@@ -20,12 +20,21 @@ import {
   buildManagerAgentSystemPrompt,
   createManagerAgentWidgetFileTools,
   managerAgentToolSpec,
+  managerAgentPluginOwnedLegacyWidgetType,
+  managerAgentPluginSkillSnapshot,
+  mergeManagerAgentPluginSkillCatalog,
+  executeHomerailPluginTool,
+  homerailPluginTurnContextDigestInput,
+  validateHomerailPluginTurnContext,
   type ManagerAgentWidgetFileToolAdapter,
   type ManagerAgentWidgetFileToolResult,
   type ManagerAgentToolName,
   type ManagerAgentReasoningEffort,
   type ManagerAgentPromptSkill,
+  type HomerailPluginTurnContextV1,
+  type HomerailPluginToolExecutionEnvelopeV1,
 } from "homerail-protocol";
+import { pluginJsonDigest } from "../plugins/descriptor.js";
 
 type ToolHandlerResult = {
   content: Array<{ type: "text"; text: string }>;
@@ -45,6 +54,7 @@ interface VoiceSurfaceState {
   taskDraft: Record<string, unknown> | null;
   widgets: Record<string, unknown>[];
   removeWidgetIds: string[];
+  pluginProjections: HomerailPluginToolExecutionEnvelopeV1[];
 }
 
 interface VoiceMemoTodo {
@@ -126,6 +136,7 @@ export interface HostCodexManagerAgentInput {
   response_mode?: "chat" | "voice";
   voice_ui_rules?: VoiceUiRules;
   manager_skills?: ManagerAgentPromptSkill[];
+  plugin_context?: HomerailPluginTurnContextV1;
 }
 
 export type HostCodexManagerAgentRunner = (
@@ -475,6 +486,7 @@ function emptyVoiceSurface(): VoiceSurfaceState {
     taskDraft: null,
     widgets: [],
     removeWidgetIds: [],
+    pluginProjections: [],
   };
 }
 
@@ -487,7 +499,13 @@ export function createManagerTools(state: {
   finalNotes: string[];
   objectiveToolCalls: Array<{ name: string; success: boolean; error?: string }>;
   voiceSurface: VoiceSurfaceState;
-}, responseMode: "chat" | "voice"): ToolDefinition[] {
+}, responseMode: "chat" | "voice", pluginContext?: HomerailPluginTurnContextV1): ToolDefinition[] {
+  if (pluginContext && (
+    !validateHomerailPluginTurnContext(pluginContext).valid
+    || pluginJsonDigest(homerailPluginTurnContextDigestInput(pluginContext)) !== pluginContext.context_digest
+  )) {
+    throw new Error("Plugin Context failed validation or digest verification in Host Manager Agent");
+  }
   const tools: ToolDefinition[] = [
     {
       name: "list_projects",
@@ -501,8 +519,13 @@ export function createManagerTools(state: {
     {
       ...managerAgentToolSpec("list_skills"),
       async handler() {
-        const body = await requestManager(state.restUrl, "/skills");
-        return { content: [{ type: "text", text: short(body, 12000) }] };
+        const body = await requestManager(state.restUrl, "/skills?local_only=1");
+        return {
+          content: [{
+            type: "text",
+            text: short(mergeManagerAgentPluginSkillCatalog(body, pluginContext), 12000),
+          }],
+        };
       },
     },
     {
@@ -510,7 +533,17 @@ export function createManagerTools(state: {
       async handler(args) {
         const skillId = String(args.skill_id || "").trim();
         if (!skillId) throw new Error("read_skill requires skill_id");
-        const body = await requestManager(state.restUrl, `/skills/${encodeURIComponent(skillId)}`);
+        const pluginSkill = managerAgentPluginSkillSnapshot(pluginContext, skillId);
+        if (skillId.includes(":") && !pluginSkill) {
+          throw new Error(`Plugin Skill is unavailable in this turn: ${skillId}`);
+        }
+        const exactQuery = pluginSkill
+          ? `?plugin_version=${encodeURIComponent(pluginSkill.plugin_version)}&digest=${encodeURIComponent(pluginSkill.digest)}`
+          : "";
+        const body = await requestManager(
+          state.restUrl,
+          `/skills/${encodeURIComponent(skillId)}${exactQuery}`,
+        );
         return { content: [{ type: "text", text: short(body, 30000) }] };
       },
     },
@@ -772,12 +805,17 @@ export function createManagerTools(state: {
       tools.push({
         ...managerAgentToolSpec(name),
         async handler(args) {
-          state.voiceSurface.widgets.push({
+          const widget = {
             ...args,
             type: name === "show_dynamic_widget"
               ? String(args.type || args.widget_type || widgetType)
               : widgetType,
-          });
+          };
+          const pluginOwnedType = managerAgentPluginOwnedLegacyWidgetType(pluginContext, widget);
+          if (pluginOwnedType) {
+            throw new Error(`Plugin-owned Widget type requires its enabled plugin Tool: ${pluginOwnedType}`);
+          }
+          state.voiceSurface.widgets.push(widget);
           return { content: [{ type: "text", text: "widget updated" }] };
         },
       });
@@ -816,6 +854,15 @@ export function createManagerTools(state: {
     tools.push({
       ...managerAgentToolSpec("update_voice_surface"),
       async handler(args) {
+        const widgets = Array.isArray(args.widgets)
+          ? args.widgets.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+          : [];
+        const pluginOwnedType = widgets
+          .map((widget) => managerAgentPluginOwnedLegacyWidgetType(pluginContext, widget))
+          .find(Boolean);
+        if (pluginOwnedType) {
+          throw new Error(`Plugin-owned Widget type requires its enabled plugin Tool: ${pluginOwnedType}`);
+        }
         const commentary = Array.isArray(args.commentary_texts) ? args.commentary_texts : [];
         for (const item of commentary) {
           const text = String(item || "").trim();
@@ -827,17 +874,28 @@ export function createManagerTools(state: {
         if (args.task_draft && typeof args.task_draft === "object" && !Array.isArray(args.task_draft)) {
           state.voiceSurface.taskDraft = args.task_draft as Record<string, unknown>;
         }
-        if (Array.isArray(args.widgets)) {
-          state.voiceSurface.widgets.push(
-            ...args.widgets.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item)),
-          );
-        }
+        state.voiceSurface.widgets.push(...widgets);
         if (Array.isArray(args.remove_widget_ids)) {
           state.voiceSurface.removeWidgetIds.push(
             ...args.remove_widget_ids.map((item) => String(item || "").trim()).filter(Boolean),
           );
         }
         return { content: [{ type: "text", text: "voice surface updated" }] };
+      },
+    });
+  }
+  for (const descriptor of responseMode === "voice" ? pluginContext?.tools ?? [] : []) {
+    if (tools.some((tool) => tool.name === descriptor.wire_id)) {
+      throw new Error(`Plugin Tool wire id collides with an existing Tool: ${descriptor.wire_id}`);
+    }
+    tools.push({
+      name: descriptor.wire_id,
+      description: descriptor.description,
+      input_schema: structuredClone(descriptor.input_schema),
+      async handler(args) {
+        const envelope = executeHomerailPluginTool(descriptor, args);
+        state.voiceSurface.pluginProjections.push(envelope);
+        return { content: [{ type: "text", text: JSON.stringify(envelope) }] };
       },
     });
   }
@@ -906,75 +964,6 @@ const BUILTIN_VOICE_UI_PRINCIPLES = [
   "- 录音、思考、播报是不同状态，不能共用同一个提示。",
 ].join("\n");
 
-const BUILTIN_VOICE_GENERATIVE_UI_SKILL = [
-  "# Voice Generative UI Skill",
-  "",
-  "Use this skill in voice mode whenever the Agent needs to present structured state.",
-  "",
-  "## Role",
-  "",
-  "The voice surface is a listening and confirmation surface first. It should show that the Agent is remembering what the user said, narrowing ambiguity, and waiting until the task is ready before execution.",
-  "",
-  "## Default Behavior",
-  "",
-  "- Simple chat and capability questions: no widget.",
-  "- Small local facts: usually no widget; at most one note widget if the fact must stay visible.",
-  "- Multi-turn task discussion: maintain one stable memo/task widget.",
-  "- Real execution or DAG state: use status/progress widgets only when backed by a real run id, blocker, or tool result.",
-  "",
-  "## Widget Tool Catalog",
-  "",
-  "Use these tools as the only way to create generated UI in voice mode:",
-  "",
-  "- update_voice_memo: the default listening widget. It writes the complete current memo to TOML and renders voice-memo.",
-  "- validate_widget_file, write_widget_file, read_widget_file, remove_widget_file: Manager-internal Widget File Protocol tools for custom persisted widgets. Use validate_widget_file before write_widget_file when drafting non-memo TOML.",
-  "- update_task_draft: use only when the task is already structured enough to ask for confirmation.",
-  "- show_status_card: execution or blocker status backed by a real run id, tool result, or explicit blocker.",
-  "- show_list_card: short visible lists, capped to the most useful items.",
-  "- show_progress_card: ordered steps with one active step.",
-  "- show_note_card: a short note that should stay visible, not a duplicate of chat history.",
-  "- show_artifact_card: a file, image, HTML, or other artifact preview backed by a real path or artifact reference.",
-  "- show_dynamic_widget: specialized widgets such as html, metric_strip, timeline, dag_flow, chart, topic_outline, or slide_deck.",
-  "- remove_widget: hide obsolete widgets when they no longer help the user.",
-  "",
-  "Do not invent widget ids or widget types outside this catalog unless the tool explicitly supports them. Reuse stable ids so later turns update the same visual state instead of adding more cards.",
-  "",
-  "## Memo Widget",
-  "",
-  "The first voice widget should normally be a memo-style widget. It records the user's evolving intent without pretending the task is ready.",
-  "",
-  "Use update_voice_memo first for multi-turn requirement gathering. It writes the session memo to a local TOML file and renders the stable voice-memo widget. Do not hand-roll a separate note card for the same purpose.",
-  "",
-  "Memo lifecycle:",
-  "- listening: user is still speaking or adding context.",
-  "- clarifying: Agent needs missing details.",
-  "- ready: enough information is available and the Agent should ask for confirmation.",
-  "- executing: execution has started with a real tool/run id.",
-  "- done: task finished or memo can be minimized.",
-  "",
-  "Memo update contract:",
-  "- Treat update_voice_memo input as the whole current memo, not an append-only log.",
-  "- Preserve useful previous facts and questions when the user adds new context.",
-  "- Mark a todo as done when the user answers it; do not keep asking that item.",
-  "- Keep at most the most important open questions and todos visible.",
-  "- If the task is not ready, keep ready_to_execute false and ask the next missing question in next_action.",
-  "- When all critical questions are answered, set status ready, set ready_to_execute true, and ask for confirmation before execution.",
-  "",
-  "## File-backed Memo Direction",
-  "",
-  "update_voice_memo is file-backed. It stores the current memo in a local TOML file and renders that file's structured content into the widget. The Agent should update and check off todo items instead of appending endlessly.",
-  "",
-  "For non-memo persisted widgets, write TOML through write_widget_file. Valid TOML refreshes the page; invalid TOML returns structured validation errors and must be corrected before the UI changes. Supported V1 widget types are memo, task_draft, progress_status, checklist, artifact_ref, and timeline.",
-  "",
-  "## Hard Product Rules",
-  "",
-  "- Do not create decorative cards.",
-  "- Do not create duplicate low-information widgets.",
-  "- Do not create more than two widgets in one turn.",
-  "- Do not create manager-run style execution state unless there is a real run id or explicit blocker.",
-  "- Do not put long markdown lists into spoken text; use a memo/list/progress widget instead.",
-].join("\n");
-
 const BUILTIN_VOICE_SYSTEM_CONTRACT = [
   "# Voice Surface Contract",
   "",
@@ -998,6 +987,11 @@ export interface VoiceUiRules {
   prompt: string;
   sources: string[];
   hash: string;
+}
+
+export interface VoiceUiRulesOverlay {
+  prompt: string;
+  sources: string[];
 }
 
 export interface VoiceSystemContract {
@@ -1026,25 +1020,35 @@ export function getUserVoiceRulesPath(): string {
 }
 
 export function loadVoiceUiRules(): VoiceUiRules {
-  const sources = ["baseline:builtin", "skill:builtin"];
+  const overlay = loadUserVoiceUiRulesOverlay();
+  return composeVoiceUiRules(overlay.prompt, overlay.sources);
+}
+
+export function loadUserVoiceUiRulesOverlay(): VoiceUiRulesOverlay {
+  const userPath = userVoiceRulesPath();
+  const userRules = readTextIfPresent(userPath) ?? "";
+  return {
+    prompt: userRules,
+    sources: [userRules ? `user:${userPath}` : `user:missing:${userPath}`],
+  };
+}
+
+export function composeVoiceUiRules(
+  userPrompt: string,
+  userSources: string[],
+): VoiceUiRules {
+  const sources = ["baseline:builtin", ...userSources];
   const chunks = [
     "## Baseline Voice UI Rules",
     BUILTIN_VOICE_UI_PRINCIPLES,
-    "## Voice Generative UI Skill",
-    BUILTIN_VOICE_GENERATIVE_UI_SKILL,
   ];
-
-  const userPath = userVoiceRulesPath();
-  const userRules = readTextIfPresent(userPath);
-  if (userRules) {
-    sources.push(`user:${userPath}`);
+  const overlay = userPrompt.trim();
+  if (overlay) {
     chunks.push(
       "## User Voice UI Rules",
       "The following user rules are editable assets. Apply them as a voice-surface preference overlay unless they conflict with safety or truthful execution.",
-      userRules,
+      overlay,
     );
-  } else {
-    sources.push(`user:missing:${userPath}`);
   }
 
   const prompt = chunks.join("\n\n");
@@ -1184,6 +1188,7 @@ function buildHostCodexManagerAgentResult(
           task_draft: state.voiceSurface.taskDraft,
           widgets: state.voiceSurface.widgets,
           remove_widget_ids: state.voiceSurface.removeWidgetIds,
+          plugin_projections: state.voiceSurface.pluginProjections,
         },
         progress: state.voiceSurface.progress,
         task_draft: state.voiceSurface.taskDraft,
@@ -1211,6 +1216,8 @@ function buildHostCodexManagerAgentResult(
       voice_system_hash: voiceSystemContract ? createHash("sha256").update(voiceSystemContract.prompt).digest("hex").slice(0, 16) : null,
       voice_ui_rules_hash: voiceUiRules?.hash ?? null,
       voice_ui_rules_sources: voiceUiRules?.sources ?? [],
+      plugin_registry_revision: input.plugin_context?.registry_revision ?? 0,
+      plugin_context_digest: input.plugin_context?.context_digest ?? null,
     },
     tool_calls: toolCalls,
     tool_results: toolResults,
@@ -1256,7 +1263,7 @@ async function* runHostCodexManagerAgentTurnEvents(
   try {
     for await (const event of adapter.run(
       buildPrompt(input.history, message, input.continue_chat !== false),
-      createManagerTools(state, responseMode),
+      createManagerTools(state, responseMode, input.plugin_context),
       {
         systemPrompt: systemPrompt(config, responseMode, voiceUiRules, voiceSystemContract, input.manager_skills),
         provider: config.provider_name || undefined,

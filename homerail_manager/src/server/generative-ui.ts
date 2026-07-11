@@ -4,7 +4,7 @@ import type {
   GenerativeUiDocumentScopeV1,
   GenerativeUiSurfaceContextV1,
 } from "homerail-protocol";
-import { CORE_GENERATIVE_UI_COMPOSITION_METADATA } from "../generative-ui/core-composition-metadata.js";
+import { getGenerativeUiKindRegistry } from "../generative-ui/kind-registry.js";
 import { persistentGenerativeUiDocumentService } from "../generative-ui/shadow-service.js";
 import { composeGenerativeUi } from "../generative-ui/surface-composer.js";
 import { persistentGenerativeUiUserOverrideService } from "../generative-ui/user-override-service.js";
@@ -63,13 +63,22 @@ function projection(sessionId: string, context: GenerativeUiSurfaceContextV1) {
   if (!document) return null;
   const cursor = persistentGenerativeUiDocumentService.getCursor(document.document_id, scope);
   const overrides = persistentGenerativeUiUserOverrideService.list(document.document_id, scope, true);
+  const registry = getGenerativeUiKindRegistry();
   const composition = composeGenerativeUi(
     document,
     overrides,
     context,
-    CORE_GENERATIVE_UI_COMPOSITION_METADATA,
+    registry.compositionMetadata(),
   );
-  return { scope, document, cursor, overrides, composition, active: Boolean(activeDocument) };
+  return {
+    scope,
+    document,
+    cursor,
+    overrides,
+    composition,
+    uiRegistry: registry.uiProjection(),
+    active: Boolean(activeDocument),
+  };
 }
 
 function projectionEtag(current: NonNullable<ReturnType<typeof projection>>): string {
@@ -78,6 +87,7 @@ function projectionEtag(current: NonNullable<ReturnType<typeof projection>>): st
     revision: current.document.revision,
     overrides: current.overrides,
     context: current.composition.context,
+    plugin_registry: current.uiRegistry.registry_fingerprint,
   })).digest("hex").slice(0, 32);
   return `"gui-${hash}"`;
 }
@@ -240,6 +250,7 @@ export function generativeUiRoutesHandler(
           cursor: current.cursor,
           overrides: current.overrides,
           composition: current.composition,
+          ui_registry: current.uiRegistry,
         },
       });
       return true;
@@ -268,6 +279,7 @@ export function generativeUiRoutesHandler(
         document: current.document,
         overrides: current.overrides,
         composition: current.composition,
+        ui_registry: current.uiRegistry,
       })}\n`);
       for (const committed of page) {
         res.write(`${JSON.stringify({

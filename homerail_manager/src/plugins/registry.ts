@@ -3,6 +3,7 @@ import type {
 } from "homerail-protocol";
 import {
   getPluginRegistryState,
+  getActivePlugin,
   setPluginEnabled,
   syncPluginPackage,
   type ActivePluginRecord,
@@ -14,6 +15,7 @@ import {
   listBuiltinPluginPackageRoots,
   loadPluginPackage,
 } from "./manifest-loader.js";
+import { getDbPath } from "../config/env.js";
 
 export const CORE_PLUGIN_ID = "com.homerail.core" as const;
 
@@ -23,7 +25,14 @@ export const M3_BUILTIN_RENDERER_IDS: ReadonlySet<string> = new Set([
   "topic-outline",
 ]);
 
+/** Temporary migration allowlist. Ordinary data-only plugins cannot target the
+ * legacy Widget renderer path. */
+export const M3_LEGACY_BRIDGE_PLUGIN_IDS: ReadonlySet<string> = new Set([
+  "com.homerail.topic-outline",
+]);
+
 const TRUSTED_BUILTIN_IDS: ReadonlySet<string> = new Set([CORE_PLUGIN_ID]);
+const synchronizedDbPaths = new Set<string>();
 
 export interface SyncBuiltinPluginsResult {
   root: string;
@@ -36,6 +45,7 @@ export function syncBuiltinPlugins(root = getBuiltinPluginRoot()): SyncBuiltinPl
       source: "builtin",
       trusted_builtin_ids: TRUSTED_BUILTIN_IDS,
       builtin_renderer_ids: M3_BUILTIN_RENDERER_IDS,
+      legacy_bridge_plugin_ids: M3_LEGACY_BRIDGE_PLUGIN_IDS,
     }))
     .sort((left, right) => left.manifest.id.localeCompare(right.manifest.id));
   const seen = new Set<string>();
@@ -54,7 +64,12 @@ export function syncBuiltinPlugins(root = getBuiltinPluginRoot()): SyncBuiltinPl
   if (!seen.has(CORE_PLUGIN_ID)) {
     throw new Error(`Missing locked builtin plugin: ${CORE_PLUGIN_ID}`);
   }
+  synchronizedDbPaths.add(getDbPath());
   return { root, plugins };
+}
+
+export function ensureBuiltinPluginsSynced(root = getBuiltinPluginRoot()): void {
+  if (!synchronizedDbPaths.has(getDbPath()) || !getActivePlugin(CORE_PLUGIN_ID)) syncBuiltinPlugins(root);
 }
 
 export class HomerailPluginRegistry {
@@ -69,12 +84,12 @@ export class HomerailPluginRegistry {
   }
 
   snapshot(): PluginRegistryState {
-    this.syncBuiltins();
+    ensureBuiltinPluginsSynced(this.#builtinRoot);
     return getPluginRegistryState();
   }
 
   setEnabled(pluginId: string, enabled: boolean): PluginActivationRecord {
-    this.syncBuiltins();
+    ensureBuiltinPluginsSynced(this.#builtinRoot);
     return setPluginEnabled(pluginId, enabled);
   }
 }

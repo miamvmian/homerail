@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { HomerailPluginManifestV1 } from "homerail-protocol";
 import { repoRoot } from "../src/assets/root.js";
+import { GenerativeUiKindRegistry } from "../src/generative-ui/kind-registry.js";
 import { closeDb, getDb } from "../src/persistence/db.js";
 import {
   getPluginRegistryState,
@@ -17,9 +18,11 @@ import {
   CORE_PLUGIN_ID,
   HomerailPluginRegistry,
   M3_BUILTIN_RENDERER_IDS,
+  M3_LEGACY_BRIDGE_PLUGIN_IDS,
 } from "../src/plugins/registry.js";
 
 const corePackage = () => path.join(repoRoot(), "plugins", "builtin", "core-generative-ui");
+const topicPackage = () => path.join(repoRoot(), "plugins", "builtin", "topic-outline");
 
 function writeMinimalPlugin(root: string, id = "com.example.notes", version = "1.0.0"): string {
   const packageRoot = path.join(root, `${id}-${version}`);
@@ -55,6 +58,52 @@ function writeMinimalPlugin(root: string, id = "com.example.notes", version = "1
   fs.writeFileSync(path.join(packageRoot, "schemas", "notes.v1.schema.json"), JSON.stringify({
     type: "object", properties: { note: { type: "string" } }, required: ["note"], additionalProperties: false,
   }, null, 2));
+  return packageRoot;
+}
+
+function writeActionPlugin(root: string): string {
+  const packageRoot = writeMinimalPlugin(root, "com.example.actions", "1.0.0");
+  const manifestFile = path.join(packageRoot, "homerail.plugin.json");
+  const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8")) as HomerailPluginManifestV1;
+  manifest.capabilities[0].actions = ["pin_note"];
+  manifest.kinds = [{
+    kind: "com.example.actions/note",
+    current_version: 1,
+    versions: [{
+      version: 1,
+      content_schema: "notes-v1",
+      allowed_surfaces: ["task"],
+      default_surface: "task",
+      default_variant: "summary",
+      max_content_bytes: 4096,
+      preferred_visuals: ["note"],
+      fallback: "portable_required",
+      actions: ["pin_note"],
+    }],
+    migrations: [],
+  }];
+  manifest.actions = [{
+    id: "pin_note",
+    intent: "com.example.actions:pin_note",
+    input_schema: "notes-v1",
+    effect: "write",
+    permissions: [],
+    confirmation: "never",
+    handler: { type: "projection", file: "ui/pin-note.v1.json" },
+  }];
+  fs.mkdirSync(path.join(packageRoot, "ui"), { recursive: true });
+  fs.writeFileSync(path.join(packageRoot, "ui", "pin-note.v1.json"), JSON.stringify({
+    projection_version: 1,
+    type: "direct_ui_node",
+    kind: "com.example.actions/note",
+    kind_version: 1,
+    node_id_pointer: "/id",
+    content_pointer: "",
+    omit_content_fields: ["id"],
+    fallback: { title_pointer: "/note" },
+    defaults: { surface: "task", importance: "primary", density: "summary", persistence: "session" },
+  }, null, 2));
+  fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2));
   return packageRoot;
 }
 
@@ -114,20 +163,36 @@ describe("HomeRail plugin archive and activation registry", () => {
     expect(() => loadPluginPackage(minimal, { source: "development" })).toThrow(/non-local \$ref/i);
   });
 
+  it("allows legacy UI bridges only for explicitly approved builtin migrations", () => {
+    expect(() => loadPluginPackage(topicPackage(), {
+      source: "builtin",
+      builtin_renderer_ids: M3_BUILTIN_RENDERER_IDS,
+    })).toThrow(/restricted to approved builtin migrations/);
+    expect(loadPluginPackage(topicPackage(), {
+      source: "builtin",
+      builtin_renderer_ids: M3_BUILTIN_RENDERER_IDS,
+      legacy_bridge_plugin_ids: M3_LEGACY_BRIDGE_PLUGIN_IDS,
+    }).manifest.id).toBe("com.homerail.topic-outline");
+  });
+
   it("keeps Core locked and preserves an optional plugin disable across resync", () => {
     const registry = new HomerailPluginRegistry();
     const first = registry.snapshot();
-    expect(first.plugins).toHaveLength(1);
-    expect(first.plugins[0].activation).toMatchObject({ enabled: true, locked: true, revision: 1 });
+    expect(first.plugins.map((plugin) => plugin.plugin_id)).toEqual([
+      CORE_PLUGIN_ID,
+      "com.homerail.topic-outline",
+    ]);
+    expect(first.plugins.find((plugin) => plugin.plugin_id === CORE_PLUGIN_ID)?.activation)
+      .toMatchObject({ enabled: true, locked: true, revision: 1 });
+    expect(first.plugins.find((plugin) => plugin.plugin_id === "com.homerail.topic-outline")?.activation)
+      .toMatchObject({ enabled: true, locked: false, revision: 1 });
     expect(() => registry.setEnabled(CORE_PLUGIN_ID, false)).toThrow(/locked/);
     expect(registry.snapshot()).toMatchObject({ revision: first.revision, fingerprint: first.fingerprint });
 
-    const descriptor = loadPluginPackage(writeMinimalPlugin(tmpHome), { source: "development" });
-    syncPluginPackage({ descriptor, source: "development", default_enabled: true, timestamp: "2026-07-11T12:00:00.000Z" });
-    expect(setPluginEnabled(descriptor.manifest.id, false, "2026-07-11T12:01:00.000Z"))
+    expect(setPluginEnabled("com.homerail.topic-outline", false, "2026-07-11T12:01:00.000Z"))
       .toMatchObject({ enabled: false, revision: 2 });
-    syncPluginPackage({ descriptor, source: "development", default_enabled: true, timestamp: "2026-07-11T12:02:00.000Z" });
-    expect(getPluginRegistryState().plugins.find((plugin) => plugin.plugin_id === descriptor.manifest.id)?.activation)
+    registry.syncBuiltins();
+    expect(getPluginRegistryState().plugins.find((plugin) => plugin.plugin_id === "com.homerail.topic-outline")?.activation)
       .toMatchObject({ enabled: false, revision: 2 });
   });
 
@@ -152,6 +217,19 @@ describe("HomeRail plugin archive and activation registry", () => {
     expect(() => getDb().prepare(`
       DELETE FROM plugin_packages WHERE plugin_id = ? AND plugin_version = ?
     `).run("com.example.notes", "1.1.0")).toThrow(/foreign key/i);
+  });
+
+  it("qualifies Action capability identities in the UI registry projection", () => {
+    const descriptor = loadPluginPackage(writeActionPlugin(tmpHome), { source: "development" });
+    syncPluginPackage({ descriptor, source: "development", default_enabled: true });
+    expect(new GenerativeUiKindRegistry().uiProjection().actions).toContainEqual({
+      plugin_id: "com.example.actions",
+      plugin_version: "1.0.0",
+      local_id: "pin_note",
+      qualified_id: "com.example.actions:pin_note",
+      capability_ids: ["com.example.actions:notes"],
+      intent: "com.example.actions:pin_note",
+    });
   });
 
   it("fails closed when a persisted descriptor is corrupted", () => {

@@ -4,14 +4,23 @@ import YAML from "yaml";
 
 import { repoRoot } from "../assets/root.js";
 import { getHomerailHome } from "../config/env.js";
+import {
+  assemblePluginTurnContext,
+  readArchivedPluginSkill,
+  readExactArchivedPluginSkill,
+} from "../plugins/context-assembler.js";
+import type { HomerailPluginTurnContextV1 } from "homerail-protocol";
 
 export interface ManagerSkillSummary {
   id: string;
   name: string;
   description: string;
   relative_path: string;
-  source: "home" | "repo";
+  source: "home" | "repo" | "plugin";
   enabled: true;
+  plugin_id?: string;
+  plugin_version?: string;
+  digest?: string;
 }
 
 export interface ManagerSkillDetail extends ManagerSkillSummary {
@@ -125,22 +134,66 @@ export function ensureManagerSkillsInstalled(): ManagerSkillInstallResult {
   return result;
 }
 
-export function listManagerSkills(): ManagerSkillSummary[] {
+export function listManagerSkills(
+  pluginContext: HomerailPluginTurnContextV1 | null = assemblePluginTurnContext(),
+): ManagerSkillSummary[] {
   ensureManagerSkillsInstalled();
   const homeSkills = scanSkills(getManagerSkillsRoot(), "home");
   const byId = new Map(homeSkills.map((skill) => [skill.id, skill]));
   for (const skill of scanSkills(path.join(repoRoot(), "skills"), "repo")) {
     if (!byId.has(skill.id)) byId.set(skill.id, skill);
   }
-  return Array.from(byId.values())
+  const local = Array.from(byId.values())
     .sort((a, b) => a.id.localeCompare(b.id))
     .map(({ content: _content, ...summary }) => summary);
+  const plugin = (pluginContext?.skills ?? []).map((skill): ManagerSkillSummary => ({
+    id: skill.qualified_id,
+    name: skill.local_id,
+    description: skill.description,
+    relative_path: `plugin://${skill.plugin_id}@${skill.plugin_version}/skills/${skill.local_id}`,
+    source: "plugin",
+    enabled: true,
+    plugin_id: skill.plugin_id,
+    plugin_version: skill.plugin_version,
+    digest: skill.digest,
+  }));
+  return [...local, ...plugin].sort((a, b) => a.id.localeCompare(b.id));
 }
 
-export function readManagerSkill(id: string): ManagerSkillDetail | undefined {
+export function readManagerSkill(
+  id: string,
+  exactPlugin?: { plugin_version: string; digest: string },
+): ManagerSkillDetail | undefined {
   const normalized = id.trim();
   if (!normalized || normalized.includes("/") || normalized.includes("\\") || normalized === "." || normalized === "..") {
     return undefined;
+  }
+  if (normalized.includes(":")) {
+    const separator = normalized.lastIndexOf(":");
+    const pluginId = normalized.slice(0, separator);
+    const localId = normalized.slice(separator + 1);
+    const plugin = exactPlugin
+      ? readExactArchivedPluginSkill({
+        plugin_id: pluginId,
+        plugin_version: exactPlugin.plugin_version,
+        local_id: localId,
+        qualified_id: normalized,
+        digest: exactPlugin.digest,
+      })
+      : readArchivedPluginSkill(normalized);
+    if (!plugin) return undefined;
+    return {
+      id: plugin.descriptor.qualified_id,
+      name: plugin.descriptor.local_id,
+      description: plugin.descriptor.description,
+      relative_path: `plugin://${plugin.descriptor.plugin_id}@${plugin.descriptor.plugin_version}/skills/${plugin.descriptor.local_id}`,
+      source: "plugin",
+      enabled: true,
+      plugin_id: plugin.descriptor.plugin_id,
+      plugin_version: plugin.descriptor.plugin_version,
+      digest: plugin.descriptor.digest,
+      content: plugin.content,
+    };
   }
   ensureManagerSkillsInstalled();
   const home = scanSkills(getManagerSkillsRoot(), "home").find((skill) => skill.id === normalized);
