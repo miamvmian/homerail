@@ -168,6 +168,128 @@ describe("custom LLM providers", () => {
     expect(stored).toContain("manager_encrypted");
   });
 
+  it("updates custom providers without clearing omitted fields", async () => {
+    const port = await listen(server);
+    const createResponse = await fetch(`http://127.0.0.1:${port}/api/llm/providers`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: "editable-provider",
+        name: "Editable Provider",
+        default_model: "model-v1",
+        base_url: "http://provider.test/v1",
+        supports_llm: true,
+        supports_asr: true,
+      }),
+    });
+    expect(createResponse.status).toBe(201);
+
+    const settingResponse = await fetch(`http://127.0.0.1:${port}/api/llm/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider_id: "editable-provider",
+        model_name: "model-v1",
+        api_key: "local-no-key",
+        supports_llm: false,
+        supports_asr: true,
+      }),
+    });
+    expect(settingResponse.status).toBe(201);
+
+    const updateResponse = await fetch(`http://127.0.0.1:${port}/api/llm/providers/editable-provider`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: "Renamed Provider",
+        base_url: "http://provider.test/v1",
+        voice_adapter: "openai_audio",
+        asr_async_url: "http://provider.test/v1/audio/transcriptions",
+        asr_realtime_url: "ws://provider.test/v1/realtime",
+      }),
+    });
+    expect(updateResponse.status).toBe(200);
+    const body = (await updateResponse.json()) as {
+      data: {
+        id: string;
+        name: string;
+        default_model: string;
+        base_url: string;
+        supports_asr: boolean;
+        asr_async_url: string;
+        asr_realtime_url: string;
+      };
+    };
+    expect(body.data).toMatchObject({
+      id: "editable-provider",
+      name: "Renamed Provider",
+      default_model: "model-v1",
+      base_url: "http://provider.test/v1",
+      supports_asr: true,
+      asr_async_url: "http://provider.test/v1/audio/transcriptions",
+      asr_realtime_url: "ws://provider.test/v1/realtime",
+    });
+    expect(findActiveSetting("editable-provider", "model-v1")).toMatchObject({
+      base_url: "http://provider.test/v1",
+      voice_adapter: "openai_audio",
+      asr_async_url: "http://provider.test/v1/audio/transcriptions",
+      asr_realtime_url: "ws://provider.test/v1/realtime",
+    });
+  });
+
+  it("rejects provider changes on model edits and protects referenced providers", async () => {
+    const port = await listen(server);
+    for (const id of ["provider-a", "provider-b"]) {
+      const response = await fetch(`http://127.0.0.1:${port}/api/llm/providers`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id,
+          name: id,
+          default_model: "model-v1",
+          base_url: `http://${id}.test/v1`,
+        }),
+      });
+      expect(response.status).toBe(201);
+    }
+
+    const settingResponse = await fetch(`http://127.0.0.1:${port}/api/llm/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider_id: "provider-a",
+        model_name: "model-v1",
+        api_key: "secret-a",
+      }),
+    });
+    const setting = (await settingResponse.json()) as { data: { id: string } };
+    expect(settingResponse.status).toBe(201);
+
+    const moveResponse = await fetch(`http://127.0.0.1:${port}/api/llm/settings/${setting.data.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider_id: "provider-b" }),
+    });
+    expect(moveResponse.status).toBe(400);
+    expect(findActiveSetting("provider-a", "model-v1")).toBeTruthy();
+    expect(findActiveSetting("provider-b", "model-v1")).toBeUndefined();
+
+    const deleteResponse = await fetch(`http://127.0.0.1:${port}/api/llm/providers/provider-a`, {
+      method: "DELETE",
+    });
+    expect(deleteResponse.status).toBe(409);
+    expect(findActiveSetting("provider-a", "model-v1")).toBeTruthy();
+
+    const cascadeResponse = await fetch(`http://127.0.0.1:${port}/api/llm/providers/provider-a?cascade=true`, {
+      method: "DELETE",
+    });
+    expect(cascadeResponse.status).toBe(200);
+    expect(findActiveSetting("provider-a", "model-v1")).toBeUndefined();
+
+    const missingResponse = await fetch(`http://127.0.0.1:${port}/api/llm/providers/provider-a`);
+    expect(missingResponse.status).toBe(404);
+  });
+
   it("returns catalog models for openspeech provider probes", async () => {
     const port = await listen(server);
 

@@ -42,6 +42,11 @@ export interface ProviderInfo extends ModelCapabilities {
   chat_completions_base_url?: string;
   responses_base_url?: string;
   anthropic_base_url?: string;
+  voice_adapter?: ProviderEndpointPreset["voice_adapter"];
+  tts_http_url?: string;
+  tts_realtime_url?: string;
+  asr_realtime_url?: string;
+  asr_async_url?: string;
   docs_url?: string;
   source?: "builtin" | "custom";
   readonly?: boolean;
@@ -57,6 +62,11 @@ export interface ProviderInput extends ModelCapabilities {
   chat_completions_base_url?: string;
   responses_base_url?: string;
   anthropic_base_url?: string;
+  voice_adapter?: ProviderEndpointPreset["voice_adapter"];
+  tts_http_url?: string;
+  tts_realtime_url?: string;
+  asr_realtime_url?: string;
+  asr_async_url?: string;
 }
 
 export interface LLMSettingInput extends ModelCapabilities {
@@ -248,6 +258,13 @@ function _normalizeProvider(raw: unknown): ProviderInfo | undefined {
       : undefined,
     responses_base_url: typeof rec.responses_base_url === "string" ? rec.responses_base_url : undefined,
     anthropic_base_url: typeof rec.anthropic_base_url === "string" ? rec.anthropic_base_url : undefined,
+    voice_adapter: typeof rec.voice_adapter === "string"
+      ? rec.voice_adapter as ProviderEndpointPreset["voice_adapter"]
+      : undefined,
+    tts_http_url: typeof rec.tts_http_url === "string" ? rec.tts_http_url : undefined,
+    tts_realtime_url: typeof rec.tts_realtime_url === "string" ? rec.tts_realtime_url : undefined,
+    asr_realtime_url: typeof rec.asr_realtime_url === "string" ? rec.asr_realtime_url : undefined,
+    asr_async_url: typeof rec.asr_async_url === "string" ? rec.asr_async_url : undefined,
     docs_url: typeof rec.docs_url === "string" ? rec.docs_url : undefined,
     supports_llm: typeof rec.supports_llm === "boolean" ? rec.supports_llm : undefined,
     supports_asr: typeof rec.supports_asr === "boolean" ? rec.supports_asr : undefined,
@@ -424,6 +441,7 @@ function _providerFromDbRow(
     .map((endpointRow) => _providerEndpointFromDbRow(endpointRow, modelRowsByEndpoint.get(String(endpointRow.id)) ?? []))
     .filter((endpoint): endpoint is ProviderEndpointPreset => endpoint !== undefined);
   const source = _rowString(row, "source") === "builtin" ? "builtin" : "custom";
+  const primaryEndpoint = endpoints[0];
   const provider: ProviderInfo = {
     ...raw,
     id,
@@ -434,6 +452,11 @@ function _providerFromDbRow(
     chat_completions_base_url: _rowNullableString(row, "chat_completions_base_url") ?? raw.chat_completions_base_url,
     responses_base_url: _rowNullableString(row, "responses_base_url") ?? raw.responses_base_url,
     anthropic_base_url: _rowNullableString(row, "anthropic_base_url") ?? raw.anthropic_base_url,
+    voice_adapter: primaryEndpoint?.voice_adapter ?? raw.voice_adapter,
+    tts_http_url: primaryEndpoint?.tts_http_url ?? raw.tts_http_url,
+    tts_realtime_url: primaryEndpoint?.tts_realtime_url ?? raw.tts_realtime_url,
+    asr_realtime_url: primaryEndpoint?.asr_realtime_url ?? raw.asr_realtime_url,
+    asr_async_url: primaryEndpoint?.asr_async_url ?? raw.asr_async_url,
     docs_url: _rowNullableString(row, "docs_url") ?? raw.docs_url,
     source,
     readonly: _rowBool(row.readonly, source === "builtin") ?? false,
@@ -933,6 +956,12 @@ function _customEndpointForProvider(provider: ProviderInfo): ProviderEndpointPre
     chat_completions_base_url: provider.chat_completions_base_url,
     responses_base_url: provider.responses_base_url,
     anthropic_base_url: provider.anthropic_base_url,
+    voice_adapter: provider.voice_adapter ??
+      (provider.supports_asr || provider.supports_tts ? "openai_audio" : "custom"),
+    tts_http_url: provider.tts_http_url,
+    tts_realtime_url: provider.tts_realtime_url,
+    asr_realtime_url: provider.asr_realtime_url,
+    asr_async_url: provider.asr_async_url,
     auth_type: "bearer",
     key_hint: "API key",
     default_model: provider.default_model,
@@ -988,6 +1017,11 @@ export function upsertProvider(input: ProviderInput): ProviderInfo {
     chat_completions_base_url: input.chat_completions_base_url,
     responses_base_url: input.responses_base_url,
     anthropic_base_url: input.anthropic_base_url,
+    voice_adapter: input.voice_adapter,
+    tts_http_url: input.tts_http_url,
+    tts_realtime_url: input.tts_realtime_url,
+    asr_realtime_url: input.asr_realtime_url,
+    asr_async_url: input.asr_async_url,
     supports_llm: input.supports_llm,
     supports_asr: input.supports_asr,
     supports_tts: input.supports_tts,
@@ -1001,14 +1035,73 @@ export function upsertProvider(input: ProviderInput): ProviderInfo {
   return getProvider(id) ?? _providerWithEndpointFallback(provider);
 }
 
-export function deleteProvider(id: string): boolean {
+export function updateProvider(id: string, patch: Partial<Omit<ProviderInput, "id">>): ProviderInfo {
+  const existing = getProvider(id);
+  if (!existing) throw new Error(`Provider not found: ${id}`);
+  if (_isReadonlyProvider(id) || findCatalogProvider(id)) {
+    throw new Error(`Cannot update built-in provider: ${id}`);
+  }
+  const provider = upsertProvider({
+    id,
+    name: patch.name ?? existing.name,
+    status: patch.status ?? existing.status,
+    default_model: patch.default_model ?? existing.default_model,
+    base_url: patch.base_url ?? existing.base_url,
+    chat_completions_base_url: patch.chat_completions_base_url ?? existing.chat_completions_base_url,
+    responses_base_url: patch.responses_base_url ?? existing.responses_base_url,
+    anthropic_base_url: patch.anthropic_base_url ?? existing.anthropic_base_url,
+    voice_adapter: patch.voice_adapter ?? existing.voice_adapter,
+    tts_http_url: patch.tts_http_url ?? existing.tts_http_url,
+    tts_realtime_url: patch.tts_realtime_url ?? existing.tts_realtime_url,
+    asr_realtime_url: patch.asr_realtime_url ?? existing.asr_realtime_url,
+    asr_async_url: patch.asr_async_url ?? existing.asr_async_url,
+    supports_llm: patch.supports_llm ?? existing.supports_llm,
+    supports_asr: patch.supports_asr ?? existing.supports_asr,
+    supports_tts: patch.supports_tts ?? existing.supports_tts,
+    supports_audio_input: patch.supports_audio_input ?? existing.supports_audio_input,
+    supports_image_input: patch.supports_image_input ?? existing.supports_image_input,
+    supports_video_input: patch.supports_video_input ?? existing.supports_video_input,
+  });
+  const endpoint = _customEndpointForProvider(provider);
+  if (endpoint) {
+    const settings = _readSettings();
+    let changed = false;
+    const updatedAt = new Date().toISOString();
+    for (const setting of settings) {
+      if (setting.provider_id !== id) continue;
+      setting.base_url = endpoint.base_url;
+      setting.chat_completions_base_url = endpoint.chat_completions_base_url;
+      setting.responses_base_url = endpoint.responses_base_url;
+      setting.anthropic_base_url = endpoint.anthropic_base_url;
+      setting.voice_adapter = endpoint.voice_adapter;
+      setting.tts_http_url = endpoint.tts_http_url;
+      setting.tts_realtime_url = endpoint.tts_realtime_url;
+      setting.asr_realtime_url = endpoint.asr_realtime_url;
+      setting.asr_async_url = endpoint.asr_async_url;
+      setting.updated_at = updatedAt;
+      changed = true;
+    }
+    if (changed) _writeSettings(settings);
+  }
+  return provider;
+}
+
+export function deleteProvider(id: string, options: { cascade?: boolean } = {}): boolean {
   if (!id.trim()) return false;
   if (_isReadonlyProvider(id) || findCatalogProvider(id)) throw new Error(`Cannot delete built-in provider: ${id}`);
   const db = getDb();
   const existing = db.prepare("SELECT id FROM llm_providers WHERE id = ?").get(id);
   if (!existing) return false;
+  const reference = db.prepare("SELECT COUNT(*) AS count FROM llm_settings WHERE provider_id = ?").get(id) as {
+    count: number;
+  };
+  if (reference.count > 0 && !options.cascade) {
+    throw new Error(`Provider ${id} is referenced by ${reference.count} model setting(s)`);
+  }
   db.transaction(() => {
-    db.prepare("DELETE FROM llm_settings WHERE provider_id = ?").run(id);
+    if (options.cascade) {
+      db.prepare("DELETE FROM llm_settings WHERE provider_id = ?").run(id);
+    }
     db.prepare("DELETE FROM llm_provider_models WHERE provider_id = ?").run(id);
     db.prepare("DELETE FROM llm_provider_endpoints WHERE provider_id = ?").run(id);
     db.prepare("DELETE FROM llm_providers WHERE id = ?").run(id);
@@ -1337,6 +1430,9 @@ export function updateSetting(id: string, patch: Partial<Omit<LLMSetting, "id" |
   }
 
   const existing = settings[idx];
+  if (patch.provider_id !== undefined && patch.provider_id !== existing.provider_id) {
+    throw new Error("Changing provider_id is not supported; create a new model setting instead");
+  }
   const providerId = _canonicalProviderId(
     patch.provider_id ?? existing.provider_id,
     patch.endpoint_id ?? existing.endpoint_id,
