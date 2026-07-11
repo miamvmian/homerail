@@ -187,7 +187,7 @@ describe("PersistentGenerativeUiDocumentService", () => {
     legacy.close();
 
     expect(getDb().prepare("SELECT version FROM schema_migrations ORDER BY version").all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
     expect(getDb().prepare("SELECT data FROM voice_agent_sessions WHERE session_id = ?").get("legacy-v2"))
       .toEqual({ data: legacyPayload });
     expect(getDb().prepare(`
@@ -202,6 +202,8 @@ describe("PersistentGenerativeUiDocumentService", () => {
     expect(getDb().prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 3").get())
       .toEqual({ count: 1 });
     expect(getDb().prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 4").get())
+      .toEqual({ count: 1 });
+    expect(getDb().prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 5").get())
       .toEqual({ count: 1 });
   });
 
@@ -226,6 +228,14 @@ describe("PersistentGenerativeUiDocumentService", () => {
     closeDb();
     expect(() => getDb()).toThrow(
       "Schema migration 4 is incomplete: missing table generative_ui_user_overrides",
+    );
+  });
+
+  it("fails closed when a v5 plugin registry table disappears after migration", () => {
+    getDb().exec("DROP TABLE plugin_activations");
+    closeDb();
+    expect(() => getDb()).toThrow(
+      "Schema migration 5 is incomplete: missing table plugin_activations",
     );
   });
 });

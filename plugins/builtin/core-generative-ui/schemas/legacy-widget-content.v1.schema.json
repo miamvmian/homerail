@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "legacy_widget": {
+      "type": "object"
+    }
+  },
+  "required": ["legacy_widget"],
+  "additionalProperties": false
+}

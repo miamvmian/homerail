@@ -52,6 +52,8 @@ const CLEARABLE_TABLES = new Set([
   "generative_ui_user_overrides",
   "generative_ui_transactions",
   "generative_ui_documents",
+  "plugin_activations",
+  "plugin_packages",
   "experience_nodes",
   "experience_relationships",
   "storages",
@@ -484,6 +486,84 @@ function validateGenerativeUiSchemaV4(db: SqliteDatabase): void {
   }
 }
 
+function validatePluginRegistrySchemaV5(db: SqliteDatabase): void {
+  const requiredColumns: Record<string, readonly string[]> = {
+    plugin_packages: [
+      "plugin_id",
+      "plugin_version",
+      "manifest_version",
+      "package_digest",
+      "manifest_json",
+      "resolved_descriptor_json",
+      "source",
+      "installed_at",
+    ],
+    plugin_activations: [
+      "plugin_id",
+      "active_version",
+      "enabled",
+      "locked",
+      "revision",
+      "updated_at",
+    ],
+  };
+  for (const [table, required] of Object.entries(requiredColumns)) {
+    const tableRow = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+    ).get(table) as { sql: string } | undefined;
+    if (!tableRow) throw new Error(`Schema migration 5 is incomplete: missing table ${table}`);
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+      name: string;
+      pk: number;
+    }>;
+    const byName = new Map(columns.map((column) => [column.name, column]));
+    const missing = required.filter((column) => !byName.has(column));
+    if (missing.length) {
+      throw new Error(`Schema migration 5 is incomplete: ${table} is missing columns ${missing.join(", ")}`);
+    }
+    if (table === "plugin_packages") {
+      if (byName.get("plugin_id")?.pk !== 1 || byName.get("plugin_version")?.pk !== 2) {
+        throw new Error("Schema migration 5 is incomplete: plugin package identity constraint is missing");
+      }
+    } else if (byName.get("plugin_id")?.pk !== 1) {
+      throw new Error("Schema migration 5 is incomplete: plugin activation identity constraint is missing");
+    }
+  }
+
+  const foreignKeys = db.prepare("PRAGMA foreign_key_list(plugin_activations)").all() as Array<{
+    id: number;
+    seq: number;
+    table: string;
+    from: string;
+    to: string;
+    on_delete: string;
+  }>;
+  const packageForeignKeys = foreignKeys.filter((foreignKey) => (
+    foreignKey.table === "plugin_packages"
+    && foreignKey.on_delete.toUpperCase() === "RESTRICT"
+  ));
+  const grouped = new Map<number, Map<string, string>>();
+  for (const foreignKey of packageForeignKeys) {
+    const columns = grouped.get(foreignKey.id) ?? new Map<string, string>();
+    columns.set(foreignKey.from, foreignKey.to);
+    grouped.set(foreignKey.id, columns);
+  }
+  const packageOwnership = [...grouped.values()].some((columns) => (
+    columns.get("plugin_id") === "plugin_id"
+    && columns.get("active_version") === "plugin_version"
+  ));
+  if (!packageOwnership) {
+    throw new Error("Schema migration 5 is incomplete: plugin activation package constraint is missing");
+  }
+
+  const activationSql = (db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'plugin_activations'",
+  ).get() as { sql: string }).sql.replace(/\s+/g, " ").toLowerCase();
+  if (!activationSql.includes("check(locked = 0 or enabled = 1)")) {
+    throw new Error("Schema migration 5 is incomplete: locked plugins are not protected");
+  }
+}
+
 const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
   {
     version: 3,
@@ -545,6 +625,38 @@ const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
         ON generative_ui_user_overrides(document_id, node_id);
     `),
     validate: validateGenerativeUiSchemaV4,
+  },
+  {
+    version: 5,
+    up: (db) => db.exec(`
+      CREATE TABLE plugin_packages (
+        plugin_id TEXT NOT NULL,
+        plugin_version TEXT NOT NULL,
+        manifest_version INTEGER NOT NULL CHECK(manifest_version = 1),
+        package_digest TEXT NOT NULL CHECK(length(package_digest) = 64),
+        manifest_json TEXT NOT NULL,
+        resolved_descriptor_json TEXT NOT NULL,
+        source TEXT NOT NULL CHECK(source IN ('builtin', 'installed', 'development')),
+        installed_at TEXT NOT NULL,
+        PRIMARY KEY(plugin_id, plugin_version)
+      );
+
+      CREATE TABLE plugin_activations (
+        plugin_id TEXT PRIMARY KEY,
+        active_version TEXT NOT NULL,
+        enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+        locked INTEGER NOT NULL CHECK(locked IN (0, 1)),
+        revision INTEGER NOT NULL CHECK(revision >= 1),
+        updated_at TEXT NOT NULL,
+        CHECK(locked = 0 OR enabled = 1),
+        FOREIGN KEY(plugin_id, active_version)
+          REFERENCES plugin_packages(plugin_id, plugin_version)
+          ON UPDATE RESTRICT ON DELETE RESTRICT
+      );
+      CREATE INDEX idx_plugin_packages_id_installed
+        ON plugin_packages(plugin_id, installed_at, plugin_version);
+    `),
+    validate: validatePluginRegistrySchemaV5,
   },
 ];
 
