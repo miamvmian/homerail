@@ -58,7 +58,7 @@ async function close(server: http.Server): Promise<void> {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
-async function configure(baseUrl: string, mode: "off" | "shadow"): Promise<void> {
+async function configure(baseUrl: string, mode: "off" | "shadow" | "prefer"): Promise<void> {
   const response = await fetch(`${baseUrl}/api/voice-agent/config`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -459,6 +459,109 @@ describe("Voice Generative UI shadow runtime", () => {
     }));
   });
 
+  it("publishes prefer plugin nodes canonically while retaining legacy core UI and honoring off", async () => {
+    await configure(baseUrl, "prefer");
+    const sessionId = await createSession(baseUrl);
+    const descriptor = assemblePluginTurnContext(undefined, { modality: "voice" }).tools.find((tool) => (
+      tool.plugin_id === "com.homerail.topic-outline"
+    ))!;
+    const envelope = executeHomerailPluginTool(descriptor, {
+      id: "com.homerail.topic-outline:prefer-runtime",
+      title: "Prefer canonical plugin node",
+      thesis: "Legacy core UI remains alongside it.",
+    });
+    _setHostCodexManagerAgentRunnerForTest(async (input) => ({
+      text: "Prefer projection created.",
+      spoken_text: "已创建。",
+      session_id: input.session_id || sessionId,
+      run_id: null,
+      run_ids: [],
+      objective: { required: false, satisfied: true, tool_calls: [] },
+      tool_calls: [],
+      tool_results: [],
+      commentary_texts: [],
+      voice_surface: {
+        progress: { status: "running", short_text: "Core progress remains visible" },
+        task_draft: {
+          title: "Core task draft",
+          request: "Keep core UI",
+          status: "draft",
+        },
+        widgets: [{
+          id: "core-note",
+          type: "note",
+          title: "Core legacy note",
+          body: "Retained fallback content",
+          priority: "normal",
+          status: "ready",
+          items: [],
+          steps: [],
+          data: {},
+        }, envelope.projection.legacy_widget!],
+        remove_widget_ids: [],
+        plugin_projections: [envelope],
+      },
+      worker_id: "host-codex",
+      container_name: null,
+    }));
+
+    const turn = await fetch(`${baseUrl}/api/voice-agent/sessions/${sessionId}/turn`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "Create the plugin outline." }),
+    });
+    const body = await turn.json() as {
+      data: {
+        workspace: {
+          task_draft: { title: string };
+          progress_brief: { short_text: string };
+          widgets: Array<{ id: string }>;
+          plugin_nodes: Array<{ id: string }>;
+          generative_ui_canonical_pending?: unknown;
+          debug_events: Array<{ code: string; message: string }>;
+        };
+      };
+    };
+    expect(body.data.workspace).toMatchObject({
+      task_draft: { title: "Core task draft" },
+      progress_brief: { short_text: "Core progress remains visible" },
+      widgets: expect.arrayContaining([
+        expect.objectContaining({ id: "core-note" }),
+        expect.objectContaining({ id: "com.homerail.topic-outline:prefer-runtime" }),
+      ]),
+      plugin_nodes: [{ id: "com.homerail.topic-outline:prefer-runtime" }],
+    });
+    expect(body.data.workspace).not.toHaveProperty("generative_ui_canonical_pending");
+    expect(_getGenerativeUiShadowForTest(sessionId)).toMatchObject({ snapshot: null, document: null });
+
+    const projectionUrl = `${baseUrl}/api/voice-agent/sessions/${sessionId}/generative-ui`;
+    const projection = await fetch(projectionUrl);
+    expect(await projection.json()).toMatchObject({
+      data: {
+        mode: "prefer",
+        authoritative: true,
+        purpose: "canonical",
+        document: {
+          revision: 1,
+          nodes: [{
+            id: "com.homerail.topic-outline:prefer-runtime",
+            content: { title: "Prefer canonical plugin node" },
+          }],
+        },
+      },
+    });
+
+    process.env[GENERATIVE_UI_MODE_ENV] = "off";
+    expect((await fetch(projectionUrl)).status).toBe(404);
+    const retained = await (await fetch(`${baseUrl}/api/voice-agent/sessions/${sessionId}`)).json();
+    expect(retained).toMatchObject({
+      data: {
+        task_draft: { title: "Core task draft" },
+        widgets: expect.arrayContaining([expect.objectContaining({ id: "core-note" })]),
+      },
+    });
+  });
+
   it("commits the legacy bridge only with an accepted projection and protects an existing semantic id", async () => {
     await configure(baseUrl, "shadow");
     const sessionId = await createSession(baseUrl);
@@ -516,7 +619,7 @@ describe("Voice Generative UI shadow runtime", () => {
     expect((await fetch(`${baseUrl}/api/voice-agent/sessions/${sessionId}/turn`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: "Accept the original projection." }),
+      body: JSON.stringify({ text: "Create a topic outline with the original projection." }),
     })).status).toBe(200);
 
     _setHostCodexManagerAgentRunnerForTest(async () => ({

@@ -11,6 +11,7 @@ import type {
   GenerativeUiSnapshotStreamEventV1,
   GenerativeUiStreamEventV1,
 } from './types'
+import { normalizePendingAgentToolConfirmations } from './tool-confirmation'
 
 export type GenerativeUiProjectionEventResult = 'applied_snapshot' | 'ignored_replay' | 'refresh_required'
 
@@ -70,9 +71,14 @@ function assertComposition(document: GenerativeUiDocumentV1, composition: Genera
 function assertProjection(projection: GenerativeUiProjectionV1): GenerativeUiProjectionV1 {
   if (
     projection.stream_version !== 1
-    || projection.mode !== 'shadow'
-    || projection.authoritative !== false
-    || projection.purpose !== 'legacy_widget_shadow'
+    || !(
+      (projection.mode === 'shadow'
+        && projection.authoritative === false
+        && projection.purpose === 'legacy_widget_shadow')
+      || (projection.mode === 'prefer'
+        && projection.authoritative === true
+        && projection.purpose === 'canonical')
+    )
     || !Number.isSafeInteger(projection.cursor)
     || projection.cursor < 0
   ) throw new Error('Invalid Generative UI projection envelope')
@@ -87,6 +93,15 @@ function assertProjection(projection: GenerativeUiProjectionV1): GenerativeUiPro
   const uiRegistryValidation = validateHomerailPluginUiProjection(projection.ui_registry)
   if (!uiRegistryValidation.valid) throw new Error('Invalid Generative UI plugin registry projection')
   assertComposition(projection.document, projection.composition)
+  const pendingValue = (projection as unknown as Record<string, unknown>).pending_tool_confirmations
+  if (projection.mode === 'prefer') {
+    return {
+      ...structuredClone(projection),
+      pending_tool_confirmations: normalizePendingAgentToolConfirmations(pendingValue),
+    }
+  } else if (pendingValue !== undefined && (!Array.isArray(pendingValue) || pendingValue.length !== 0)) {
+    throw new Error('Invalid Generative UI shadow projection Tool confirmation authority')
+  }
   return structuredClone(projection)
 }
 

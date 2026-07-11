@@ -1,6 +1,8 @@
 /** Draft-07 schema for the HomeRail Plugin Manifest V1. */
 
 import {
+  HOMERAIL_RUNTIME_ARTIFACT_MAX_ITEMS,
+  HOMERAIL_RUNTIME_LOG_MAX_ITEMS,
   HOMERAIL_PLUGIN_MANIFEST_VERSION,
   HOMERAIL_PLUGIN_ID_PATTERN_SOURCE,
   HomerailPluginConfirmation,
@@ -8,11 +10,13 @@ import {
   HomerailPluginModality,
   HomerailPluginPermission,
   HomerailPluginRendererMode,
+  HomerailPluginRuntimeRpcErrorCode,
   HomerailPluginRuntimeTrust,
 } from "./types.js";
 import {
   GenerativeUiDensity,
   GenerativeUiDevice,
+  GenerativeUiActionStyle,
   GenerativeUiImportance,
   GenerativeUiPersistence,
   GenerativeUiSurface,
@@ -289,6 +293,13 @@ const toolSchema = {
   properties: {
     id: toolId,
     description: shortText,
+    exposure: {
+      type: "array",
+      minItems: 1,
+      maxItems: 2,
+      uniqueItems: true,
+      items: { type: "string", enum: ["action", "agent"] },
+    },
     input_schema: localId,
     output_schema: localId,
     effect,
@@ -299,6 +310,7 @@ const toolSchema = {
   required: [
     "id",
     "description",
+    "exposure",
     "input_schema",
     "effect",
     "permissions",
@@ -474,8 +486,12 @@ const resolvedRendererSourceSchema = {
     },
     {
       type: "object",
-      properties: { type: { const: "custom" }, file: packagePath },
-      required: ["type", "file"],
+      properties: {
+        type: { const: "custom" },
+        file: packagePath,
+        digest: declarativeSha256Digest,
+      },
+      required: ["type", "file", "digest"],
       additionalProperties: false,
     },
   ],
@@ -547,20 +563,12 @@ const actionSchema = {
       maxLength: 200,
       pattern: "^[a-z0-9]+(?:[.-][a-z0-9]+)+[.:][a-z][a-z0-9._-]*$",
     },
-    input_schema: localId,
-    effect,
-    permissions,
-    confirmation,
-    handler: handlerSchema,
+    tool: toolId,
   },
   required: [
     "id",
     "intent",
-    "input_schema",
-    "effect",
-    "permissions",
-    "confirmation",
-    "handler",
+    "tool",
   ],
   additionalProperties: false,
 } as const;
@@ -1051,6 +1059,21 @@ export const homerailDirectUiProjectionSchema = {
       required: ["surface", "importance", "density", "persistence"],
       additionalProperties: false,
     },
+    actions: {
+      type: "array",
+      maxItems: 16,
+      items: {
+        type: "object",
+        properties: {
+          id: localId,
+          label: { type: "string", minLength: 1, maxLength: 120 },
+          style: { type: "string", enum: Object.values(GenerativeUiActionStyle) },
+          arguments_pointer: jsonPointer,
+        },
+        required: ["id", "label"],
+        additionalProperties: false,
+      },
+    },
     legacy_bridge: {
       type: "object",
       properties: {
@@ -1113,6 +1136,664 @@ export const homerailPluginToolExecutionEnvelopeSchema = {
   additionalProperties: false,
 } as const;
 
+const actionWireId = {
+  type: "string",
+  minLength: 8,
+  maxLength: 160,
+  pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+} as const;
+const actionOpaqueId = {
+  type: "string",
+  minLength: 1,
+  maxLength: 256,
+  pattern: "^(?!\\s*$)[^\\u0000-\\u001F\\u007F]+$",
+} as const;
+const actionDateTime = {
+  type: "string",
+  maxLength: 40,
+  pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+} as const;
+const actionIntent = {
+  type: "string",
+  minLength: 3,
+  maxLength: 200,
+  pattern: "^[a-z0-9]+(?:[.-][a-z0-9]+)+[.:][a-z][a-z0-9._-]*$",
+} as const;
+
+const actionTargetSchema = {
+  type: "object",
+  properties: {
+    document_id: actionOpaqueId,
+    document_revision: safeInteger,
+    node_id: actionOpaqueId,
+    node_revision: safeInteger,
+    action_id: localId,
+    action_intent: actionIntent,
+  },
+  required: [
+    "document_id", "document_revision", "node_id", "node_revision",
+    "action_id", "action_intent",
+  ],
+  additionalProperties: false,
+} as const;
+
+const toolBindingSchema = {
+  type: "object",
+  properties: {
+    plugin_id: pluginId,
+    plugin_version: semver,
+    manifest_digest: sha256Digest,
+    package_digest: sha256Digest,
+    context_digest: sha256Digest,
+    registry_revision: safeInteger,
+    permission_revision: safeInteger,
+  },
+  required: [
+    "plugin_id", "plugin_version", "manifest_digest", "package_digest",
+    "context_digest", "registry_revision", "permission_revision",
+  ],
+  additionalProperties: false,
+} as const;
+
+const effectivePermissionGrantSchema = {
+  type: "object",
+  properties: {
+    permission,
+    paths: {
+      type: "array",
+      minItems: 1,
+      maxItems: 64,
+      uniqueItems: true,
+      items: { type: "string", minLength: 1, maxLength: 500 },
+    },
+    hosts: {
+      type: "array",
+      minItems: 1,
+      maxItems: 64,
+      uniqueItems: true,
+      items: {
+        type: "string",
+        minLength: 1,
+        maxLength: 253,
+        pattern: "^[a-z0-9.-]+(?::[0-9]{1,5})?$",
+      },
+    },
+  },
+  required: ["permission"],
+  additionalProperties: false,
+} as const;
+
+const effectivePermissionGrants = {
+  type: "array",
+  maxItems: 32,
+  uniqueItems: true,
+  items: effectivePermissionGrantSchema,
+} as const;
+
+const toolPolicySchema = {
+  type: "object",
+  properties: {
+    effect,
+    permissions,
+    effective_grants: effectivePermissionGrants,
+    confirmation,
+    confirmation_required: { type: "boolean" },
+  },
+  required: [
+    "effect", "permissions", "effective_grants", "confirmation", "confirmation_required",
+  ],
+  additionalProperties: false,
+} as const;
+
+const toolHandlerIdentitySchema = {
+  oneOf: [
+    {
+      type: "object",
+      properties: { type: { const: "projection" }, digest: sha256Digest },
+      required: ["type", "digest"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: { type: { const: "runtime" }, method: localId },
+      required: ["type", "method"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: { type: { const: "builtin" }, id: localId },
+      required: ["type", "id"],
+      additionalProperties: false,
+    },
+  ],
+} as const;
+
+export const homerailPluginToolInvocationSchema = {
+  $id: "homerail-plugin-tool-invocation-v1",
+  type: "object",
+  properties: {
+    tool_bus_version: { const: 1 },
+    request_id: actionWireId,
+    idempotency_key: actionWireId,
+    request_digest: sha256Digest,
+    invoked_at: actionDateTime,
+    deadline_at: actionDateTime,
+    source: {
+      oneOf: [
+        {
+          type: "object",
+          properties: {
+            type: { const: "ui_action" },
+            target: actionTargetSchema,
+            action: {
+              type: "object",
+              properties: { local_id: localId, qualified_id: qualifiedId },
+              required: ["local_id", "qualified_id"],
+              additionalProperties: false,
+            },
+            input_digest: sha256Digest,
+          },
+          required: ["type", "target", "action", "input_digest"],
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: {
+            type: { const: "agent" },
+            call_id: actionWireId,
+            modality: { type: "string", enum: Object.values(HomerailPluginModality) },
+            scope: {
+              type: "object",
+              properties: {
+                type: { type: "string", enum: ["voice_session", "project", "run"] },
+                id: actionOpaqueId,
+              },
+              required: ["type", "id"],
+              additionalProperties: false,
+            },
+            target: {
+              type: "object",
+              properties: {
+                document_id: actionOpaqueId,
+                base_revision: safeInteger,
+              },
+              required: ["document_id", "base_revision"],
+              additionalProperties: false,
+            },
+          },
+          required: ["type", "call_id", "modality", "scope", "target"],
+          additionalProperties: false,
+        },
+      ],
+    },
+    tool: {
+      type: "object",
+      properties: {
+        local_id: toolId,
+        qualified_id: qualifiedId,
+        wire_id: { type: "string", minLength: 1, maxLength: 64, pattern: "^[A-Za-z][A-Za-z0-9_-]*$" },
+        handler: toolHandlerIdentitySchema,
+      },
+      required: ["local_id", "qualified_id", "wire_id", "handler"],
+      additionalProperties: false,
+    },
+    binding: toolBindingSchema,
+    policy: toolPolicySchema,
+    arguments: {
+      type: "object",
+      maxProperties: 64,
+      additionalProperties: true,
+    },
+  },
+  required: [
+    "tool_bus_version", "request_id", "idempotency_key", "request_digest",
+    "invoked_at", "deadline_at", "source", "tool", "binding", "policy",
+    "arguments",
+  ],
+  additionalProperties: false,
+} as const;
+
+export const homerailPluginToolCapabilityClaimsSchema = {
+  $id: "homerail-plugin-tool-capability-claims-v1",
+  type: "object",
+  properties: {
+    capability_version: { const: 1 },
+    capability_id: actionWireId,
+    audience: { const: "homerail.plugin-runtime" },
+    scope: { const: "plugin.tool.execute" },
+    nonce: actionWireId,
+    single_use: { const: true },
+    request_id: actionWireId,
+    request_digest: sha256Digest,
+    binding: toolBindingSchema,
+    effect,
+    permissions,
+    effective_grants: effectivePermissionGrants,
+    issued_at: actionDateTime,
+    expires_at: actionDateTime,
+  },
+  required: [
+    "capability_version", "capability_id", "audience", "scope", "nonce",
+    "single_use", "request_id", "request_digest", "binding", "effect",
+    "permissions", "effective_grants", "issued_at", "expires_at",
+  ],
+  additionalProperties: false,
+} as const;
+
+export const homerailPluginToolConfirmationChallengeSchema = {
+  $id: "homerail-plugin-tool-confirmation-challenge-v1",
+  type: "object",
+  properties: {
+    confirmation_version: { const: 1 },
+    challenge_id: actionWireId,
+    request_id: actionWireId,
+    request_digest: sha256Digest,
+    effect,
+    permissions,
+    effective_grants: effectivePermissionGrants,
+    message: { type: "string", minLength: 1, maxLength: 1000 },
+    issued_at: actionDateTime,
+    expires_at: actionDateTime,
+  },
+  required: [
+    "confirmation_version", "challenge_id", "request_id", "request_digest",
+    "effect", "permissions", "effective_grants", "message", "issued_at", "expires_at",
+  ],
+  additionalProperties: false,
+} as const;
+
+export const homerailPluginToolConfirmationDecisionSchema = {
+  $id: "homerail-plugin-tool-confirmation-decision-v1",
+  type: "object",
+  properties: {
+    confirmation_version: { const: 1 },
+    challenge_id: actionWireId,
+    request_id: actionWireId,
+    request_digest: sha256Digest,
+    decision: { type: "string", enum: ["approved", "denied"] },
+    actor: {
+      type: "object",
+      properties: {
+        type: { const: "user" },
+        id: actionOpaqueId,
+      },
+      required: ["type", "id"],
+      additionalProperties: false,
+    },
+    decided_at: actionDateTime,
+  },
+  required: [
+    "confirmation_version", "challenge_id", "request_id", "request_digest",
+    "decision", "actor", "decided_at",
+  ],
+  additionalProperties: false,
+} as const;
+
+export const homerailPluginAuthorizedToolInvocationSchema = {
+  $id: "homerail-plugin-authorized-tool-invocation-v1",
+  type: "object",
+  properties: {
+    authorization_version: { const: 1 },
+    invocation: { $ref: "homerail-plugin-tool-invocation-v1" },
+    capability: { $ref: "homerail-plugin-tool-capability-claims-v1" },
+    confirmation: {
+      type: "object",
+      properties: {
+        challenge: { $ref: "homerail-plugin-tool-confirmation-challenge-v1" },
+        decision: { $ref: "homerail-plugin-tool-confirmation-decision-v1" },
+      },
+      required: ["challenge", "decision"],
+      additionalProperties: false,
+    },
+  },
+  required: ["authorization_version", "invocation", "capability"],
+  additionalProperties: false,
+} as const;
+
+const runtimeLogEntrySchema = {
+  type: "object",
+  properties: {
+    sequence: { type: "integer", minimum: 0, maximum: HOMERAIL_RUNTIME_LOG_MAX_ITEMS - 1 },
+    timestamp: actionDateTime,
+    level: { type: "string", enum: ["debug", "info", "warn", "error"] },
+    message: { type: "string", minLength: 1, maxLength: 4096 },
+  },
+  required: ["sequence", "timestamp", "level", "message"],
+  additionalProperties: false,
+} as const;
+
+const runtimeLogsSchema = {
+  type: "array",
+  maxItems: HOMERAIL_RUNTIME_LOG_MAX_ITEMS,
+  items: runtimeLogEntrySchema,
+} as const;
+
+const runtimeArtifactSchema = {
+  type: "object",
+  properties: {
+    id: localId,
+    label: { type: "string", minLength: 1, maxLength: 200 },
+    uri: { type: "string", minLength: 1, maxLength: 2048 },
+    media_type: { type: "string", minLength: 1, maxLength: 160 },
+    digest: sha256Digest,
+    size_bytes: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  },
+  required: ["id", "label", "uri"],
+  additionalProperties: false,
+} as const;
+
+const runtimeArtifactsSchema = {
+  type: "array",
+  maxItems: HOMERAIL_RUNTIME_ARTIFACT_MAX_ITEMS,
+  items: runtimeArtifactSchema,
+} as const;
+
+const runtimeArtifactDeclarationSchema = {
+  type: "object",
+  properties: {
+    id: localId,
+    label: { type: "string", minLength: 1, maxLength: 240 },
+    media_type: { type: "string", enum: ["application/json", "image/jpeg", "image/png", "image/webp"] },
+    digest: sha256Digest,
+    size_bytes: { type: "integer", minimum: 1, maximum: 16 * 1024 * 1024 },
+  },
+  required: ["id", "label", "media_type", "digest", "size_bytes"],
+  additionalProperties: false,
+} as const;
+
+const runtimeArtifactUploadSchema = {
+  type: "object",
+  properties: {
+    ...runtimeArtifactDeclarationSchema.properties,
+    capability_id: actionWireId,
+    upload_url: { type: "string", pattern: "^https?://", minLength: 10, maxLength: 4096 },
+    token: { type: "string", minLength: 32, maxLength: 24 * 1024 },
+  },
+  required: [...runtimeArtifactDeclarationSchema.required, "capability_id", "upload_url", "token"],
+  additionalProperties: false,
+} as const;
+
+const runtimeRequestBaseProperties = {
+  runtime_rpc_version: { const: 1 },
+  message_type: { const: "request" },
+  rpc_id: actionWireId,
+  sent_at: actionDateTime,
+} as const;
+
+export const homerailPluginRuntimeRpcRequestSchema = {
+  $id: "homerail-plugin-runtime-rpc-request-v1",
+  oneOf: [
+    {
+      type: "object",
+      properties: {
+        ...runtimeRequestBaseProperties,
+        method: { const: "prepare" },
+        params: {
+          type: "object",
+          properties: {
+            authorization: { $ref: "homerail-plugin-authorized-tool-invocation-v1" },
+          },
+          required: ["authorization"],
+          additionalProperties: false,
+        },
+      },
+      required: ["runtime_rpc_version", "message_type", "method", "rpc_id", "sent_at", "params"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        ...runtimeRequestBaseProperties,
+        method: { const: "execute" },
+        params: {
+          type: "object",
+          properties: {
+            authorization: { $ref: "homerail-plugin-authorized-tool-invocation-v1" },
+            artifact_uploads: {
+              type: "array",
+              minItems: 1,
+              maxItems: HOMERAIL_RUNTIME_ARTIFACT_MAX_ITEMS,
+              items: runtimeArtifactUploadSchema,
+            },
+          },
+          required: ["authorization"],
+          additionalProperties: false,
+        },
+      },
+      required: ["runtime_rpc_version", "message_type", "method", "rpc_id", "sent_at", "params"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        ...runtimeRequestBaseProperties,
+        method: { const: "cancel" },
+        params: {
+          type: "object",
+          properties: {
+            request_id: actionWireId,
+            request_digest: sha256Digest,
+            reason: { type: "string", enum: ["user", "deadline", "shutdown", "superseded"] },
+          },
+          required: ["request_id", "request_digest", "reason"],
+          additionalProperties: false,
+        },
+      },
+      required: ["runtime_rpc_version", "message_type", "method", "rpc_id", "sent_at", "params"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        ...runtimeRequestBaseProperties,
+        method: { const: "health" },
+        params: {
+          type: "object",
+          properties: { binding: toolBindingSchema },
+          required: ["binding"],
+          additionalProperties: false,
+        },
+      },
+      required: ["runtime_rpc_version", "message_type", "method", "rpc_id", "sent_at", "params"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        ...runtimeRequestBaseProperties,
+        method: { const: "reconcile" },
+        params: {
+          type: "object",
+          properties: { request_id: actionWireId, request_digest: sha256Digest },
+          required: ["request_id", "request_digest"],
+          additionalProperties: false,
+        },
+      },
+      required: ["runtime_rpc_version", "message_type", "method", "rpc_id", "sent_at", "params"],
+      additionalProperties: false,
+    },
+  ],
+} as const;
+
+const runtimeResponseBaseProperties = {
+  runtime_rpc_version: { const: 1 },
+  rpc_id: actionWireId,
+  completed_at: actionDateTime,
+  logs: runtimeLogsSchema,
+  artifacts: runtimeArtifactsSchema,
+} as const;
+
+export const homerailPluginRuntimeRpcResponseSchema = {
+  $id: "homerail-plugin-runtime-rpc-response-v1",
+  oneOf: [
+    {
+      type: "object",
+      properties: {
+        ...runtimeResponseBaseProperties,
+        message_type: { const: "result" },
+        method: { const: "prepare" },
+        request_id: actionWireId,
+        request_digest: sha256Digest,
+        binding: toolBindingSchema,
+        artifact_declarations: {
+          type: "array",
+          maxItems: HOMERAIL_RUNTIME_ARTIFACT_MAX_ITEMS,
+          items: runtimeArtifactDeclarationSchema,
+        },
+      },
+      required: [
+        "runtime_rpc_version", "message_type", "method", "rpc_id", "completed_at",
+        "request_id", "request_digest", "binding", "artifact_declarations", "logs", "artifacts",
+      ],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        ...runtimeResponseBaseProperties,
+        message_type: { const: "result" },
+        method: { const: "execute" },
+        request_id: actionWireId,
+        request_digest: sha256Digest,
+        binding: toolBindingSchema,
+        output: {
+          oneOf: [
+            {
+              type: "object",
+              properties: {
+                type: { const: "domain_output" },
+                output: { type: "object", maxProperties: 256, additionalProperties: true },
+              },
+              required: ["type", "output"],
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              properties: {
+                type: { const: "ui_transaction" },
+                transaction: { type: "object" },
+              },
+              required: ["type", "transaction"],
+              additionalProperties: false,
+            },
+          ],
+        },
+      },
+      required: [
+        "runtime_rpc_version", "message_type", "method", "rpc_id", "completed_at",
+        "request_id", "request_digest", "binding", "output", "logs", "artifacts",
+      ],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        ...runtimeResponseBaseProperties,
+        message_type: { const: "result" },
+        method: { const: "cancel" },
+        request_id: actionWireId,
+        request_digest: sha256Digest,
+        status: { type: "string", enum: ["accepted", "already_finished", "not_found"] },
+      },
+      required: [
+        "runtime_rpc_version", "message_type", "method", "rpc_id", "completed_at",
+        "request_id", "request_digest", "status", "logs", "artifacts",
+      ],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        ...runtimeResponseBaseProperties,
+        message_type: { const: "result" },
+        method: { const: "health" },
+        binding: toolBindingSchema,
+        status: { type: "string", enum: ["ready", "degraded", "unhealthy"] },
+        runtime_api: { const: 1 },
+        started_at: actionDateTime,
+        active_requests: { type: "integer", minimum: 0, maximum: 4096 },
+      },
+      required: [
+        "runtime_rpc_version", "message_type", "method", "rpc_id", "completed_at",
+        "binding", "status", "runtime_api", "started_at", "active_requests", "logs", "artifacts",
+      ],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        ...runtimeResponseBaseProperties,
+        message_type: { const: "result" },
+        method: { const: "reconcile" },
+        request_id: actionWireId,
+        request_digest: sha256Digest,
+        binding: toolBindingSchema,
+        status: { type: "string", enum: ["completed", "absent", "running", "failed"] },
+        output_digest: sha256Digest,
+        output: {
+          oneOf: [
+            {
+              type: "object",
+              properties: {
+                type: { const: "domain_output" },
+                output: { type: "object", maxProperties: 256, additionalProperties: true },
+              },
+              required: ["type", "output"],
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              properties: { type: { const: "ui_transaction" }, transaction: { type: "object" } },
+              required: ["type", "transaction"],
+              additionalProperties: false,
+            },
+          ],
+        },
+        error: {
+          type: "object",
+          properties: {
+            code: { type: "string", minLength: 1, maxLength: 160 },
+            message: { type: "string", minLength: 1, maxLength: 4096 },
+          },
+          required: ["code", "message"],
+          additionalProperties: false,
+        },
+      },
+      required: [
+        "runtime_rpc_version", "message_type", "method", "rpc_id", "completed_at",
+        "request_id", "request_digest", "binding", "status", "logs", "artifacts",
+      ],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        ...runtimeResponseBaseProperties,
+        message_type: { const: "error" },
+        method: { type: "string", enum: ["prepare", "execute", "cancel", "health", "reconcile"] },
+        request_id: actionWireId,
+        request_digest: sha256Digest,
+        binding: toolBindingSchema,
+        error: {
+          type: "object",
+          properties: {
+            code: { type: "string", enum: Object.values(HomerailPluginRuntimeRpcErrorCode) },
+            message: { type: "string", minLength: 1, maxLength: 4096 },
+            retryable: { type: "boolean" },
+          },
+          required: ["code", "message", "retryable"],
+          additionalProperties: false,
+        },
+      },
+      required: [
+        "runtime_rpc_version", "message_type", "method", "rpc_id", "completed_at",
+        "error", "logs", "artifacts",
+      ],
+      additionalProperties: false,
+    },
+  ],
+} as const;
+
 export const homerailPluginSchemas: Record<string, Record<string, unknown>> = {
   "homerail-plugin-manifest-v1": homerailPluginManifestSchema as Record<string, unknown>,
   "homerail-plugin-turn-context-v1": homerailPluginTurnContextSchema as Record<string, unknown>,
@@ -1121,4 +1802,11 @@ export const homerailPluginSchemas: Record<string, Record<string, unknown>> = {
   "homerail-direct-ui-projection-v1": homerailDirectUiProjectionSchema as Record<string, unknown>,
   "homerail-declarative-renderer-v1": homerailDeclarativeRendererSchema as Record<string, unknown>,
   "homerail-plugin-tool-execution-envelope-v1": homerailPluginToolExecutionEnvelopeSchema as Record<string, unknown>,
+  "homerail-plugin-tool-invocation-v1": homerailPluginToolInvocationSchema as Record<string, unknown>,
+  "homerail-plugin-tool-capability-claims-v1": homerailPluginToolCapabilityClaimsSchema as Record<string, unknown>,
+  "homerail-plugin-tool-confirmation-challenge-v1": homerailPluginToolConfirmationChallengeSchema as Record<string, unknown>,
+  "homerail-plugin-tool-confirmation-decision-v1": homerailPluginToolConfirmationDecisionSchema as Record<string, unknown>,
+  "homerail-plugin-authorized-tool-invocation-v1": homerailPluginAuthorizedToolInvocationSchema as Record<string, unknown>,
+  "homerail-plugin-runtime-rpc-request-v1": homerailPluginRuntimeRpcRequestSchema as Record<string, unknown>,
+  "homerail-plugin-runtime-rpc-response-v1": homerailPluginRuntimeRpcResponseSchema as Record<string, unknown>,
 };

@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Command } from "commander";
 import { InvalidArgumentError } from "commander";
@@ -10,6 +11,7 @@ import {
 } from "../plugin/dev-server.js";
 import {
   codegenPluginProject,
+  generatePluginPublisherKey,
   packPluginProject,
   readPluginArchive,
   testPluginProject,
@@ -79,11 +81,11 @@ export function registerPluginCommand(program: Command): void {
 
   plugin
     .command("validate [directory]")
-    .description("Statically validate a plugin project and M4 data-only eligibility")
+    .description("Statically validate a plugin project and its safe execution-tier eligibility")
     .action(async (directory: string | undefined) => runPluginAction(async () => {
       const report = validatePluginProject(directory);
       output(program, report, validationLines(report));
-      if (!report.valid || !report.data_only_eligible) process.exitCode = 1;
+      if (!report.valid) process.exitCode = 1;
     }));
 
   plugin
@@ -135,19 +137,45 @@ export function registerPluginCommand(program: Command): void {
     }));
 
   plugin
+    .command("publisher-keygen <publisher> [directory]")
+    .description("Generate an Ed25519 publisher key and public trust descriptor")
+    .action(async (publisher: string, directory: string | undefined) => runPluginAction(async () => {
+      const report = generatePluginPublisherKey(directory ?? ".", publisher);
+      output(program, report, [
+        `Generated publisher key: ${report.publisher}`,
+        `Key id: ${report.key_id}`,
+        `Private key: ${report.private_key}`,
+        `Trust descriptor: ${report.trust_descriptor}`,
+      ]);
+    }));
+
+  plugin
     .command("pack [directory]")
     .description("Build a deterministic .hrp archive and lock file")
     .option("-o, --out <file>", "Output .hrp path")
     .option("--force", "Replace an existing output file")
+    .option("--publisher <publisher>", "Publisher identity for a signed archive")
+    .option("--sign-key <file>", "Ed25519 PKCS#8 private key PEM")
     .action(async (
       directory: string | undefined,
-      options: { out?: string; force?: boolean },
+      options: { out?: string; force?: boolean; publisher?: string; signKey?: string },
     ) => runPluginAction(async () => {
-      const report = packPluginProject(directory, { output: options.out, force: options.force });
+      if ((options.publisher === undefined) !== (options.signKey === undefined)) {
+        throw new Error("Use --publisher and --sign-key together");
+      }
+      const report = packPluginProject(directory, {
+        output: options.out,
+        force: options.force,
+        ...(options.publisher && options.signKey ? {
+          publisher: options.publisher,
+          signing_key: readPrivateSigningKey(options.signKey),
+        } : {}),
+      });
       output(program, report, [
         `Packed ${report.plugin_id}@${report.plugin_version}`,
         `Archive: ${report.output}`,
         `SHA-256: ${report.archive_digest}`,
+        `Signature: ${report.signature_state}${report.key_id ? ` (${report.key_id})` : ""}`,
       ]);
     }));
 
@@ -160,9 +188,188 @@ export function registerPluginCommand(program: Command): void {
         `Verified ${report.plugin_id}@${report.plugin_version}`,
         `Archive SHA-256: ${report.archive_digest}`,
         `Payload SHA-256: ${report.payload_digest}`,
-        `Data-only eligible: ${report.data_only_eligible ? "yes" : "no"}`,
+        `Signature: ${report.signature_state}${report.key_id ? ` (${report.key_id})` : ""}`,
+        `M4 data-only eligible: ${report.data_only_eligible ? "yes" : "no"}`,
+        `M5 projection Action eligible: ${report.m5_projection_action_eligible ? "yes" : "no"}`,
+        `M5 Workflow resolution eligible: ${report.m5_workflow_resolution_eligible ? "yes" : "no"}`,
+        `M6 isolated custom Renderer eligible: ${report.m6_custom_renderer_eligible ? "yes" : "no"}`,
       ]);
-      if (!report.data_only_eligible) process.exitCode = 1;
+    }));
+
+  plugin
+    .command("publisher-list")
+    .description("List trusted and revoked plugin publisher keys")
+    .action(async () => runPluginAction(async () => {
+      const client = getClient(globalOptions(program));
+      const response = await client.get<ApiResponse<JsonObject>>("/api/plugins/publishers");
+      const data = requireSuccess(response);
+      const publishers = Array.isArray(data.publishers) ? data.publishers : [];
+      output(program, data, publishers.length
+        ? publishers.map((entry) => publisherLine(entry))
+        : ["No plugin publisher keys are configured."]);
+    }));
+
+  plugin
+    .command("publisher-trust <descriptor>")
+    .description("Trust an Ed25519 publisher descriptor through the Manager")
+    .option("--expected-revision <revision>", "Publisher trust compare-and-swap", parseNonNegativeRevision)
+    .action(async (
+      descriptor: string,
+      options: { expectedRevision?: number },
+    ) => runPluginAction(async () => {
+      const entry = readPublisherDescriptor(descriptor);
+      const client = getClient(globalOptions(program));
+      const expectedRevision = options.expectedRevision ?? await publisherTrustRevision(client, entry.key_id);
+      const response = await client.put<ApiResponse<JsonObject>>(
+        `/api/plugins/publishers/${encodeURIComponent(entry.key_id)}`,
+        {
+          publisher: entry.publisher,
+          public_key_spki: entry.public_key_spki,
+          state: "trusted",
+          expected_revision: expectedRevision,
+        },
+      );
+      const data = requireSuccess(response);
+      output(program, data, [`Trusted ${entry.publisher} (${entry.key_id}).`]);
+    }));
+
+  plugin
+    .command("publisher-revoke <key-id>")
+    .description("Permanently revoke a publisher key and disable affected plugins")
+    .requiredOption("--reason <reason>", "Auditable revocation reason")
+    .option("--expected-revision <revision>", "Publisher trust compare-and-swap", parseRevision)
+    .action(async (
+      keyId: string,
+      options: { reason: string; expectedRevision?: number },
+    ) => runPluginAction(async () => {
+      const client = getClient(globalOptions(program));
+      const current = await publisherTrustRecord(client, keyId);
+      const response = await client.put<ApiResponse<JsonObject>>(
+        `/api/plugins/publishers/${encodeURIComponent(keyId)}`,
+        {
+          publisher: String(current.publisher),
+          public_key_spki: String(current.public_key_spki),
+          state: "revoked",
+          expected_revision: options.expectedRevision ?? Number(current.revision),
+          reason: options.reason,
+        },
+      );
+      const data = requireSuccess(response);
+      output(program, data, [`Revoked ${keyId}.`, "Affected active plugins were disabled fail-closed."]);
+    }));
+
+  plugin
+    .command("registry-source <registry-id> <source-url>")
+    .description("Configure an HTTPS plugin registry source and immutable root pin")
+    .requiredOption("--root-key-id <key-id>", "Pinned Ed25519 registry root key id")
+    .action(async (
+      registryId: string,
+      sourceUrl: string,
+      options: { rootKeyId: string },
+    ) => runPluginAction(async () => {
+      const client = getClient(globalOptions(program));
+      const response = await client.put<ApiResponse<JsonObject>>(
+        `/api/plugins/registries/${encodeRegistryId(registryId)}/source`,
+        { source_url: sourceUrl, root_key_id: assertKeyId(options.rootKeyId) },
+      );
+      const data = requireSuccess(response);
+      output(program, data, [
+        `Configured registry ${registryId}`,
+        `Source: ${sourceUrl}`,
+        `Root pin: ${options.rootKeyId}`,
+      ]);
+    }));
+
+  plugin
+    .command("registry-sync <registry-id> <index>")
+    .description("Submit exact canonical signed registry-index bytes to the Manager")
+    .action(async (registryId: string, index: string) => runPluginAction(async () => {
+      const indexPath = path.resolve(index);
+      const bytes = fs.readFileSync(indexPath);
+      if (!bytes.byteLength || bytes.byteLength > 1024 * 1024) {
+        throw new Error("Plugin registry index size is outside the 1 MiB limit");
+      }
+      const client = getClient(globalOptions(program));
+      const response = await client.post<ApiResponse<JsonObject>>(
+        `/api/plugins/registries/${encodeRegistryId(registryId)}/sync`,
+        { index_base64: bytes.toString("base64url") },
+      );
+      const data = requireSuccess(response);
+      output(program, data, [
+        `Synchronized registry ${registryId}`,
+        `Index: ${indexPath}`,
+      ]);
+    }));
+
+  for (const operation of ["install", "update"] as const) {
+    plugin
+      .command(`registry-${operation} <registry-id> <archive>`)
+      .description(`${operation === "install" ? "Install" : "Stage an update for"} an exact signed registry release`)
+      .action(async (registryId: string, archive: string) => runPluginAction(async () => {
+        const verified = verifyPluginArchiveFile(archive);
+        const input = readPluginArchive(archive);
+        const client = getClient(globalOptions(program));
+        const response = await client.postBinary<ApiResponse<JsonObject>>(
+          `/api/plugins/registries/${encodeRegistryId(registryId)}/releases/`
+            + `${encodePluginId(verified.plugin_id)}/${encodeURIComponent(verified.plugin_version)}/${operation}`,
+          input.content,
+        );
+        const data = requireSuccess(response);
+        output(program, data, [
+          `${operation === "install" ? "Installed" : "Staged update"} ${verified.plugin_id}@${verified.plugin_version}`,
+          `Registry: ${registryId}`,
+          "The candidate is not activated or enabled implicitly.",
+        ]);
+      }));
+  }
+
+  plugin
+    .command("registry-activate <registry-id> <id> <version>")
+    .description("Activate an installed release through its fresh signed Registry catalog")
+    .option("--expected-revision <revision>", "Activation revision compare-and-swap", parseRevision)
+    .action(async (
+      registryId: string,
+      id: string,
+      version: string,
+      options: { expectedRevision?: number },
+    ) => runPluginAction(async () => {
+      const client = getClient(globalOptions(program));
+      const expectedRevision = options.expectedRevision
+        ?? (await getPluginVersionState(client, id)).activation.revision;
+      const response = await client.post<ApiResponse<JsonObject>>(
+        `/api/plugins/registries/${encodeRegistryId(registryId)}/releases/`
+          + `${encodePluginId(id)}/${encodeURIComponent(version)}/activate`,
+        { expected_revision: expectedRevision },
+      );
+      const data = requireSuccess(response);
+      output(program, data, [
+        `Activated ${id}@${version} from registry ${registryId}.`,
+        "The release remains disabled until registry-enable succeeds.",
+      ]);
+    }));
+
+  plugin
+    .command("registry-enable <registry-id> <id>")
+    .description("Enable the active release only while its signed Registry catalog is fresh")
+    .option("--expected-revision <revision>", "Activation revision compare-and-swap", parseRevision)
+    .action(async (
+      registryId: string,
+      id: string,
+      options: { expectedRevision?: number },
+    ) => runPluginAction(async () => {
+      const client = getClient(globalOptions(program));
+      const state = await getPluginVersionState(client, id);
+      const expectedRevision = options.expectedRevision ?? state.activation.revision;
+      const response = await client.put<ApiResponse<JsonObject>>(
+        `/api/plugins/registries/${encodeRegistryId(registryId)}/plugins/${encodePluginId(id)}/enabled`,
+        {
+          enabled: true,
+          expected_revision: expectedRevision,
+          expected_active_version: state.activation.active_version,
+        },
+      );
+      const data = requireSuccess(response);
+      output(program, data, [`Enabled ${id} from fresh registry ${registryId}.`]);
     }));
 
   plugin
@@ -170,16 +377,12 @@ export function registerPluginCommand(program: Command): void {
     .description("Verify and upload an .hrp archive to the Manager staging lifecycle")
     .option("--staging", "Install through the staging channel")
     .option("--local", "Install through the local-development channel")
-    .option("--registry", "Install through the registry channel")
     .action(async (
       archive: string,
-      options: { staging?: boolean; local?: boolean; registry?: boolean },
+      options: { staging?: boolean; local?: boolean },
     ) => runPluginAction(async () => {
       const channel = installChannel(options);
       const verified = verifyPluginArchiveFile(archive);
-      if (!verified.data_only_eligible) {
-        throw new Error("M4 only installs plugins eligible for the data-only execution policy");
-      }
       const input = readPluginArchive(archive);
       const client = getClient(globalOptions(program));
       const response = await client.postBinary<ApiResponse<JsonObject>>(
@@ -313,6 +516,24 @@ export function registerPluginCommand(program: Command): void {
     }));
 
   plugin
+    .command("runtime-preflight <id> <version>")
+    .description("Attest a staged executable HRP on the configured Node before enablement")
+    .action(async (id: string, version: string) => runPluginAction(async () => {
+      const client = getClient(globalOptions(program));
+      const response = await client.post<ApiResponse<JsonObject>>(
+        `/api/plugins/${encodePluginId(id)}/versions/${encodeURIComponent(version)}/runtime/preflight`,
+        {},
+      );
+      const data = requireSuccess(response);
+      output(program, data, [
+        `Runtime preflight passed for ${id}@${version}.`,
+        `Node: ${String(data.node_id ?? "?")}`,
+        `Image: ${String(data.image_digest ?? "?")}`,
+        `Measurement: ${String(data.measurement_digest ?? "?")}`,
+      ]);
+    }));
+
+  plugin
     .command("doctor <id>")
     .description("Inspect installation, package, health, and activation state")
     .action(async (id: string) => runPluginAction(async () => {
@@ -380,17 +601,28 @@ function requireSuccess<T>(response: ApiResponse<T>): T {
   return response.data;
 }
 
-function installChannel(options: { staging?: boolean; local?: boolean; registry?: boolean }): "staging" | "local" | "registry" {
-  const selected = [options.staging && "staging", options.local && "local", options.registry && "registry"]
-    .filter((value): value is "staging" | "local" | "registry" => Boolean(value));
+function installChannel(options: { staging?: boolean; local?: boolean }): "staging" | "local" {
+  const selected = [options.staging && "staging", options.local && "local"]
+    .filter((value): value is "staging" | "local" => Boolean(value));
   if (selected.length > 1) throw new Error("Use only one install channel flag");
-  if (selected[0] === "registry") throw new Error("Remote registry installs require the signed M6 registry pipeline");
   return selected[0] ?? "staging";
 }
 
 function encodePluginId(pluginId: string): string {
   if (!isHomerailPluginId(pluginId)) throw new Error(`Invalid HomeRail plugin id: ${pluginId}`);
   return encodeURIComponent(pluginId);
+}
+
+function encodeRegistryId(registryId: string): string {
+  if (!/^[a-z][a-z0-9._-]{0,79}$/.test(registryId)) {
+    throw new Error(`Invalid HomeRail plugin registry id: ${registryId}`);
+  }
+  return encodeURIComponent(registryId);
+}
+
+function assertKeyId(keyId: string): string {
+  if (!/^sha256:[a-f0-9]{64}$/.test(keyId)) throw new Error("Registry root key id must be sha256:<64 lowercase hex>");
+  return keyId;
 }
 
 async function getPluginVersionState(
@@ -444,6 +676,9 @@ function validationLines(report: ReturnType<typeof validatePluginProject>): stri
   const lines = [
     `${report.valid ? "VALID" : "INVALID"}: ${report.plugin_id}@${report.plugin_version}`,
     `M4 data-only eligible: ${report.data_only_eligible ? "yes" : "no"}`,
+    `M5 projection Action eligible: ${report.m5_projection_action_eligible ? "yes" : "no"}`,
+    `M5 Workflow resolution eligible: ${report.m5_workflow_resolution_eligible ? "yes" : "no"}`,
+    `M6 isolated custom Renderer eligible: ${report.m6_custom_renderer_eligible ? "yes" : "no"}`,
     `Payload files: ${report.files.length}`,
   ];
   for (const issue of report.issues) {
@@ -467,6 +702,88 @@ function permissionLine(value: unknown): string {
   return `${String(grant.permission ?? "?")}: ${String(grant.status ?? "?")} (revision ${String(grant.revision ?? "?")})`;
 }
 
+function publisherLine(value: unknown): string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return JSON.stringify(value);
+  const entry = value as JsonObject;
+  return `${String(entry.publisher ?? "?")}: ${String(entry.state ?? "?")} ${String(entry.key_id ?? "?")} (revision ${String(entry.revision ?? "?")})`;
+}
+
+function readPrivateSigningKey(fileValue: string): Buffer {
+  const file = path.resolve(fileValue);
+  const stat = fs.lstatSync(file);
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error("Plugin signing key must be a regular file, not a symlink");
+  }
+  if (!stat.size || stat.size > 16 * 1024) throw new Error("Plugin signing key size is invalid");
+  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+    throw new Error("Plugin signing key must not be readable or writable by group/other users");
+  }
+  return fs.readFileSync(file);
+}
+
+function readPublisherDescriptor(fileValue: string): {
+  publisher: string;
+  key_id: string;
+  public_key_spki: string;
+} {
+  const file = path.resolve(fileValue);
+  const stat = fs.lstatSync(file);
+  if (stat.isSymbolicLink() || !stat.isFile() || !stat.size || stat.size > 16 * 1024) {
+    throw new Error("Publisher descriptor must be a bounded regular file, not a symlink");
+  }
+  const value = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Publisher descriptor must be an object");
+  }
+  const descriptor = value as JsonObject;
+  if (
+    Object.keys(descriptor).sort().join(",")
+      !== "algorithm,descriptor_version,key_id,public_key_spki,publisher"
+    || descriptor.descriptor_version !== 1
+    || descriptor.algorithm !== "Ed25519"
+    || typeof descriptor.publisher !== "string"
+    || typeof descriptor.key_id !== "string"
+    || !/^sha256:[a-f0-9]{64}$/.test(descriptor.key_id)
+    || typeof descriptor.public_key_spki !== "string"
+  ) throw new Error("Publisher descriptor is malformed or unsupported");
+  return {
+    publisher: descriptor.publisher,
+    key_id: descriptor.key_id,
+    public_key_spki: descriptor.public_key_spki,
+  };
+}
+
+async function publisherTrustRecords(client: ReturnType<typeof getClient>): Promise<JsonObject[]> {
+  const response = await client.get<ApiResponse<JsonObject>>("/api/plugins/publishers");
+  const data = requireSuccess(response);
+  return (Array.isArray(data.publishers) ? data.publishers : [])
+    .filter((entry): entry is JsonObject => Boolean(entry && typeof entry === "object" && !Array.isArray(entry)));
+}
+
+async function publisherTrustRecord(
+  client: ReturnType<typeof getClient>,
+  keyId: string,
+): Promise<JsonObject> {
+  const record = (await publisherTrustRecords(client)).find((entry) => entry.key_id === keyId);
+  if (!record) throw new Error(`Publisher key is not configured: ${keyId}`);
+  if (!Number.isSafeInteger(record.revision) || Number(record.revision) < 1) {
+    throw new Error(`Publisher key has invalid revision: ${keyId}`);
+  }
+  return record;
+}
+
+async function publisherTrustRevision(
+  client: ReturnType<typeof getClient>,
+  keyId: string,
+): Promise<number> {
+  const record = (await publisherTrustRecords(client)).find((entry) => entry.key_id === keyId);
+  if (!record) return 0;
+  if (!Number.isSafeInteger(record.revision) || Number(record.revision) < 1) {
+    throw new Error(`Publisher key has invalid revision: ${keyId}`);
+  }
+  return Number(record.revision);
+}
+
 function doctorLines(id: string, data: JsonObject): string[] {
   const versions = Array.isArray(data.versions) ? data.versions : [];
   return [
@@ -487,6 +804,14 @@ function parseRevision(value: string): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 1) {
     throw new InvalidArgumentError("revision must be a positive integer");
+  }
+  return parsed;
+}
+
+function parseNonNegativeRevision(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new InvalidArgumentError("revision must be a non-negative integer");
   }
   return parsed;
 }

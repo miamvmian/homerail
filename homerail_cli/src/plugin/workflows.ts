@@ -1,15 +1,18 @@
 import * as fs from "node:fs";
-import { randomBytes } from "node:crypto";
+import { generateKeyPairSync, randomBytes } from "node:crypto";
 import * as path from "node:path";
 import {
   DEFAULT_HRP_LIMITS,
   buildHrpArchive,
+  buildSignedHrpArchive,
+  createHrpPublisherTrustEntry,
   generatePluginTypes,
   runPluginFixtureMatrix,
   scanPluginSource,
   sourceFilesForPack,
   verifyPluginArchive,
   type HrpLockFileV1,
+  type HrpSignatureFileV1,
   type PluginFixtureMatrixReport,
   type PluginSourceSnapshot,
 } from "homerail-plugin-sdk";
@@ -19,7 +22,14 @@ export interface PluginValidationReport {
   plugin_id: string;
   plugin_version: string;
   valid: boolean;
+  /** Backward-compatible M4 eligibility field. */
   data_only_eligible: boolean;
+  m5_projection_action_eligible: boolean;
+  m5_projection_action_eligibility_reasons: PluginSourceSnapshot["m5_projection_action_eligibility_reasons"];
+  m5_workflow_resolution_eligible: boolean;
+  m5_workflow_resolution_eligibility_reasons: PluginSourceSnapshot["m5_workflow_resolution_eligibility_reasons"];
+  m6_custom_renderer_eligible: boolean;
+  m6_custom_renderer_eligibility_reasons: PluginSourceSnapshot["m6_custom_renderer_eligibility_reasons"];
   files: Array<{ path: string; sha256: string; size: number }>;
   issues: PluginSourceSnapshot["issues"];
 }
@@ -30,8 +40,18 @@ export interface PluginPackReport {
   plugin_version: string;
   archive_digest: string;
   payload_digest: string;
+  data_only_eligible: boolean;
+  m5_projection_action_eligible: boolean;
+  m5_projection_action_eligibility_reasons: PluginSourceSnapshot["m5_projection_action_eligibility_reasons"];
+  m5_workflow_resolution_eligible: boolean;
+  m5_workflow_resolution_eligibility_reasons: PluginSourceSnapshot["m5_workflow_resolution_eligibility_reasons"];
+  m6_custom_renderer_eligible: boolean;
+  m6_custom_renderer_eligibility_reasons: PluginSourceSnapshot["m6_custom_renderer_eligibility_reasons"];
   size: number;
   files: number;
+  signature_state: "unsigned" | "signed";
+  publisher?: string;
+  key_id?: string;
 }
 
 export interface PluginVerifyReport {
@@ -40,8 +60,26 @@ export interface PluginVerifyReport {
   plugin_version: string;
   archive_digest: string;
   payload_digest: string;
+  /** Backward-compatible M4 eligibility field. */
   data_only_eligible: boolean;
+  m5_projection_action_eligible: boolean;
+  m5_projection_action_eligibility_reasons: PluginSourceSnapshot["m5_projection_action_eligibility_reasons"];
+  m5_workflow_resolution_eligible: boolean;
+  m5_workflow_resolution_eligibility_reasons: PluginSourceSnapshot["m5_workflow_resolution_eligibility_reasons"];
+  m6_custom_renderer_eligible: boolean;
+  m6_custom_renderer_eligibility_reasons: PluginSourceSnapshot["m6_custom_renderer_eligibility_reasons"];
   files: HrpLockFileV1["files"];
+  signature_state: "unsigned" | "untrusted";
+  publisher?: string;
+  key_id?: string;
+}
+
+export interface PluginPublisherKeyReport {
+  private_key: string;
+  trust_descriptor: string;
+  publisher: string;
+  key_id: string;
+  public_key_spki: string;
 }
 
 export function resolvePluginRoot(value = "."): string {
@@ -57,6 +95,12 @@ export function validatePluginProject(rootValue = "."): PluginValidationReport {
     plugin_version: snapshot.manifest.version,
     valid: snapshot.valid,
     data_only_eligible: snapshot.m4_data_only_eligible,
+    m5_projection_action_eligible: snapshot.m5_projection_action_eligible,
+    m5_projection_action_eligibility_reasons: snapshot.m5_projection_action_eligibility_reasons,
+    m5_workflow_resolution_eligible: snapshot.m5_workflow_resolution_eligible,
+    m5_workflow_resolution_eligibility_reasons: snapshot.m5_workflow_resolution_eligibility_reasons,
+    m6_custom_renderer_eligible: snapshot.m6_custom_renderer_eligible,
+    m6_custom_renderer_eligibility_reasons: snapshot.m6_custom_renderer_eligibility_reasons,
     files: [...snapshot.files.entries()]
       .map(([filePath, content]) => ({
         path: filePath,
@@ -220,17 +264,28 @@ function writeArchiveAtomically(output: string, archive: Buffer, force: boolean)
 
 export function packPluginProject(
   rootValue = ".",
-  options: { output?: string; force?: boolean } = {},
+  options: {
+    output?: string;
+    force?: boolean;
+    publisher?: string;
+    signing_key?: string | Buffer;
+  } = {},
 ): PluginPackReport {
   const root = resolvePluginRoot(rootValue);
   const snapshot = scanPluginSource(root);
   if (!snapshot.valid) {
     throw new Error(`Cannot pack invalid plugin source: ${JSON.stringify(snapshot.issues)}`);
   }
-  if (!snapshot.m4_data_only_eligible) {
-    throw new Error("M4 can only pack plugins eligible for the data-only execution policy");
+  if ((options.publisher === undefined) !== (options.signing_key === undefined)) {
+    throw new Error("Signed plugin packaging requires both publisher and signing_key");
   }
-  const built = buildHrpArchive(sourceFilesForPack(snapshot));
+  const built = options.publisher && options.signing_key
+    ? buildSignedHrpArchive(sourceFilesForPack(snapshot), {
+        publisher: options.publisher,
+        private_key: options.signing_key,
+      })
+    : buildHrpArchive(sourceFilesForPack(snapshot));
+  const signature = "signature" in built ? built.signature as HrpSignatureFileV1 : undefined;
   const output = path.resolve(options.output ?? defaultPluginArchivePath(root, snapshot.manifest.version));
   writeArchiveAtomically(output, built.archive, options.force === true);
   return {
@@ -239,8 +294,60 @@ export function packPluginProject(
     plugin_version: snapshot.manifest.version,
     archive_digest: built.archive_digest,
     payload_digest: built.lock.payload_digest,
+    data_only_eligible: snapshot.m4_data_only_eligible,
+    m5_projection_action_eligible: snapshot.m5_projection_action_eligible,
+    m5_projection_action_eligibility_reasons: snapshot.m5_projection_action_eligibility_reasons,
+    m5_workflow_resolution_eligible: snapshot.m5_workflow_resolution_eligible,
+    m5_workflow_resolution_eligibility_reasons: snapshot.m5_workflow_resolution_eligibility_reasons,
+    m6_custom_renderer_eligible: snapshot.m6_custom_renderer_eligible,
+    m6_custom_renderer_eligibility_reasons: snapshot.m6_custom_renderer_eligibility_reasons,
     size: built.archive.byteLength,
     files: built.lock.files.length,
+    signature_state: signature ? "signed" : "unsigned",
+    ...(signature ? {
+      publisher: signature.publisher,
+      key_id: signature.key_id,
+    } : {}),
+  };
+}
+
+export function generatePluginPublisherKey(
+  directoryValue: string,
+  publisher: string,
+  options: { force?: boolean } = {},
+): PluginPublisherKeyReport {
+  const directory = path.resolve(directoryValue);
+  const privateKeyPath = path.join(directory, "homerail.publisher.private.pem");
+  const descriptorPath = path.join(directory, "homerail.publisher.json");
+  ensureSafeOutputParent(privateKeyPath);
+  assertSafeOutputTarget(privateKeyPath, options.force === true);
+  assertSafeOutputTarget(descriptorPath, options.force === true);
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const entry = createHrpPublisherTrustEntry({ publisher, public_key: publicKey });
+  const privatePem = Buffer.from(privateKey.export({ format: "pem", type: "pkcs8" }));
+  const descriptor = Buffer.from(`${JSON.stringify({
+    descriptor_version: 1,
+    publisher: entry.publisher,
+    key_id: entry.key_id,
+    public_key_spki: entry.public_key_spki,
+    algorithm: "Ed25519",
+  }, null, 2)}\n`, "utf8");
+  let privateWritten = false;
+  try {
+    writeArchiveAtomically(privateKeyPath, privatePem, options.force === true);
+    privateWritten = true;
+    writeArchiveAtomically(descriptorPath, descriptor, options.force === true);
+  } catch (cause) {
+    if (privateWritten && options.force !== true) fs.rmSync(privateKeyPath, { force: true });
+    throw cause;
+  }
+  fs.chmodSync(privateKeyPath, 0o600);
+  return {
+    private_key: privateKeyPath,
+    trust_descriptor: descriptorPath,
+    publisher: entry.publisher,
+    key_id: entry.key_id,
+    public_key_spki: entry.public_key_spki,
   };
 }
 
@@ -258,7 +365,7 @@ export function readPluginArchive(archiveValue: string): { archivePath: string; 
 
 export function verifyPluginArchiveFile(archiveValue: string): PluginVerifyReport {
   const { archivePath, content } = readPluginArchive(archiveValue);
-  const verified = verifyPluginArchive(content);
+  const verified = verifyPluginArchive(content, { allow_signature: true });
   return {
     archive: archivePath,
     plugin_id: verified.snapshot.manifest.id,
@@ -266,6 +373,20 @@ export function verifyPluginArchiveFile(archiveValue: string): PluginVerifyRepor
     archive_digest: verified.archive_digest,
     payload_digest: verified.lock.payload_digest,
     data_only_eligible: verified.snapshot.m4_data_only_eligible,
+    m5_projection_action_eligible: verified.snapshot.m5_projection_action_eligible,
+    m5_projection_action_eligibility_reasons:
+      verified.snapshot.m5_projection_action_eligibility_reasons,
+    m5_workflow_resolution_eligible: verified.snapshot.m5_workflow_resolution_eligible,
+    m5_workflow_resolution_eligibility_reasons:
+      verified.snapshot.m5_workflow_resolution_eligibility_reasons,
+    m6_custom_renderer_eligible: verified.snapshot.m6_custom_renderer_eligible,
+    m6_custom_renderer_eligibility_reasons:
+      verified.snapshot.m6_custom_renderer_eligibility_reasons,
     files: verified.lock.files,
+    signature_state: verified.signature ? "untrusted" : "unsigned",
+    ...(verified.signature ? {
+      publisher: verified.signature.statement.publisher,
+      key_id: verified.signature.statement.key_id,
+    } : {}),
   };
 }

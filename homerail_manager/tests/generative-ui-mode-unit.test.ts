@@ -16,14 +16,14 @@ describe("Generative UI mode parser", () => {
     expect(parseGenerativeUiMode("  ")).toBe("off");
   });
 
-  it("accepts only normalized off and shadow values", () => {
+  it("accepts normalized off, shadow, and prefer while keeping strict reserved", () => {
     expect(parseGenerativeUiMode(" OFF ")).toBe("off");
     expect(parseGenerativeUiMode(" Shadow ")).toBe("shadow");
-    expect(() => parseGenerativeUiMode("prefer")).toThrow(GenerativeUiModeValidationError);
-    expect(() => parseGenerativeUiMode("prefer")).toThrow(/reserved and is not available/);
+    expect(parseGenerativeUiMode(" Prefer ")).toBe("prefer");
+    expect(() => parseGenerativeUiMode("strict")).toThrow(GenerativeUiModeValidationError);
     expect(() => parseGenerativeUiMode("strict")).toThrow(/reserved and is not available/);
-    expect(() => parseGenerativeUiMode("enabled")).toThrow(/must be one of: off, shadow/);
-    expect(() => parseGenerativeUiMode(true)).toThrow(/must be one of: off, shadow/);
+    expect(() => parseGenerativeUiMode("enabled")).toThrow(/must be one of: off, shadow, prefer/);
+    expect(() => parseGenerativeUiMode(true)).toThrow(/must be one of: off, shadow, prefer/);
   });
 
   it("lets a non-empty environment value override persisted configuration", () => {
@@ -31,7 +31,8 @@ describe("Generative UI mode parser", () => {
     expect(resolveConfiguredGenerativeUiMode("shadow", "")).toBe("shadow");
     expect(resolveConfiguredGenerativeUiMode("shadow", "off")).toBe("off");
     expect(resolveConfiguredGenerativeUiMode("off", "shadow")).toBe("shadow");
-    expect(() => resolveConfiguredGenerativeUiMode("off", "prefer")).toThrow(
+    expect(resolveConfiguredGenerativeUiMode("off", "prefer")).toBe("prefer");
+    expect(() => resolveConfiguredGenerativeUiMode("off", "strict")).toThrow(
       new RegExp(GENERATIVE_UI_MODE_ENV),
     );
     expect(resolveConfiguredGenerativeUiModeDetails("off", "shadow")).toEqual({
@@ -46,5 +47,7 @@ describe("Generative UI mode parser", () => {
     expect(resolveSessionGenerativeUiMode("shadow", "off")).toBe("off");
     expect(resolveSessionGenerativeUiMode("off", "shadow")).toBe("off");
     expect(resolveSessionGenerativeUiMode(undefined, "shadow")).toBe("off");
+    expect(resolveSessionGenerativeUiMode("prefer", "prefer")).toBe("prefer");
+    expect(resolveSessionGenerativeUiMode("prefer", "off")).toBe("off");
   });
 });

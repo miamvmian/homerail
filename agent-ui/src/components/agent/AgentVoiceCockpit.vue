@@ -31,7 +31,12 @@ import VoiceSessionProjectSidebar from '@/components/agent/VoiceSessionProjectSi
 import AgentModeTopBar from '@/components/agent/AgentModeTopBar.vue'
 import DagResourceStatusPill from '@/components/agent/DagResourceStatusPill.vue'
 import VoiceDynamicWidget from '@/components/agent/VoiceDynamicWidget.vue'
+import GenerativeUiCanonicalSurface from '@/components/generative-ui/GenerativeUiCanonicalSurface.vue'
 import GenerativeUiShadowPreview from '@/components/generative-ui/GenerativeUiShadowPreview.vue'
+import {
+  resolveVoiceGenerativeUiPresentation,
+  showLegacyWidgetAlongsideCanonical,
+} from '@/generative-ui/production-mode'
 import {
   isCodexModelUnavailable,
   resolveCodexModelOptions,
@@ -172,11 +177,19 @@ type GenerativeUiShadowPreviewControls = {
   acceptStreamEvent: (event: GenerativeUiStreamEventV1) => Promise<void>
   refresh: () => Promise<void>
 }
+type GenerativeUiCanonicalSurfaceControls = {
+  refresh: () => Promise<void>
+}
 
 const workspace = ref<VoiceWorkspace | null>(null)
-const generativeUiShadowPreviewActive = computed(() => (
-  generativeUiShadowPreviewRequested && workspace.value?.generative_ui_mode === 'shadow'
-))
+const generativeUiCanonicalAvailable = ref(false)
+const generativeUiCanonicalNodeIds = ref<Set<string>>(new Set())
+const generativeUiPresentation = computed(() => resolveVoiceGenerativeUiPresentation({
+  mode: workspace.value?.generative_ui_mode,
+  canonical_available: generativeUiCanonicalAvailable.value,
+  shadow_preview_requested: generativeUiShadowPreviewRequested,
+}))
+const generativeUiShadowPreviewActive = computed(() => generativeUiPresentation.value.show_shadow)
 const loading = ref(false)
 const speaking = ref(false)
 const listening = ref(false)
@@ -246,9 +259,23 @@ const modelMenuRef = ref<HTMLElement | null>(null)
 const voiceSidebarRef = ref<VoiceSessionSidebarGamepadControls | null>(null)
 const voiceCardGridRef = ref<HTMLElement | null>(null)
 const generativeUiShadowPreviewRef = ref<GenerativeUiShadowPreviewControls | null>(null)
+const generativeUiCanonicalSurfaceRef = ref<GenerativeUiCanonicalSurfaceControls | null>(null)
 const conversationThreadRef = ref<HTMLElement | null>(null)
 const noSleepVideo = ref<HTMLVideoElement | null>(null)
 const ttsAudioElement = ref<HTMLAudioElement | null>(null)
+
+watch(
+  () => [workspace.value?.session_id, workspace.value?.generative_ui_mode],
+  () => {
+    generativeUiCanonicalAvailable.value = false
+    generativeUiCanonicalNodeIds.value = new Set()
+  },
+)
+
+function onGenerativeUiCanonicalAvailability(payload: { available: boolean; node_ids: string[] }): void {
+  generativeUiCanonicalAvailable.value = payload.available
+  generativeUiCanonicalNodeIds.value = new Set(payload.node_ids)
+}
 
 let mediaStream: MediaStream | null = null
 let nativeVoiceCaptureSession: NativeVoiceCaptureSession | null = null
@@ -358,7 +385,12 @@ const displayWidgets = computed<VoiceWidget[]>(() => {
         'manager-agent-blocker'
       ].includes(widget.id) &&
       !isDuplicateTaskDraftWidget(widget) &&
-      widgetUiState(widget) !== 'hidden'
+      widgetUiState(widget) !== 'hidden' &&
+      showLegacyWidgetAlongsideCanonical(
+        widget.id,
+        generativeUiPresentation.value,
+        generativeUiCanonicalNodeIds.value,
+      )
   )
 })
 const minimizedWidgets = computed(() => displayWidgets.value.filter(isWidgetMinimized))
@@ -1374,10 +1406,16 @@ function setupVoiceStatusSubscription(): void {
       if (generativeUiShadowPreviewActive.value) {
         void generativeUiShadowPreviewRef.value?.refresh()
       }
+      if (generativeUiPresentation.value.request_canonical) {
+        void generativeUiCanonicalSurfaceRef.value?.refresh()
+      }
     })
     pluginRegistryStateUnsub = voiceWs.onStateChange((state) => {
       if (state === 'connected' && generativeUiShadowPreviewActive.value) {
         void generativeUiShadowPreviewRef.value?.refresh()
+      }
+      if (state === 'connected' && generativeUiPresentation.value.request_canonical) {
+        void generativeUiCanonicalSurfaceRef.value?.refresh()
       }
     })
   } catch {
@@ -4767,7 +4805,7 @@ function summarizeTask(value: string): string {
           >
             {{ processingText }}
           </div>
-          <div v-if="minimizedWidgets.length && !generativeUiShadowPreviewActive" class="voice-widget-shelf">
+          <div v-if="minimizedWidgets.length && generativeUiPresentation.show_legacy" class="voice-widget-shelf">
             <div
               v-for="widget in minimizedWidgets"
               :key="widget.id"
@@ -4789,7 +4827,7 @@ function summarizeTask(value: string): string {
               @open-preview="openWidgetPreview"
             />
             <div
-              v-else
+              v-if="generativeUiPresentation.show_legacy"
               ref="voiceCardGridRef"
               class="voice-card-grid"
               :class="{
@@ -4797,7 +4835,16 @@ function summarizeTask(value: string): string {
                 'voice-card-grid--deck-active': deckPreviewFocusActive
               }"
             >
-              <div v-if="!hasVoiceStageContent" class="voice-empty-state">
+              <GenerativeUiCanonicalSurface
+                v-if="generativeUiPresentation.request_canonical && workspace"
+                ref="generativeUiCanonicalSurfaceRef"
+                :session-id="workspace.session_id"
+                :refresh-token="workspace.updated_at"
+                :active-run-id="workspace.manager_run_id"
+                @availability="onGenerativeUiCanonicalAvailability"
+                @open-preview="openWidgetPreview"
+              />
+              <div v-if="!hasVoiceStageContent && !generativeUiPresentation.show_canonical" class="voice-empty-state">
                 <div class="voice-empty-state__kicker">{{ t('voice.canvas.dynamicCanvas') }}</div>
                 <h1>{{ t('voice.canvas.emptyTitle') }}</h1>
                 <p>{{ t('voice.canvas.emptyDescription') }}</p>

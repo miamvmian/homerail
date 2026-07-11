@@ -67,6 +67,11 @@ import {
   persistentGenerativeUiDocumentService,
   type GenerativeUiShadowSnapshotV1,
 } from "../generative-ui/shadow-service.js";
+import {
+  applyVoiceCanonicalProjectionPatch,
+  VoiceCanonicalProjectionConflictError,
+  type VoiceCanonicalProjectionPatch,
+} from "../generative-ui/canonical-voice-service.js";
 import { acceptPluginToolExecution } from "../plugins/execution-broker.js";
 import {
   assembleLegacyWidgetReservations,
@@ -124,6 +129,7 @@ interface VoiceWorkspace {
   mode: "voice";
   generative_ui_mode?: GenerativeUiMode;
   generative_ui_shadow_released?: boolean;
+  generative_ui_canonical_pending?: VoiceCanonicalProjectionPatch;
   project_id?: string | null;
   project_workspace_path?: string | null;
   voice_assets_dir?: string | null;
@@ -751,16 +757,21 @@ function saveWorkspace(workspace: VoiceWorkspace): VoiceWorkspace {
   workspace.updated_at = now();
   sanitizeLegacyProgrammaticWidgets(workspace);
 
-  // Legacy remains authoritative: commit it before any non-authoritative
-  // shadow state can advance. A failed legacy write therefore cannot create a
-  // phantom Generative UI revision.
+  // The legacy workspace is always retained, including in prefer mode where
+  // it is the fallback whenever no canonical projection exists.
   persistWorkspace(workspace);
   const previousDebugId = workspace.debug_events.at(-1)?.id;
+  const hadCanonicalPending = Boolean(workspace.generative_ui_canonical_pending);
   reconcileGenerativeUiShadow(workspace);
-  if (workspace.debug_events.at(-1)?.id !== previousDebugId) {
+  reconcileGenerativeUiCanonical(workspace);
+  if (
+    workspace.debug_events.at(-1)?.id !== previousDebugId
+    || (hadCanonicalPending && !workspace.generative_ui_canonical_pending)
+  ) {
     try {
-      // Best-effort persistence for shadow diagnostics only. The authoritative
-      // workspace is already committed, so this failure must not fail the turn.
+      // Persist diagnostics and clear a canonical patch only after the
+      // canonical transaction succeeds. A crash before this write safely
+      // replays the same semantic patch on the next save.
       persistWorkspace(workspace);
     } catch {
       // Keep the diagnostic in the current response; a later save may persist it.
@@ -987,6 +998,42 @@ function applyTaskDraftPatch(workspace: VoiceWorkspace, raw: unknown, fallbackTe
   return true;
 }
 
+function queueCanonicalNodeUpsert(workspace: VoiceWorkspace, node: GenerativeUiNodeV1): void {
+  if (!effectiveGenerativeUiPreferEnabled(workspace)) return;
+  const scope = { type: "voice_session", id: workspace.session_id } as const;
+  const baseRevision = persistentGenerativeUiDocumentService
+    .findActiveForScope(scope, "canonical")?.revision ?? 0;
+  if (workspace.generative_ui_canonical_pending?.base_revision !== baseRevision) {
+    workspace.generative_ui_canonical_pending = {
+      base_revision: baseRevision,
+      upsert: [],
+      remove_ids: [],
+    };
+  }
+  const pending = workspace.generative_ui_canonical_pending;
+  const existing = pending.upsert.findIndex((candidate) => candidate.id === node.id);
+  if (existing >= 0) pending.upsert[existing] = structuredClone(node);
+  else pending.upsert.push(structuredClone(node));
+  pending.remove_ids = pending.remove_ids.filter((nodeId) => nodeId !== node.id);
+}
+
+function queueCanonicalNodeRemoval(workspace: VoiceWorkspace, nodeId: string): void {
+  if (!effectiveGenerativeUiPreferEnabled(workspace)) return;
+  const scope = { type: "voice_session", id: workspace.session_id } as const;
+  const baseRevision = persistentGenerativeUiDocumentService
+    .findActiveForScope(scope, "canonical")?.revision ?? 0;
+  if (workspace.generative_ui_canonical_pending?.base_revision !== baseRevision) {
+    workspace.generative_ui_canonical_pending = {
+      base_revision: baseRevision,
+      upsert: [],
+      remove_ids: [],
+    };
+  }
+  const pending = workspace.generative_ui_canonical_pending;
+  pending.upsert = pending.upsert.filter((node) => node.id !== nodeId);
+  if (!pending.remove_ids.includes(nodeId)) pending.remove_ids.push(nodeId);
+}
+
 function applyVoiceSurfaceFromResult(
   workspace: VoiceWorkspace,
   result: Record<string, unknown>,
@@ -1010,12 +1057,12 @@ function applyVoiceSurfaceFromResult(
 
   const rawPluginProjections = Array.isArray(surface?.plugin_projections) ? surface.plugin_projections : [];
   const acceptedPluginProjections: Array<{ node: GenerativeUiNodeV1; legacyWidget: VoiceWidget | null }> = [];
-  const pluginProjectionCommitEnabled = effectiveGenerativeUiShadowEnabled(workspace);
+  const pluginProjectionCommitEnabled = effectiveGenerativeUiMode(workspace) !== "off";
   if (rawPluginProjections.length && !pluginProjectionCommitEnabled) {
     appendDebugEvent(
       workspace,
       "plugin_projection_mode_rejected",
-      "Plugin projections cannot commit while Generative UI shadow mode is off",
+      "Plugin projections cannot commit while Generative UI mode is off",
       "warning",
     );
   }
@@ -1082,7 +1129,7 @@ function applyVoiceSurfaceFromResult(
     : (Array.isArray(result.widgets) ? result.widgets : []);
   let pluginPolicyCatalog: { legacy_widget_reservations: ReturnType<typeof assembleLegacyWidgetReservations> } | undefined;
   let pluginPolicyUnavailable = false;
-  if (rawWidgets.length && effectiveGenerativeUiShadowEnabled(workspace)) {
+  if (rawWidgets.length && effectiveGenerativeUiMode(workspace) !== "off") {
     try {
       pluginPolicyCatalog = { legacy_widget_reservations: assembleLegacyWidgetReservations() };
     } catch (cause) {
@@ -1130,6 +1177,7 @@ function applyVoiceSurfaceFromResult(
     const existing = nodes.findIndex((candidate) => candidate.id === accepted.node.id);
     if (existing >= 0) nodes[existing] = accepted.node;
     else nodes.push(accepted.node);
+    queueCanonicalNodeUpsert(workspace, accepted.node);
     changed = true;
   }
 
@@ -1139,9 +1187,11 @@ function applyVoiceSurfaceFromResult(
   ].map((item) => String(item || "").trim()).filter(Boolean);
   for (const id of removeIds) {
     removeWidget(workspace, id);
+    const removedPluginNode = Boolean(workspace.plugin_nodes?.some((node) => node.id === id));
     if (workspace.plugin_nodes) {
       workspace.plugin_nodes = workspace.plugin_nodes.filter((node) => node.id !== id);
     }
+    if (removedPluginNode) queueCanonicalNodeRemoval(workspace, id);
     changed = true;
   }
   return changed;
@@ -1217,17 +1267,26 @@ function reactivateGenerativeUiShadowIfReleased(workspace: VoiceWorkspace): void
   }
 }
 
-function effectiveGenerativeUiShadowEnabled(workspace: VoiceWorkspace): boolean {
-  if (workspace.generative_ui_mode !== "shadow" || workspace.generative_ui_shadow_released) return false;
+function effectiveGenerativeUiMode(workspace: VoiceWorkspace): GenerativeUiMode {
   try {
     const globalMode = resolveConfiguredGenerativeUiModeDetails(
       readManagerAgentConfig().generative_ui_mode,
     ).effective_mode;
-    return resolveSessionGenerativeUiMode(workspace.generative_ui_mode, globalMode) === "shadow";
+    return resolveSessionGenerativeUiMode(workspace.generative_ui_mode, globalMode);
   } catch {
     // A broken or emergency-off global setting must preserve the legacy path.
-    return false;
+    return "off";
   }
+}
+
+function effectiveGenerativeUiShadowEnabled(workspace: VoiceWorkspace): boolean {
+  if (workspace.generative_ui_mode !== "shadow" || workspace.generative_ui_shadow_released) return false;
+  return effectiveGenerativeUiMode(workspace) === "shadow";
+}
+
+function effectiveGenerativeUiPreferEnabled(workspace: VoiceWorkspace): boolean {
+  return workspace.generative_ui_mode === "prefer"
+    && effectiveGenerativeUiMode(workspace) === "prefer";
 }
 
 function reconcileGenerativeUiShadow(workspace: VoiceWorkspace): void {
@@ -1253,6 +1312,34 @@ function reconcileGenerativeUiShadow(workspace: VoiceWorkspace): void {
       workspace,
       "generative_ui_shadow_error",
       `status=error revision=${snapshot.document_revision} widgets=${snapshot.legacy_widget_count} code=${snapshot.error_code} fingerprint=${snapshot.error_hash}`,
+      "warning",
+    );
+  }
+}
+
+function reconcileGenerativeUiCanonical(workspace: VoiceWorkspace): void {
+  const pending = workspace.generative_ui_canonical_pending;
+  if (!pending || !effectiveGenerativeUiPreferEnabled(workspace)) return;
+  try {
+    applyVoiceCanonicalProjectionPatch({
+      session_id: workspace.session_id,
+      patch: pending,
+      created_at: workspace.updated_at,
+    });
+    delete workspace.generative_ui_canonical_pending;
+  } catch (cause) {
+    if (cause instanceof VoiceCanonicalProjectionConflictError) {
+      // The canonical head advanced after this Tool result was accepted (for
+      // example, an Action committed first). Never replay stale Tool output on
+      // the new head; a later Tool result must bind a fresh revision.
+      delete workspace.generative_ui_canonical_pending;
+    }
+    appendDebugEvent(
+      workspace,
+      cause instanceof VoiceCanonicalProjectionConflictError
+        ? "generative_ui_canonical_stale"
+        : "generative_ui_canonical_error",
+      cause instanceof Error ? cause.message : String(cause),
       "warning",
     );
   }
@@ -1313,6 +1400,20 @@ function confirmedTaskMessage(workspace: VoiceWorkspace, fallbackText = ""): str
   return sections.join("\n");
 }
 
+function voicePluginRoutingInputs(workspace: VoiceWorkspace, message: string): Record<string, unknown> {
+  const title = workspace.task_draft?.title ?? workspace.session_title ?? shortText(message, 80);
+  return {
+    message,
+    text: message,
+    ...(title ? { title } : {}),
+    ...(workspace.task_draft?.request ? { request: workspace.task_draft.request } : {}),
+    ...(workspace.task_draft?.acceptance.length ? { acceptance: workspace.task_draft.acceptance } : {}),
+    ...(workspace.task_draft?.constraints.length ? { constraints: workspace.task_draft.constraints } : {}),
+    ...(workspace.session_slate ? { session_slate: workspace.session_slate } : {}),
+    ...(workspace.active_objective ? { active_objective: workspace.active_objective } : {}),
+  };
+}
+
 function managerAgentHistory(workspace: VoiceWorkspace): Array<{ role: string; content: string; timestamp?: string }> {
   return (workspace.conversation ?? []).slice(-24).map((item) => ({
     role: item.role,
@@ -1366,9 +1467,13 @@ async function submitVoiceWorkspaceToManagerAgent(
   let pluginContext: HomerailPluginTurnContextV1;
   try {
     const voiceUiRules = ensureWorkspaceVoiceUiRules(workspace);
-    pluginContext = assemblePluginTurnContext(undefined, {
+    const generativeUiMode = effectiveGenerativeUiMode(workspace);
+    const pluginRoutingSource = assemblePluginTurnContext(undefined, {
       modality: "voice",
-      legacy_compatibility_mode: !effectiveGenerativeUiShadowEnabled(workspace),
+      legacy_compatibility_mode: !(
+        effectiveGenerativeUiShadowEnabled(workspace)
+        || effectiveGenerativeUiPreferEnabled(workspace)
+      ),
     });
     const turnInput: RunManagerAgentTurnInput = {
       message,
@@ -1377,10 +1482,14 @@ async function submitVoiceWorkspaceToManagerAgent(
       voice_session_id: workspace.session_id,
       continue_chat: true,
       response_mode: "voice",
+      generative_ui_mode: generativeUiMode,
       history: managerAgentHistory(workspace),
       agent_config: agentConfig,
       voice_ui_rules: voiceUiRules,
-      plugin_context: pluginContext,
+      plugin_routing: {
+        inputs: voicePluginRoutingInputs(workspace, message),
+        source_context: pluginRoutingSource,
+      },
     };
     if (realtimeHooks?.onSpeech) {
       let streamResult: Awaited<ReturnType<typeof runManagerAgentTurn>> | undefined;
@@ -1397,9 +1506,11 @@ async function submitVoiceWorkspaceToManagerAgent(
       }
       if (!streamResult) throw new Error("Manager Agent stream completed without a result");
       result = streamResult.result;
+      pluginContext = streamResult.plugin_context;
     } else {
       const turn = await runManagerAgentTurn(turnInput, options);
       result = turn.result;
+      pluginContext = turn.plugin_context;
     }
   } catch (err) {
     if (err instanceof ManagerAgentRuntimeError) {

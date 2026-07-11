@@ -16,5 +16,6 @@ export * from "./manager-agent.js";
 export * from "./manager-agent-tools.js";
 export * from "./manager-agent-widget-tools.js";
 export * from "./manager-agent-prompt.js";
+export * from "./manager-agent-turn-envelope.js";
 export * from "./generative-ui/index.js";
 export * from "./plugins/index.js";

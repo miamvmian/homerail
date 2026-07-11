@@ -3,7 +3,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createAgentClient } from "../agent/factory.js";
+import { sanitizedAgentChildEnv } from "../agent/child-env.js";
+import {
+  ManagerAgentTurnAuthenticationError,
+  ManagerAgentTurnEnvelopeVerifier,
+} from "./turn-envelope.js";
 import type { AgentEvent, AgentRunContext, DagToolDefinition } from "../agent/types.js";
 import {
   buildManagerAgentSystemPrompt,
@@ -24,6 +30,8 @@ import {
   type ManagerAgentPromptSkill,
   type HomerailPluginTurnContextV1,
   type HomerailPluginToolExecutionEnvelopeV1,
+  type ManagerAgentTurnEnvelopeV1,
+  HOMERAIL_MANAGER_TURN_HEADER,
 } from "homerail-protocol";
 
 interface ManagerAgentConfig {
@@ -42,8 +50,10 @@ interface ChatRequest {
   message?: string;
   project_id?: string;
   session_id?: string;
+  voice_session_id?: string;
   continue_chat?: boolean;
   response_mode?: "chat" | "voice";
+  generative_ui_mode?: "off" | "shadow" | "prefer";
   required_tool_calls?: string[];
   history?: Array<{ role?: string; content?: string; timestamp?: string }>;
   agent_config?: ManagerAgentConfig;
@@ -51,6 +61,9 @@ interface ChatRequest {
   voice_system_contract?: { prompt?: string; source?: string };
   manager_skills?: ManagerAgentPromptSkill[];
   plugin_context?: HomerailPluginTurnContextV1;
+  plugin_tool_turn_token?: string;
+  turn_envelope?: unknown;
+  manager_api_scopes?: string[];
 }
 
 interface ChatSession {
@@ -72,6 +85,40 @@ interface ToolResultTrace {
   is_error?: boolean;
 }
 
+function stablePluginModelCallIdentifiers(input: {
+  turn_token: string;
+  tool_wire_id: string;
+  arguments: Record<string, unknown>;
+  model_tool_call_id?: string;
+}): { request_id: string; call_id: string } {
+  const hash = createHash("sha256");
+  hash.update("homerail.plugin.model-tool-call.v1\0");
+  hash.update(createHash("sha256").update(input.turn_token).digest());
+  hash.update("\0");
+  hash.update(input.tool_wire_id);
+  hash.update("\0");
+  const rawCallId = input.model_tool_call_id?.trim();
+  if (rawCallId) {
+    if (Buffer.byteLength(rawCallId, "utf8") > 1024 || /[\u0000-\u001f\u007f]/.test(rawCallId)) {
+      throw new Error("Model Tool call id is invalid");
+    }
+    hash.update("model\0");
+    hash.update(rawCallId);
+  } else {
+    hash.update("semantic\0");
+    const analyzed = analyzeGenerativeUiJsonValue(input.arguments, {
+      limits: { max_bytes: 64 * 1024 },
+      on_token: (chunk) => hash.update(chunk),
+    });
+    if (!analyzed.valid) throw new Error("Plugin Tool arguments cannot form a stable model call identity");
+  }
+  const digest = hash.digest("hex");
+  return {
+    request_id: `tool_${digest}`,
+    call_id: `call_${createHash("sha256").update(rawCallId ?? digest).digest("hex")}`,
+  };
+}
+
 interface VoiceSurfaceState {
   commentaryTexts: string[];
   progress: Record<string, unknown> | null;
@@ -82,6 +129,7 @@ interface VoiceSurfaceState {
 }
 
 const sessions = new Map<string, ChatSession>();
+const activeManagerTurn = new AsyncLocalStorage<ManagerAgentTurnEnvelopeV1>();
 
 class ManagerAgentTurnTimeoutError extends Error {
   readonly statusCode = 504;
@@ -191,24 +239,63 @@ function managerAgentShell(): { command: string; argsPrefix: string[] } {
 
 async function requestManager(pathname: string, init?: RequestInit): Promise<unknown> {
   const url = `${managerRestUrl()}${pathname.startsWith("/") ? pathname : `/${pathname}`}`;
-  const res = await fetch(url, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
-  });
-  const text = await res.text();
-  let body: unknown = text;
+  const envelope = activeManagerTurn.getStore();
+  const credential = envelope
+    ? Buffer.from(JSON.stringify(envelope), "utf8").toString("base64url")
+    : undefined;
+  const headers = managerRequestHeaders(url, init, credential);
   try {
-    body = text ? JSON.parse(text) : {};
-  } catch {
-    body = { raw: text };
+    const res = await fetch(url, { ...init, headers });
+    const text = await res.text();
+    let body: unknown = text;
+    try {
+      body = text ? JSON.parse(text) : {};
+    } catch {
+      body = { raw: text };
+    }
+    if (!res.ok) {
+      throw new Error(`Manager API ${res.status}: ${short(body, 800)}`);
+    }
+    return body;
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    const error = new Error(redactManagerCredential(message, credential));
+    if (cause instanceof Error) error.name = cause.name;
+    throw error;
   }
-  if (!res.ok) {
-    throw new Error(`Manager API ${res.status}: ${short(body, 800)}`);
-  }
-  return body;
+}
+
+export function _requestManagerForTest(pathname: string, init?: RequestInit): Promise<unknown> {
+  return requestManager(pathname, init);
+}
+
+export function _withManagerTurnEnvelopeForTest<T>(
+  envelope: ManagerAgentTurnEnvelopeV1,
+  callback: () => T,
+): T {
+  return activeManagerTurn.run(envelope, callback);
+}
+
+function managerRequestHeaders(url: string, init: RequestInit | undefined, credential: string | undefined): Headers {
+  const headers = new Headers(init?.headers);
+  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  headers.delete("Authorization");
+  headers.delete(HOMERAIL_MANAGER_TURN_HEADER);
+  const method = (init?.method || "GET").toUpperCase();
+  const pathname = new URL(url).pathname;
+  if (
+    credential
+    && ["POST", "PUT", "PATCH", "DELETE"].includes(method)
+    && (pathname === "/api" || pathname.startsWith("/api/"))
+  ) headers.set(HOMERAIL_MANAGER_TURN_HEADER, credential);
+  return headers;
+}
+
+function redactManagerCredential(message: string, credential: string | undefined): string {
+  let redacted = credential ? message.split(credential).join("***REDACTED***") : message;
+  redacted = redacted.replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1***REDACTED***");
+  redacted = redacted.replace(/(credential=)[A-Za-z0-9_-]{32,}/gi, "$1***REDACTED***");
+  return redacted;
 }
 
 function execReadonly(command: string, cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
@@ -219,7 +306,7 @@ function execReadonly(command: string, cwd: string): Promise<{ exitCode: number;
       timeout: 20_000,
       maxBuffer: 1024 * 1024,
       encoding: "utf-8",
-      env: process.env,
+      env: sanitizedAgentChildEnv(),
       windowsHide: true,
     }, (err, stdout, stderr) => {
       const code = typeof (err as NodeJS.ErrnoException | null)?.code === "number"
@@ -348,7 +435,7 @@ export function createManagerTools(state: {
   finalNotes: string[];
   objectiveToolCalls: Array<{ name: string; success: boolean; error?: string; inferred?: boolean }>;
   voiceSurface: VoiceSurfaceState;
-}, responseMode: "chat" | "voice", pluginContext?: HomerailPluginTurnContextV1): DagToolDefinition[] {
+}, responseMode: "chat" | "voice", pluginContext?: HomerailPluginTurnContextV1, pluginToolTurnToken?: string): DagToolDefinition[] {
   if (pluginContext && (
     !validateHomerailPluginTurnContext(pluginContext).valid
     || pluginContextDigest(pluginContext) !== pluginContext.context_digest
@@ -738,10 +825,30 @@ export function createManagerTools(state: {
       name: descriptor.wire_id,
       description: descriptor.description,
       input_schema: structuredClone(descriptor.input_schema),
-      async handler(args) {
-        const envelope = executeHomerailPluginTool(descriptor, args);
-        state.voiceSurface.pluginProjections.push(envelope);
-        return { content: [{ type: "text", text: JSON.stringify(envelope) }] };
+      async handler(args, context) {
+        if (!pluginToolTurnToken) {
+          const envelope = executeHomerailPluginTool(descriptor, args);
+          state.voiceSurface.pluginProjections.push(envelope);
+          return { content: [{ type: "text", text: JSON.stringify(envelope) }] };
+        }
+        const identity = stablePluginModelCallIdentifiers({
+          turn_token: pluginToolTurnToken,
+          tool_wire_id: descriptor.wire_id,
+          arguments: args,
+          ...(context?.tool_call_id ? { model_tool_call_id: context.tool_call_id } : {}),
+        });
+        const result = await requestManager("/plugins/tools/invoke", {
+          method: "POST",
+          body: JSON.stringify({
+            request_id: identity.request_id,
+            idempotency_key: identity.request_id,
+            turn_token: pluginToolTurnToken,
+            tool_wire_id: descriptor.wire_id,
+            call_id: identity.call_id,
+            arguments: args,
+          }),
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
       },
     });
   }
@@ -850,7 +957,7 @@ async function handleChat(body: ChatRequest): Promise<Record<string, unknown>> {
       throw new Error("Plugin Context failed validation or digest verification");
     }
   }
-  const tools = createManagerTools(state, responseMode, pluginContext);
+  const tools = createManagerTools(state, responseMode, pluginContext, body.plugin_tool_turn_token);
   const agent = createAgentClient(normalizeBackend(body.agent_config?.agent_type));
   const config = body.agent_config ?? {};
   const model = String(config.model || config.model_name || "");
@@ -981,6 +1088,7 @@ async function handleChat(body: ChatRequest): Promise<Record<string, unknown>> {
 }
 
 export function startManagerAgentServer(port = Number(process.env.MANAGER_AGENT_PORT || "9001")): http.Server {
+  const turnVerifier = new ManagerAgentTurnEnvelopeVerifier();
   const server = http.createServer((req, res) => {
     const url = new URL(req.url || "/", "http://localhost");
     if (req.method === "GET" && url.pathname === "/health") {
@@ -995,9 +1103,21 @@ export function startManagerAgentServer(port = Number(process.env.MANAGER_AGENT_
     }
     if (req.method === "POST" && url.pathname === "/chat") {
       readJsonBody(req)
-        .then((body) => handleChat(body as ChatRequest))
+        .then((body) => {
+          if (!body || typeof body !== "object" || Array.isArray(body)) {
+            throw new ManagerAgentTurnAuthenticationError("Manager Agent chat payload must be an object");
+          }
+          const envelope = turnVerifier.authenticate(body as Record<string, unknown>);
+          return envelope
+            ? activeManagerTurn.run(envelope, () => handleChat(body as ChatRequest))
+            : handleChat(body as ChatRequest);
+        })
         .then((result) => json(res, 200, result))
         .catch((err) => {
+          if (err instanceof ManagerAgentTurnAuthenticationError) {
+            json(res, err.statusCode, { error: err.message });
+            return;
+          }
           if (err instanceof ManagerAgentTurnTimeoutError) {
             json(res, err.statusCode, { error: err.message, data: err.data });
             return;

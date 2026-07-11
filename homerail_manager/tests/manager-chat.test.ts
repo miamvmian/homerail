@@ -244,7 +244,15 @@ describe("/api/manager/chat", () => {
         manager_skills: expect.arrayContaining([
           expect.objectContaining({ id: "homerail-dag-patterns", source: "home" }),
         ]),
+        plugin_context: {
+          enabled_plugins: [],
+          skills: [],
+          tools: [],
+          actions: [],
+        },
       });
+      expect((observedChatBodies[0].manager_skills as Array<{ source?: string }>)
+        .filter((skill) => skill.source === "plugin")).toEqual([]);
       expect(fakeNode.requests.map((item) => `${item.resource_type}:${item.operation}`)).toEqual([
         "container:list",
         "container:create",
@@ -983,10 +991,12 @@ describe("/api/manager/chat", () => {
     let seenMessage = "";
     let seenAgentType = "";
     let seenSkills: Array<{ id: string; source?: string }> = [];
+    let seenPluginContext: { enabled_plugins: unknown[]; skills: unknown[]; tools: unknown[]; actions: unknown[] } | undefined;
     _setHostCodexManagerAgentRunnerForTest(async (input) => {
       seenMessage = input.message;
       seenAgentType = input.agent_config.agent_type;
       seenSkills = input.manager_skills ?? [];
+      seenPluginContext = input.plugin_context;
       return {
         text: "host codex handled",
         session_id: input.session_id,
@@ -1038,6 +1048,13 @@ describe("/api/manager/chat", () => {
       id: "homerail-dag-patterns",
       source: "home",
     }));
+    expect(seenSkills.filter((skill) => skill.source === "plugin")).toEqual([]);
+    expect(seenPluginContext).toMatchObject({
+      enabled_plugins: [],
+      skills: [],
+      tools: [],
+      actions: [],
+    });
   });
 
   it("normalizes container-only manager URLs for host Codex tools", () => {

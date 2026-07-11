@@ -3,7 +3,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { HomeRailClient } from "../src/client.js";
-import { configuredManagerPort } from "../src/local-config.js";
+import {
+  HOMERAIL_MANAGER_ADMIN_TOKEN,
+  configuredManagerPort,
+  getSecretsPath,
+  saveLocalSecret,
+} from "../src/local-config.js";
 
 // Save and restore env
 const origEnv = { ...process.env };
@@ -17,6 +22,7 @@ beforeEach(() => {
   delete process.env.HOMERAIL_SECRETS_PATH;
   delete process.env.HOMERAIL_MANAGER_URL;
   delete process.env.HOMERAIL_MANAGER_PORT;
+  delete process.env[HOMERAIL_MANAGER_ADMIN_TOKEN];
 });
 
 afterEach(() => {
@@ -180,6 +186,108 @@ describe("HomeRailClient.post", () => {
       }),
     );
     expect(result).toEqual({ success: true, message: "resumed", data: { dispatched: 1 } });
+  });
+});
+
+describe("HomeRailClient Manager admin token", () => {
+  it("injects an environment token into every /api mutation and nowhere else", async () => {
+    const token = "cli-env-admin-token-0123456789abcdef";
+    process.env[HOMERAIL_MANAGER_ADMIN_TOKEN] = token;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true }),
+    } as unknown as Response);
+    const client = new HomeRailClient({ baseUrl: "http://test:1234" });
+
+    await client.put("/api/plugins/com.example.demo/enabled", { enabled: true });
+    await client.get("/api/plugins");
+    await client.post("/api/runs", {});
+    await client.patch("/api/future-route", {});
+    await client.post("/health", {});
+
+    expect(fetchSpy.mock.calls[0][1]?.headers).toEqual(expect.objectContaining({
+      Authorization: `Bearer ${token}`,
+    }));
+    expect(fetchSpy.mock.calls[1][1]?.headers).not.toEqual(expect.objectContaining({
+      Authorization: expect.anything(),
+    }));
+    expect(fetchSpy.mock.calls[2][1]?.headers).toEqual(expect.objectContaining({
+      Authorization: `Bearer ${token}`,
+    }));
+    expect(fetchSpy.mock.calls[3][1]?.headers).toEqual(expect.objectContaining({
+      Authorization: `Bearer ${token}`,
+    }));
+    expect(fetchSpy.mock.calls[4][1]?.headers).not.toEqual(expect.objectContaining({
+      Authorization: expect.anything(),
+    }));
+  });
+
+  it("loads the token from the private local secrets file", async () => {
+    const token = "cli-local-admin-token-0123456789abcdef";
+    saveLocalSecret(HOMERAIL_MANAGER_ADMIN_TOKEN, token);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true }),
+    } as unknown as Response);
+
+    await new HomeRailClient({ baseUrl: "http://test:1234" })
+      .delete("/api/not-yet-registered", {});
+
+    expect(fetchSpy.mock.calls[0][1]?.headers).toEqual(expect.objectContaining({
+      Authorization: `Bearer ${token}`,
+    }));
+    if (process.platform !== "win32") {
+      expect(fs.statSync(getSecretsPath()).mode & 0o077).toBe(0);
+    }
+  });
+
+  it("keeps process environment precedence over the private secrets file", async () => {
+    saveLocalSecret(HOMERAIL_MANAGER_ADMIN_TOKEN, "secret-admin-token-0123456789abcdef");
+    const environmentToken = "environment-admin-token-0123456789abcdef";
+    process.env[HOMERAIL_MANAGER_ADMIN_TOKEN] = environmentToken;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true }),
+    } as unknown as Response);
+
+    await new HomeRailClient({ baseUrl: "http://test:1234" }).post("/api/runs", {});
+    expect(fetchSpy.mock.calls[0][1]?.headers).toEqual(expect.objectContaining({
+      Authorization: `Bearer ${environmentToken}`,
+    }));
+  });
+
+  it("refuses an insecure local secrets file", () => {
+    saveLocalSecret(HOMERAIL_MANAGER_ADMIN_TOKEN, "cli-local-admin-token-0123456789abcdef");
+    if (process.platform === "win32") return;
+    fs.chmodSync(getSecretsPath(), 0o644);
+    expect(() => new HomeRailClient()).toThrow("group/world-accessible");
+  });
+
+  it.runIf(process.platform !== "win32")("refuses a symlinked local secrets file", () => {
+    saveLocalSecret(HOMERAIL_MANAGER_ADMIN_TOKEN, "cli-local-admin-token-0123456789abcdef");
+    const original = `${getSecretsPath()}.original`;
+    fs.renameSync(getSecretsPath(), original);
+    fs.symlinkSync(original, getSecretsPath());
+    expect(() => new HomeRailClient()).toThrow("non-regular secrets file");
+  });
+
+  it("redacts the credential from Manager and transport errors", async () => {
+    const token = "cli-redaction-token-0123456789abcdef";
+    process.env[HOMERAIL_MANAGER_ADMIN_TOKEN] = token;
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      status: 401,
+      json: async () => ({ error: `bad Bearer ${token}` }),
+    } as unknown as Response);
+
+    let message = "";
+    try {
+      await new HomeRailClient().post("/api/runs", {});
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : String(cause);
+    }
+    expect(message).toContain("REDACTED");
+    expect(message).not.toContain(token);
   });
 });
 

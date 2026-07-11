@@ -1,4 +1,11 @@
-import { createHash } from "node:crypto";
+import {
+  createHash,
+  createPublicKey,
+  KeyObject,
+  sign as signMessage,
+  verify as verifyMessage,
+  type KeyLike,
+} from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { decodeHomerailPluginUtf8 } from "homerail-protocol";
@@ -32,6 +39,35 @@ export interface HrpLockFileV1 {
   files: Array<{ path: string; size: number; sha256: string }>;
 }
 
+/**
+ * Detached publisher statement. The signature file is intentionally not part
+ * of the payload lock: it signs the immutable lock identity and can therefore
+ * be added without a digest cycle or installation-time code execution.
+ */
+export interface HrpSignatureFileV1 {
+  signature_version: 1;
+  algorithm: "Ed25519";
+  publisher: string;
+  key_id: string;
+  public_key_spki: string;
+  payload_digest: string;
+  signature: string;
+}
+
+export interface HrpPublisherTrustEntry {
+  publisher: string;
+  key_id: string;
+  public_key_spki: string;
+  state: "trusted" | "revoked";
+}
+
+export type HrpSignatureTrustState = "unsigned" | "verified" | "untrusted" | "revoked";
+
+export interface VerifiedHrpSignature {
+  statement: HrpSignatureFileV1;
+  trust_state: Exclude<HrpSignatureTrustState, "unsigned">;
+}
+
 export interface HrpSourceFile {
   path: string;
   content: Buffer;
@@ -41,6 +77,8 @@ export interface VerifiedHrpArchive {
   archive_digest: string;
   lock: HrpLockFileV1;
   files: ReadonlyMap<string, Buffer>;
+  signature?: VerifiedHrpSignature;
+  signature_state: HrpSignatureTrustState;
 }
 
 const ZIP_LOCAL_FILE = 0x04034b50;
@@ -52,6 +90,8 @@ const ZIP_UNIX_VERSION = (3 << 8) | ZIP_VERSION;
 const ZIP_DOS_DATE_1980_01_01 = 0x0021;
 const PORTABLE_SEGMENT = /^[A-Za-z0-9._-]+$/;
 const SHA256 = /^[a-f0-9]{64}$/;
+const SIGNATURE_KEY_ID = /^sha256:[a-f0-9]{64}$/;
+const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const WINDOWS_DEVICE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 /** Common filesystems cap a single filename component at 255 bytes/code units. */
 export const MAX_HRP_SEGMENT_UTF8_BYTES = 255;
@@ -95,6 +135,156 @@ function canonicalJson(value: unknown): string {
 
 export function canonicalHrpJsonBytes(value: unknown): Buffer {
   return Buffer.from(`${canonicalJson(value)}\n`, "utf8");
+}
+
+function assertPublisher(value: string): string {
+  if (
+    typeof value !== "string"
+    || !value
+    || value.length > 128
+    || value !== value.normalize("NFC")
+    || /[\u0000-\u001f\u007f]/.test(value)
+  ) throw new Error("HRP signature publisher must be 1-128 safe NFC characters");
+  return value;
+}
+
+function decodeBase64Url(value: string, label: string, expectedBytes?: number): Buffer {
+  if (typeof value !== "string" || !BASE64URL.test(value)) {
+    throw new Error(`HRP signature ${label} must be unpadded base64url`);
+  }
+  const decoded = Buffer.from(value, "base64url");
+  if (decoded.toString("base64url") !== value || (expectedBytes !== undefined && decoded.byteLength !== expectedBytes)) {
+    throw new Error(`HRP signature ${label} has an invalid encoding or size`);
+  }
+  return decoded;
+}
+
+function signatureKeyId(publicKeySpki: Buffer): string {
+  return `sha256:${sha256(publicKeySpki)}`;
+}
+
+export function canonicalHrpSignatureMessage(lock: HrpLockFileV1): Buffer {
+  return canonicalHrpJsonBytes({
+    context: "homerail.hrp.signature.v1",
+    lock_version: lock.lock_version,
+    plugin: lock.plugin,
+    payload_digest: lock.payload_digest,
+  });
+}
+
+function parseHrpSignature(content: Buffer, lock: HrpLockFileV1): {
+  statement: HrpSignatureFileV1;
+  publicKeySpki: Buffer;
+  signature: Buffer;
+} {
+  let value: unknown;
+  try {
+    value = JSON.parse(decodeHomerailPluginUtf8(content, HRP_SIGNATURE_FILE));
+  } catch (cause) {
+    throw new Error(`Invalid ${HRP_SIGNATURE_FILE}: ${cause instanceof Error ? cause.message : String(cause)}`);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Invalid ${HRP_SIGNATURE_FILE}`);
+  }
+  const raw = value as Record<string, unknown>;
+  if (
+    Object.keys(raw).sort().join(",")
+      !== "algorithm,key_id,payload_digest,public_key_spki,publisher,signature,signature_version"
+    || raw.signature_version !== 1
+    || raw.algorithm !== "Ed25519"
+    || typeof raw.publisher !== "string"
+    || typeof raw.key_id !== "string"
+    || !SIGNATURE_KEY_ID.test(raw.key_id)
+    || typeof raw.public_key_spki !== "string"
+    || typeof raw.payload_digest !== "string"
+    || !SHA256.test(raw.payload_digest)
+    || typeof raw.signature !== "string"
+  ) throw new Error(`Unsupported or malformed ${HRP_SIGNATURE_FILE}`);
+  const statement: HrpSignatureFileV1 = {
+    signature_version: 1,
+    algorithm: "Ed25519",
+    publisher: assertPublisher(raw.publisher),
+    key_id: raw.key_id,
+    public_key_spki: raw.public_key_spki,
+    payload_digest: raw.payload_digest,
+    signature: raw.signature,
+  };
+  if (!content.equals(canonicalHrpJsonBytes(statement))) {
+    throw new Error(`${HRP_SIGNATURE_FILE} must use canonical JSON bytes`);
+  }
+  if (statement.payload_digest !== lock.payload_digest) {
+    throw new Error("HRP signature payload digest does not match its lock");
+  }
+  const publicKeySpki = decodeBase64Url(statement.public_key_spki, "public key");
+  if (publicKeySpki.byteLength < 32 || publicKeySpki.byteLength > 256) {
+    throw new Error("HRP signature public key is outside size limits");
+  }
+  if (signatureKeyId(publicKeySpki) !== statement.key_id) {
+    throw new Error("HRP signature key id does not match its public key");
+  }
+  const publicKey = createPublicKey({ key: publicKeySpki, format: "der", type: "spki" });
+  if (publicKey.asymmetricKeyType !== "ed25519") {
+    throw new Error("HRP signature public key must be Ed25519");
+  }
+  const signature = decodeBase64Url(statement.signature, "value", 64);
+  if (!verifyMessage(null, canonicalHrpSignatureMessage(lock), publicKey, signature)) {
+    throw new Error("HRP publisher signature is invalid");
+  }
+  return { statement, publicKeySpki, signature };
+}
+
+function resolveSignatureTrust(
+  statement: HrpSignatureFileV1,
+  trustStore: readonly HrpPublisherTrustEntry[],
+): Exclude<HrpSignatureTrustState, "unsigned"> {
+  const matches = trustStore.filter((entry) => entry.key_id === statement.key_id);
+  for (const entry of matches) {
+    const normalized = validateHrpPublisherTrustEntry(entry);
+    if (normalized.public_key_spki !== statement.public_key_spki) {
+      throw new Error("HRP publisher trust store contains a conflicting public key");
+    }
+  }
+  if (matches.some((entry) => entry.state === "revoked")) return "revoked";
+  if (matches.some((entry) => entry.state === "trusted" && entry.publisher === statement.publisher)) return "verified";
+  return "untrusted";
+}
+
+export function validateHrpPublisherTrustEntry(entry: HrpPublisherTrustEntry): HrpPublisherTrustEntry {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    throw new Error("Invalid HRP publisher trust entry");
+  }
+  if (!SIGNATURE_KEY_ID.test(entry.key_id)) throw new Error("Malformed HRP publisher trust entry key id");
+  if (entry.state !== "trusted" && entry.state !== "revoked") {
+    throw new Error("Malformed HRP publisher trust entry state");
+  }
+  const publicKeySpki = decodeBase64Url(entry.public_key_spki, "trust-store public key");
+  if (signatureKeyId(publicKeySpki) !== entry.key_id) throw new Error("HRP publisher trust entry key id mismatch");
+  const publicKey = createPublicKey({ key: publicKeySpki, format: "der", type: "spki" });
+  if (publicKey.asymmetricKeyType !== "ed25519") throw new Error("HRP publisher trust key must be Ed25519");
+  return {
+    publisher: assertPublisher(entry.publisher),
+    key_id: entry.key_id,
+    public_key_spki: entry.public_key_spki,
+    state: entry.state,
+  };
+}
+
+export function createHrpPublisherTrustEntry(options: {
+  publisher: string;
+  public_key: KeyLike;
+  state?: "trusted" | "revoked";
+}): HrpPublisherTrustEntry {
+  const publicKey = options.public_key instanceof KeyObject && options.public_key.type === "public"
+    ? options.public_key
+    : createPublicKey(options.public_key);
+  if (publicKey.asymmetricKeyType !== "ed25519") throw new Error("HRP publisher key must be Ed25519");
+  const publicKeySpki = publicKey.export({ format: "der", type: "spki" }) as Buffer;
+  return validateHrpPublisherTrustEntry({
+    publisher: assertPublisher(options.publisher),
+    key_id: signatureKeyId(publicKeySpki),
+    public_key_spki: publicKeySpki.toString("base64url"),
+    state: options.state ?? "trusted",
+  });
 }
 
 export function normalizeHrpPath(value: string): string {
@@ -286,6 +476,40 @@ export function buildHrpArchive(sourceFiles: readonly HrpSourceFile[]): {
   const lockContent = canonicalHrpJsonBytes(lock);
   const archive = encodeHrpZip([...files, { path: HRP_LOCK_FILE, content: lockContent }]);
   return { archive, lock, archive_digest: sha256(archive) };
+}
+
+export function buildSignedHrpArchive(
+  sourceFiles: readonly HrpSourceFile[],
+  options: { publisher: string; private_key: KeyLike },
+): {
+  archive: Buffer;
+  lock: HrpLockFileV1;
+  signature: HrpSignatureFileV1;
+  archive_digest: string;
+} {
+  const files = normalizedFiles(sourceFiles, DEFAULT_HRP_LIMITS);
+  const lock = createHrpLock(files);
+  const privateKey = options.private_key;
+  const publicKey = createPublicKey(privateKey);
+  if (publicKey.asymmetricKeyType !== "ed25519") {
+    throw new Error("HRP signing key must be Ed25519");
+  }
+  const publicKeySpki = publicKey.export({ format: "der", type: "spki" }) as Buffer;
+  const signature: HrpSignatureFileV1 = {
+    signature_version: 1,
+    algorithm: "Ed25519",
+    publisher: assertPublisher(options.publisher),
+    key_id: signatureKeyId(publicKeySpki),
+    public_key_spki: publicKeySpki.toString("base64url"),
+    payload_digest: lock.payload_digest,
+    signature: signMessage(null, canonicalHrpSignatureMessage(lock), privateKey).toString("base64url"),
+  };
+  const archive = encodeHrpZip([
+    ...files,
+    { path: HRP_LOCK_FILE, content: canonicalHrpJsonBytes(lock) },
+    { path: HRP_SIGNATURE_FILE, content: canonicalHrpJsonBytes(signature) },
+  ]);
+  return { archive, lock, signature, archive_digest: sha256(archive) };
 }
 
 function requireRange(buffer: Buffer, offset: number, length: number, label: string): void {
@@ -480,7 +704,11 @@ function parseLock(content: Buffer): HrpLockFileV1 {
 
 export function verifyHrpArchive(
   archive: Buffer,
-  options: { allow_signature?: boolean } = {},
+  options: {
+    allow_signature?: boolean;
+    trust_store?: readonly HrpPublisherTrustEntry[];
+    require_trusted_signature?: boolean;
+  } = {},
 ): VerifiedHrpArchive {
   const files = decodeHrpZip(archive);
   const lockContent = files.get(HRP_LOCK_FILE);
@@ -510,10 +738,23 @@ export function verifyHrpArchive(
       throw new Error(`HRP lock digest mismatch: ${entry.path}`);
     }
   }
+  let signature: VerifiedHrpSignature | undefined;
+  let signatureState: HrpSignatureTrustState = "unsigned";
+  const signatureContent = files.get(HRP_SIGNATURE_FILE);
+  if (signatureContent) {
+    const parsed = parseHrpSignature(signatureContent, lock);
+    signatureState = resolveSignatureTrust(parsed.statement, options.trust_store ?? []);
+    signature = { statement: parsed.statement, trust_state: signatureState };
+  }
+  if (options.require_trusted_signature && signatureState !== "verified") {
+    throw new Error(`HRP package requires a trusted publisher signature; received ${signatureState}`);
+  }
   return {
     archive_digest: sha256(archive),
     lock,
     files: new Map([...files.entries()].map(([filePath, content]) => [filePath, Buffer.from(content)])),
+    signature,
+    signature_state: signatureState,
   };
 }
 
@@ -539,4 +780,8 @@ export function extractVerifiedHrpArchive(verified: VerifiedHrpArchive, destinat
     fs.writeFileSync(target, content, { flag: "wx", mode: 0o600 });
   }
   fs.writeFileSync(path.join(root, HRP_LOCK_FILE), verified.files.get(HRP_LOCK_FILE)!, { flag: "wx", mode: 0o600 });
+  const signature = verified.files.get(HRP_SIGNATURE_FILE);
+  if (signature) {
+    fs.writeFileSync(path.join(root, HRP_SIGNATURE_FILE), signature, { flag: "wx", mode: 0o600 });
+  }
 }

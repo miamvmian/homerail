@@ -11,8 +11,11 @@ import type {
   GenerativeUiDensity,
   GenerativeUiSurface,
   GenerativeUiNodeV1,
+  GenerativeUiTransactionV1,
+  GenerativeUiDocumentScopeV1,
   GenerativeUiImportance,
   GenerativeUiPersistence,
+  GenerativeUiActionStyle,
 } from "../generative-ui/types.js";
 
 export const HOMERAIL_PLUGIN_MANIFEST_VERSION = 1 as const;
@@ -29,6 +32,17 @@ export type HomerailPluginManifestVersion = typeof HOMERAIL_PLUGIN_MANIFEST_VERS
 
 export const HOMERAIL_PLUGIN_API_VERSION = 1 as const;
 export const HOMERAIL_RENDERER_API_VERSION = 1 as const;
+export const HOMERAIL_ACTION_BUS_VERSION = 1 as const;
+export const HOMERAIL_TOOL_BUS_VERSION = 1 as const;
+export const HOMERAIL_RUNTIME_RPC_VERSION = 1 as const;
+/** Capability claims are deliberately short lived and single use. */
+export const HOMERAIL_ACTION_CAPABILITY_MAX_TTL_MS = 5 * 60 * 1000;
+export const HOMERAIL_ACTION_CONFIRMATION_MAX_TTL_MS = 10 * 60 * 1000;
+export const HOMERAIL_ACTION_REQUEST_MAX_TTL_MS = 15 * 60 * 1000;
+export const HOMERAIL_ACTION_ARGUMENT_MAX_BYTES = 32 * 1024;
+export const HOMERAIL_RUNTIME_DOMAIN_OUTPUT_MAX_BYTES = 256 * 1024;
+export const HOMERAIL_RUNTIME_LOG_MAX_ITEMS = 128;
+export const HOMERAIL_RUNTIME_ARTIFACT_MAX_ITEMS = 32;
 
 export const HomerailPluginModality = {
   VOICE: "voice",
@@ -183,6 +197,8 @@ export type HomerailPluginResolvedHandlerV1 =
 export interface HomerailPluginToolV1 {
   id: string;
   description: string;
+  /** Explicit callable surfaces; Action-only Tools never enter Agent catalogs. */
+  exposure: Array<"agent" | "action">;
   input_schema: string;
   output_schema?: string;
   effect: HomerailPluginEffect;
@@ -278,16 +294,21 @@ export type HomerailPluginResolvedRendererSourceV1 =
       digest: string;
       document: HomerailDeclarativeRendererV1;
     }
-  | { type: "custom"; file: string };
+  | {
+      /**
+       * An immutable ES module fetched by exact package identity and executed
+       * only inside the Agent UI's opaque-origin Renderer sandbox.
+       */
+      type: "custom";
+      file: string;
+      digest: string;
+    };
 
 export interface HomerailPluginActionV1 {
   id: string;
   intent: string;
-  input_schema: string;
-  effect: HomerailPluginEffect;
-  permissions: HomerailPluginPermission[];
-  confirmation: HomerailPluginConfirmation;
-  handler: HomerailPluginHandlerV1;
+  /** Same-plugin Tool that is the sole execution and policy authority. */
+  tool: string;
 }
 
 export interface HomerailPluginPermissionGrantV1 {
@@ -365,6 +386,14 @@ export interface HomerailDirectUiProjectionV1 {
     density: GenerativeUiDensity;
     persistence: GenerativeUiPersistence;
   };
+  /** Safe Action presentation/binding; execution policy remains Tool-owned. */
+  actions?: Array<{
+    id: string;
+    label: string;
+    style?: GenerativeUiActionStyle;
+    /** RFC 6901 pointer to a Tool-input object snapshotted as fixed Action arguments. */
+    arguments_pointer?: string;
+  }>;
   /** Explicit reversible bridge while the legacy Voice surface remains live. */
   legacy_bridge?: {
     widget_type: string;
@@ -397,6 +426,387 @@ export interface HomerailPluginToolExecutionEnvelopeV1 {
   /** Immutable validated input so Manager can deterministically replay the projection. */
   arguments: Record<string, unknown>;
   projection: HomerailDirectUiProjectionResultV1;
+}
+
+/**
+ * Exact symbolic identity selected from a Generative UI document. Revisions
+ * make an invocation stale as soon as either the document or node changes.
+ */
+export interface HomerailPluginActionTargetV1 {
+  document_id: string;
+  document_revision: number;
+  node_id: string;
+  node_revision: number;
+  action_id: string;
+  action_intent: string;
+}
+
+/** Immutable package and Turn Context snapshot resolved by Manager. */
+export interface HomerailPluginToolBindingV1 {
+  plugin_id: string;
+  plugin_version: string;
+  manifest_digest: string;
+  package_digest: string;
+  context_digest: string;
+  registry_revision: number;
+  permission_revision: number;
+}
+
+/**
+ * Effective, version-scoped grant resolved by Manager for one Action.
+ *
+ * This is intentionally separate from the manifest declaration and persisted
+ * grant status. It contains only the authority that will be conveyed to the
+ * runtime. The grant list, and each paths/hosts list, use ascending canonical
+ * order so the exact scope is stable across confirmation, capability and RPC
+ * boundaries.
+ */
+export interface HomerailPluginEffectivePermissionGrantV1 {
+  permission: HomerailPluginPermission;
+  paths?: string[];
+  hosts?: string[];
+}
+
+export interface HomerailPluginToolPolicyV1 {
+  effect: HomerailPluginEffect;
+  /** Canonically sorted exact permission set; capabilities may not widen it. */
+  permissions: HomerailPluginPermission[];
+  /** Canonically sorted effective authority, including path/host narrowing. */
+  effective_grants: HomerailPluginEffectivePermissionGrantV1[];
+  confirmation: HomerailPluginConfirmation;
+  /** Host policy resolution for the manifest's policy/always/never setting. */
+  confirmation_required: boolean;
+}
+
+/**
+ * Tool Bus V1 request. `request_digest` is the SHA-256 digest of
+ * `homerailPluginToolInvocationDigestInput(value)` encoded canonically.
+ * The digest therefore binds the exact effective path/host grants in policy.
+ * Protocol defines that ABI but intentionally does not sign or issue it.
+ */
+export interface HomerailPluginToolInvocationV1 {
+  tool_bus_version: 1;
+  request_id: string;
+  idempotency_key: string;
+  request_digest: string;
+  invoked_at: string;
+  deadline_at: string;
+  source:
+    | {
+      type: "ui_action";
+      target: HomerailPluginActionTargetV1;
+      action: {
+        local_id: string;
+        qualified_id: string;
+      };
+      /** Digest of user-supplied Action input before Manager-owned fixed arguments are merged. */
+      input_digest: string;
+    }
+    | {
+      type: "agent";
+      call_id: string;
+      modality: HomerailPluginModality;
+      /** Manager-resolved scope and canonical commit target; callers never choose a document id. */
+      scope: GenerativeUiDocumentScopeV1;
+      target: {
+        document_id: string;
+        base_revision: number;
+      };
+    };
+  tool: {
+    local_id: string;
+    qualified_id: string;
+    wire_id: string;
+    handler:
+      | { type: "projection"; digest: string }
+      | { type: "runtime"; method: string }
+      | { type: "builtin"; id: string };
+  };
+  binding: HomerailPluginToolBindingV1;
+  policy: HomerailPluginToolPolicyV1;
+  arguments: Record<string, unknown>;
+}
+
+/** Short-lived, single-use bearer capability claims; signing is out of scope. */
+export interface HomerailPluginToolCapabilityClaimsV1 {
+  capability_version: 1;
+  capability_id: string;
+  audience: "homerail.plugin-runtime";
+  scope: "plugin.tool.execute";
+  nonce: string;
+  single_use: true;
+  request_id: string;
+  request_digest: string;
+  binding: HomerailPluginToolBindingV1;
+  effect: HomerailPluginEffect;
+  permissions: HomerailPluginPermission[];
+  effective_grants: HomerailPluginEffectivePermissionGrantV1[];
+  issued_at: string;
+  expires_at: string;
+}
+
+export interface HomerailPluginToolConfirmationChallengeV1 {
+  confirmation_version: 1;
+  challenge_id: string;
+  request_id: string;
+  request_digest: string;
+  effect: HomerailPluginEffect;
+  permissions: HomerailPluginPermission[];
+  effective_grants: HomerailPluginEffectivePermissionGrantV1[];
+  message: string;
+  issued_at: string;
+  expires_at: string;
+}
+
+export interface HomerailPluginToolConfirmationDecisionV1 {
+  confirmation_version: 1;
+  challenge_id: string;
+  request_id: string;
+  request_digest: string;
+  decision: "approved" | "denied";
+  actor: { type: "user"; id: string };
+  decided_at: string;
+}
+
+export interface HomerailPluginAuthorizedToolInvocationV1 {
+  authorization_version: 1;
+  invocation: HomerailPluginToolInvocationV1;
+  capability: HomerailPluginToolCapabilityClaimsV1;
+  confirmation?: {
+    challenge: HomerailPluginToolConfirmationChallengeV1;
+    decision: HomerailPluginToolConfirmationDecisionV1;
+  };
+}
+
+export interface HomerailPluginRuntimeLogEntryV1 {
+  sequence: number;
+  timestamp: string;
+  level: "debug" | "info" | "warn" | "error";
+  message: string;
+}
+
+/** Passive artifact reference. Runtime RPC never transports artifact bytes. */
+export interface HomerailPluginRuntimeArtifactV1 {
+  id: string;
+  label: string;
+  uri: string;
+  media_type?: string;
+  digest?: string;
+  size_bytes?: number;
+}
+
+/** Pure prepare-phase declaration; it contains no bytes or upload authority. */
+export interface HomerailPluginRuntimeArtifactDeclarationV1 {
+  id: string;
+  label: string;
+  media_type: "application/json" | "image/jpeg" | "image/png" | "image/webp";
+  digest: string;
+  size_bytes: number;
+}
+
+/** Manager-issued, single-use upload authority for one prepared declaration. */
+export interface HomerailPluginRuntimeArtifactUploadV1 extends HomerailPluginRuntimeArtifactDeclarationV1 {
+  capability_id: string;
+  upload_url: string;
+  token: string;
+}
+
+export interface HomerailPluginRuntimeRpcPrepareRequestV1 {
+  runtime_rpc_version: 1;
+  message_type: "request";
+  method: "prepare";
+  rpc_id: string;
+  sent_at: string;
+  params: { authorization: HomerailPluginAuthorizedToolInvocationV1 };
+}
+
+export interface HomerailPluginRuntimeRpcExecuteRequestV1 {
+  runtime_rpc_version: 1;
+  message_type: "request";
+  method: "execute";
+  rpc_id: string;
+  sent_at: string;
+  params: {
+    authorization: HomerailPluginAuthorizedToolInvocationV1;
+    /** Present only after a matching pure prepare result. */
+    artifact_uploads?: HomerailPluginRuntimeArtifactUploadV1[];
+  };
+}
+
+export interface HomerailPluginRuntimeRpcCancelRequestV1 {
+  runtime_rpc_version: 1;
+  message_type: "request";
+  method: "cancel";
+  rpc_id: string;
+  sent_at: string;
+  params: {
+    request_id: string;
+    request_digest: string;
+    reason: "user" | "deadline" | "shutdown" | "superseded";
+  };
+}
+
+export interface HomerailPluginRuntimeRpcHealthRequestV1 {
+  runtime_rpc_version: 1;
+  message_type: "request";
+  method: "health";
+  rpc_id: string;
+  sent_at: string;
+  params: { binding: HomerailPluginToolBindingV1 };
+}
+
+export interface HomerailPluginRuntimeRpcReconcileRequestV1 {
+  runtime_rpc_version: 1;
+  message_type: "request";
+  method: "reconcile";
+  rpc_id: string;
+  sent_at: string;
+  params: { request_id: string; request_digest: string };
+}
+
+export type HomerailPluginRuntimeRpcRequestV1 =
+  | HomerailPluginRuntimeRpcPrepareRequestV1
+  | HomerailPluginRuntimeRpcExecuteRequestV1
+  | HomerailPluginRuntimeRpcCancelRequestV1
+  | HomerailPluginRuntimeRpcHealthRequestV1
+  | HomerailPluginRuntimeRpcReconcileRequestV1;
+
+export type HomerailPluginRuntimeExecutionOutputV1 =
+  | { type: "domain_output"; output: Record<string, unknown> }
+  | { type: "ui_transaction"; transaction: GenerativeUiTransactionV1 };
+
+export interface HomerailPluginRuntimeRpcPrepareResultV1 {
+  runtime_rpc_version: 1;
+  message_type: "result";
+  method: "prepare";
+  rpc_id: string;
+  completed_at: string;
+  request_id: string;
+  request_digest: string;
+  binding: HomerailPluginToolBindingV1;
+  artifact_declarations: HomerailPluginRuntimeArtifactDeclarationV1[];
+  logs: HomerailPluginRuntimeLogEntryV1[];
+  artifacts: [];
+}
+
+export interface HomerailPluginRuntimeRpcExecuteResultV1 {
+  runtime_rpc_version: 1;
+  message_type: "result";
+  method: "execute";
+  rpc_id: string;
+  completed_at: string;
+  request_id: string;
+  request_digest: string;
+  binding: HomerailPluginToolBindingV1;
+  output: HomerailPluginRuntimeExecutionOutputV1;
+  logs: HomerailPluginRuntimeLogEntryV1[];
+  artifacts: HomerailPluginRuntimeArtifactV1[];
+}
+
+export interface HomerailPluginRuntimeRpcCancelResultV1 {
+  runtime_rpc_version: 1;
+  message_type: "result";
+  method: "cancel";
+  rpc_id: string;
+  completed_at: string;
+  request_id: string;
+  request_digest: string;
+  status: "accepted" | "already_finished" | "not_found";
+  logs: HomerailPluginRuntimeLogEntryV1[];
+  artifacts: HomerailPluginRuntimeArtifactV1[];
+}
+
+export interface HomerailPluginRuntimeRpcHealthResultV1 {
+  runtime_rpc_version: 1;
+  message_type: "result";
+  method: "health";
+  rpc_id: string;
+  completed_at: string;
+  binding: HomerailPluginToolBindingV1;
+  status: "ready" | "degraded" | "unhealthy";
+  runtime_api: 1;
+  started_at: string;
+  active_requests: number;
+  logs: HomerailPluginRuntimeLogEntryV1[];
+  artifacts: HomerailPluginRuntimeArtifactV1[];
+}
+
+export interface HomerailPluginRuntimeRpcReconcileResultV1 {
+  runtime_rpc_version: 1;
+  message_type: "result";
+  method: "reconcile";
+  rpc_id: string;
+  completed_at: string;
+  request_id: string;
+  request_digest: string;
+  binding: HomerailPluginToolBindingV1;
+  status: "completed" | "absent" | "running" | "failed";
+  output_digest?: string;
+  output?: HomerailPluginRuntimeExecutionOutputV1;
+  error?: { code: string; message: string };
+  logs: HomerailPluginRuntimeLogEntryV1[];
+  artifacts: HomerailPluginRuntimeArtifactV1[];
+}
+
+export const HomerailPluginRuntimeRpcErrorCode = {
+  INVALID_REQUEST: "invalid_request",
+  UNAUTHORIZED: "unauthorized",
+  PERMISSION_DENIED: "permission_denied",
+  CONFIRMATION_REQUIRED: "confirmation_required",
+  STALE_TARGET: "stale_target",
+  IDEMPOTENCY_COLLISION: "idempotency_collision",
+  DEADLINE_EXCEEDED: "deadline_exceeded",
+  CANCELLED: "cancelled",
+  RUNTIME_UNAVAILABLE: "runtime_unavailable",
+  INTERNAL: "internal",
+} as const;
+export type HomerailPluginRuntimeRpcErrorCode =
+  (typeof HomerailPluginRuntimeRpcErrorCode)[keyof typeof HomerailPluginRuntimeRpcErrorCode];
+
+export interface HomerailPluginRuntimeRpcErrorV1 {
+  runtime_rpc_version: 1;
+  message_type: "error";
+  method: "prepare" | "execute" | "cancel" | "health" | "reconcile";
+  rpc_id: string;
+  completed_at: string;
+  request_id?: string;
+  request_digest?: string;
+  /** Required for health errors; forbidden for execute/cancel errors. */
+    binding?: HomerailPluginToolBindingV1;
+  error: {
+    code: HomerailPluginRuntimeRpcErrorCode;
+    message: string;
+    retryable: boolean;
+  };
+  logs: HomerailPluginRuntimeLogEntryV1[];
+  artifacts: HomerailPluginRuntimeArtifactV1[];
+}
+
+export type HomerailPluginRuntimeRpcResponseV1 =
+  | HomerailPluginRuntimeRpcPrepareResultV1
+  | HomerailPluginRuntimeRpcExecuteResultV1
+  | HomerailPluginRuntimeRpcCancelResultV1
+  | HomerailPluginRuntimeRpcHealthResultV1
+  | HomerailPluginRuntimeRpcReconcileResultV1
+  | HomerailPluginRuntimeRpcErrorV1;
+
+/** Expected live state supplied by Manager for stale/tamper checks. */
+export interface HomerailPluginToolValidationOptionsV1 {
+  now_ms?: number;
+  expected?: {
+    source?: HomerailPluginToolInvocationV1["source"];
+    tool?: HomerailPluginToolInvocationV1["tool"];
+    binding: HomerailPluginToolBindingV1;
+    /** Optional manifest/broker policy snapshot for direct escalation checks. */
+    policy?: HomerailPluginToolPolicyV1;
+    request_id?: string;
+    request_digest?: string;
+  };
+  idempotency_records?: ReadonlyMap<string, {
+    request_id: string;
+    request_digest: string;
+  }>;
+  consumed_capability_nonces?: ReadonlySet<string>;
 }
 
 export interface HomerailPluginCompatibilityTargetV1 {

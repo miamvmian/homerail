@@ -5,23 +5,30 @@ import { isHomerailPluginId } from "homerail-protocol";
 import {
   encodeHrpZip,
   extractVerifiedHrpArchive,
+  isHomerailDeclarativeKindMigrationManifest,
   normalizeHrpPath,
   verifyPluginArchive,
+  type PluginM5ProjectionActionIneligibilityReason,
+  type PluginM5WorkflowResolutionIneligibilityReason,
+  type PluginM6CustomRendererIneligibilityReason,
 } from "homerail-plugin-sdk";
 import { getHomerailHome } from "../config/env.js";
 import {
   activatePluginVersion,
   installExternalPluginPackage,
+  listPluginPackages,
   listPluginVersions,
   pluginVersionSetDigest,
   rollbackPluginVersion,
   setPluginEnabled,
+  updatePluginInstallationSignatureState,
   uninstallExternalPlugin,
   type PluginActivationRecord,
   type PluginInstallationRecord,
   type PluginPackageRecord,
   type PluginVersionRecord,
 } from "../persistence/plugins.js";
+import { listPluginPublisherTrust } from "../persistence/plugin-distribution.js";
 import { loadPluginPackage } from "./manifest-loader.js";
 
 export interface InstallHrpResult {
@@ -30,7 +37,14 @@ export interface InstallHrpResult {
   activation: PluginActivationRecord;
   archive_digest: string;
   payload_digest: string;
+  /** Backward-compatible M4 eligibility field. */
   data_only_eligible: boolean;
+  m5_projection_action_eligible: boolean;
+  m5_projection_action_eligibility_reasons: PluginM5ProjectionActionIneligibilityReason[];
+  m5_workflow_resolution_eligible: boolean;
+  m5_workflow_resolution_eligibility_reasons: PluginM5WorkflowResolutionIneligibilityReason[];
+  m6_custom_renderer_eligible: boolean;
+  m6_custom_renderer_eligibility_reasons: PluginM6CustomRendererIneligibilityReason[];
   idempotent: boolean;
 }
 
@@ -176,7 +190,12 @@ export function installHrpArchive(
   archive: Buffer,
   options: { channel?: "staging" | "local" | "registry" } = {},
 ): InstallHrpResult {
-  const verified = verifyPluginArchive(archive);
+  const channel = options.channel ?? "staging";
+  const verified = verifyPluginArchive(archive, {
+    allow_signature: true,
+    trust_store: listPluginPublisherTrust(),
+    require_trusted_signature: channel === "registry",
+  });
   const { manifest } = verified.snapshot;
   ensurePackageStorage(manifest.id);
   const staging = fs.mkdtempSync(path.join(stagingRoot(), ".install-"));
@@ -184,7 +203,13 @@ export function installHrpArchive(
   const target = targetPackagePath(manifest.id, manifest.version);
   try {
     extractVerifiedHrpArchive(verified, staging);
-    const descriptor = loadPluginPackage(staging, { source: "installed" });
+    const descriptor = loadPluginPackage(staging, {
+      source: "installed",
+      allow_staged_runtime: !verified.snapshot.m4_data_only_eligible
+        && !verified.snapshot.m5_projection_action_eligible
+        && !verified.snapshot.m5_workflow_resolution_eligible
+        && !verified.snapshot.m6_custom_renderer_eligible,
+    });
     if (descriptor.manifest.id !== verified.lock.plugin.id || descriptor.manifest.version !== verified.lock.plugin.version) {
       throw new Error("Resolved plugin descriptor does not match HRP identity");
     }
@@ -195,23 +220,45 @@ export function installHrpArchive(
       fs.renameSync(staging, target);
       targetCreated = true;
     }
-    const eligible = verified.snapshot.m4_data_only_eligible;
+    const m4Eligible = verified.snapshot.m4_data_only_eligible;
+    const m5Eligible = verified.snapshot.m5_projection_action_eligible;
+    const m5WorkflowEligible = verified.snapshot.m5_workflow_resolution_eligible;
+    const m6CustomRendererEligible = verified.snapshot.m6_custom_renderer_eligible;
+    const eligible = (m4Eligible || m5Eligible || m5WorkflowEligible || m6CustomRendererEligible)
+      && verified.signature_state !== "revoked";
     try {
       const persisted = installExternalPluginPackage({
         descriptor,
         archive_digest: verified.archive_digest,
         payload_digest: verified.lock.payload_digest,
-        channel: options.channel ?? "staging",
+        channel,
         lifecycle_state: eligible ? "installed" : "staged",
-        health_state: eligible ? "healthy" : "unchecked",
-        signature_state: "unsigned",
+        health_state: eligible ? "healthy" : verified.signature_state === "revoked" ? "unhealthy" : "unchecked",
+        signature_state: verified.signature_state,
+        ...(verified.signature ? {
+          signature: {
+            key_id: verified.signature.statement.key_id,
+            publisher: verified.signature.statement.publisher,
+            public_key_spki: verified.signature.statement.public_key_spki,
+            payload_digest: verified.signature.statement.payload_digest,
+          },
+        } : {}),
         package_path: target,
       });
       return {
         ...persisted,
         archive_digest: verified.archive_digest,
         payload_digest: verified.lock.payload_digest,
-        data_only_eligible: eligible,
+        data_only_eligible: m4Eligible,
+        m5_projection_action_eligible: m5Eligible,
+        m5_projection_action_eligibility_reasons:
+          verified.snapshot.m5_projection_action_eligibility_reasons,
+        m5_workflow_resolution_eligible: m5WorkflowEligible,
+        m5_workflow_resolution_eligibility_reasons:
+          verified.snapshot.m5_workflow_resolution_eligibility_reasons,
+        m6_custom_renderer_eligible: m6CustomRendererEligible,
+        m6_custom_renderer_eligibility_reasons:
+          verified.snapshot.m6_custom_renderer_eligibility_reasons,
         idempotent: persisted.idempotent,
       };
     } catch (cause) {
@@ -224,11 +271,70 @@ export function installHrpArchive(
   }
 }
 
+export function reconcileInstalledPluginPublisherTrust(): {
+  checked: number;
+  updated: number;
+  revoked: number;
+  failures: Array<{ plugin_id: string; plugin_version: string; error: string }>;
+} {
+  const trustStore = listPluginPublisherTrust();
+  let checked = 0;
+  let updated = 0;
+  let revoked = 0;
+  const failures: Array<{ plugin_id: string; plugin_version: string; error: string }> = [];
+  for (const pluginPackage of listPluginPackages().filter((candidate) => candidate.source === "installed")) {
+    const version = listPluginVersions(pluginPackage.plugin_id)
+      .find((candidate) => candidate.plugin_version === pluginPackage.plugin_version);
+    const installation = version?.installation;
+    if (!installation || installation.lifecycle_state === "removed") continue;
+    checked += 1;
+    try {
+      const files = readInstalledPackageFiles(installation.package_path);
+      const archive = encodeHrpZip([...files.entries()].map(([filePath, content]) => ({
+        path: filePath,
+        content,
+      })));
+      const verified = verifyPluginArchive(archive, {
+        allow_signature: true,
+        trust_store: trustStore,
+      });
+      if (
+        verified.archive_digest !== installation.archive_digest
+        || verified.lock.payload_digest !== installation.payload_digest
+      ) throw new Error("Installed plugin archive identity no longer matches persistence");
+      const result = updatePluginInstallationSignatureState({
+        plugin_id: pluginPackage.plugin_id,
+        plugin_version: pluginPackage.plugin_version,
+        signature_state: verified.signature_state,
+      });
+      if (result.changed) updated += 1;
+      if (verified.signature_state === "revoked") revoked += 1;
+    } catch (cause) {
+      failures.push({
+        plugin_id: pluginPackage.plugin_id,
+        plugin_version: pluginPackage.plugin_version,
+        error: cause instanceof Error ? cause.message : String(cause),
+      });
+    }
+  }
+  return { checked, updated, revoked, failures };
+}
+
 export function activateInstalledPlugin(
   pluginId: string,
   version: string,
   expectedRevision?: number,
+  options: { registry_authorized?: boolean } = {},
 ): PluginActivationRecord {
+  const versions = listPluginVersions(pluginId);
+  const target = versions.find((candidate) => candidate.plugin_version === version);
+  const active = versions.find((candidate) => candidate.active);
+  if (
+    options.registry_authorized !== true
+    && (target?.installation?.channel === "registry" || active?.installation?.channel === "registry")
+  ) {
+    throw new Error("Registry plugin activation requires the signed Registry lifecycle endpoint");
+  }
   return activatePluginVersion(pluginId, version, { expected_revision: expectedRevision });
 }
 
@@ -236,10 +342,18 @@ export function enableInstalledPlugin(
   pluginId: string,
   enabled: boolean,
   expected: { revision: number; active_version: string },
+  options: { registry_authorized?: boolean } = {},
 ): PluginActivationRecord {
+  if (enabled && options.registry_authorized !== true) {
+    const active = listPluginVersions(pluginId).find((candidate) => candidate.active);
+    if (active?.installation?.channel === "registry") {
+      throw new Error("Registry plugin enablement requires the signed Registry lifecycle endpoint");
+    }
+  }
   return setPluginEnabled(pluginId, enabled, {
     expected_revision: expected.revision,
     expected_active_version: expected.active_version,
+    registry_authorized: options.registry_authorized,
   });
 }
 
@@ -247,7 +361,25 @@ export function rollbackInstalledPlugin(
   pluginId: string,
   version?: string,
   expectedRevision?: number,
+  options: { registry_authorized?: boolean } = {},
 ): PluginActivationRecord {
+  if (options.registry_authorized !== true) {
+    const versions = listPluginVersions(pluginId);
+    const active = versions.find((candidate) => candidate.active);
+    const target = version === undefined
+      ? undefined
+      : versions.find((candidate) => candidate.plugin_version === version);
+    if (
+      active?.installation?.channel === "registry"
+      || target?.installation?.channel === "registry"
+      || (version === undefined && versions.some((candidate) => (
+        candidate.installation?.channel === "registry"
+        && candidate.installation.lifecycle_state !== "removed"
+      )))
+    ) {
+      throw new Error("Registry plugin rollback requires the signed Registry lifecycle endpoint");
+    }
+  }
   return rollbackPluginVersion(pluginId, version, expectedRevision);
 }
 
@@ -331,14 +463,43 @@ export function inspectInstalledPlugin(pluginId: string): {
         try {
           const files = readInstalledPackageFiles(version.installation.package_path);
           const archive = encodeHrpZip([...files.entries()].map(([filePath, content]) => ({ path: filePath, content })));
-          const verified = verifyPluginArchive(archive);
+          const verified = verifyPluginArchive(archive, {
+            allow_signature: true,
+            trust_store: listPluginPublisherTrust(),
+          });
           if (
             verified.archive_digest !== version.installation.archive_digest
             || verified.lock.payload_digest !== version.installation.payload_digest
             || verified.lock.plugin.id !== pluginId
             || verified.lock.plugin.version !== version.plugin_version
           ) throw new Error("persisted package identity does not match verified bytes");
-          const descriptor = loadPluginPackage(version.installation.package_path, { source: "installed" });
+          if (
+            version.installation.lifecycle_state === "installed"
+            && version.installation.health_state === "healthy"
+            && !verified.snapshot.m4_data_only_eligible
+            && !verified.snapshot.m5_projection_action_eligible
+            && !verified.snapshot.m5_workflow_resolution_eligible
+            && !verified.snapshot.m6_custom_renderer_eligible
+            && !(version.installation.channel === "registry"
+              && version.installation.signature_state === "verified"
+              && isHomerailDeclarativeKindMigrationManifest(verified.snapshot.manifest))
+            && !(verified.snapshot.manifest.runtime.trust === "sandboxed_runtime"
+              && verified.snapshot.manifest.runtime.entrypoint)
+          ) {
+            throw new Error(
+              "persisted package is not eligible for an installed M4/M5/M6 tier: "
+              + [
+                ...verified.snapshot.m5_projection_action_eligibility_reasons,
+                ...verified.snapshot.m5_workflow_resolution_eligibility_reasons,
+              ].join(", "),
+            );
+          }
+          const descriptor = loadPluginPackage(version.installation.package_path, {
+            source: "installed",
+            allow_staged_runtime: version.installation.lifecycle_state !== "installed"
+              || version.installation.health_state !== "healthy"
+              || verified.snapshot.manifest.runtime.trust === "sandboxed_runtime",
+          });
           if (descriptor.package_digest !== version.package_digest) {
             throw new Error("persisted descriptor digest does not match verified package");
           }

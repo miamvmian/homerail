@@ -230,7 +230,41 @@
     "shadowPreview": "生成式 UI 影子預覽",
     "nonInteractive": "只讀 / 非權威",
     "loading": "正在讀取生成式 UI…",
-    "previewUnavailable": "生成式 UI 預覽不可用"
+    "previewUnavailable": "生成式 UI 預覽不可用",
+    "actions": {
+      "submitting": "正在提交操作…",
+      "statusUnknown": "操作狀態需要刷新",
+      "needsGrant": "需要授權",
+      "awaitingConfirmation": "等待確認",
+      "authorized": "已授權，等待執行",
+      "running": "正在執行…",
+      "committed": "操作已提交",
+      "denied": "操作已拒絕",
+      "failed": "操作失敗",
+      "cancelled": "操作已取消",
+      "missingPermissions": "缺少權限：{permissions}",
+      "effect": "影響類型",
+      "permissions": "授權範圍",
+      "noPermissions": "無額外權限",
+      "paths": "路徑",
+      "hosts": "主機",
+      "approve": "確認執行",
+      "deny": "拒絕",
+      "retry": "重試",
+      "retryAfterGrant": "授權後重試",
+      "statusPollTimeout": "操作狀態仍未確定，請重試以繼續查詢同一個請求。",
+      "missingDocumentBinding": "當前生成式 UI 缺少文檔版本或作用域，無法安全執行操作"
+    },
+    "toolConfirmations": {
+      "title": "Agent 工具確認",
+      "managerOwned": "由 Manager 驗證的權限上下文",
+      "expires": "有效期至",
+      "busy": "正在提交決定…",
+      "failed": "工具確認未能完成",
+      "refresh": "刷新",
+      "refreshFailed": "確認決定已處理，但無法刷新 Manager 的權威狀態",
+      "bindingMismatch": "Manager 返回的工具結果與當前確認請求不一致"
+    }
   },
   "errors": {
     "sessionStart": "語音會話啓動失敗",

@@ -1,4 +1,7 @@
-import { resolveConfiguredManagerUrl } from "./local-config.js";
+import {
+  resolveConfiguredManagerAdminToken,
+  resolveConfiguredManagerUrl,
+} from "./local-config.js";
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 export interface BaseResponse {
@@ -11,15 +14,20 @@ export interface BaseResponse {
 export interface HomeRailClientOptions {
   baseUrl?: string;
   timeoutMs?: number;
+  adminToken?: string;
 }
 
 export class HomeRailClient {
   readonly baseUrl: string;
   readonly timeoutMs: number;
+  private readonly adminToken?: string;
 
   constructor(opts: HomeRailClientOptions = {}) {
     this.baseUrl = HomeRailClient.resolveBaseUrl(opts.baseUrl);
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.adminToken = opts.adminToken === undefined
+      ? resolveConfiguredManagerAdminToken()
+      : opts.adminToken || undefined;
   }
 
   static resolveBaseUrl(override?: string): string {
@@ -51,6 +59,13 @@ export class HomeRailClient {
 
   async put<T = BaseResponse>(path: string, body?: unknown): Promise<T> {
     return this.request<T>("PUT", path, body === undefined ? undefined : {
+      type: "json",
+      value: body,
+    });
+  }
+
+  async patch<T = BaseResponse>(path: string, body?: unknown): Promise<T> {
+    return this.request<T>("PATCH", path, body === undefined ? undefined : {
       type: "json",
       value: body,
     });
@@ -176,6 +191,9 @@ export class HomeRailClient {
         method,
         headers: {
           Accept: "application/json",
+          ...(this.adminToken && isProtectedApiMutationRequest(method, path) ? {
+            Authorization: `Bearer ${this.adminToken}`,
+          } : {}),
           ...(payload ? {
             "Content-Type": payload.type === "json"
               ? "application/json"
@@ -212,11 +230,30 @@ export class HomeRailClient {
       if (err instanceof Error && err.name === "AbortError") {
         throw new Error(`Request timed out after ${this.timeoutMs}ms`);
       }
-      throw err;
+      throw redactClientError(err, this.adminToken);
     } finally {
       clearTimeout(timer);
     }
   }
+}
+
+function isProtectedApiMutationRequest(method: string, pathValue: string): boolean {
+  if (!["POST", "PUT", "PATCH", "DELETE"].includes(method.toUpperCase())) return false;
+  try {
+    const pathname = new URL(pathValue, "http://localhost").pathname;
+    return pathname === "/api" || pathname.startsWith("/api/");
+  } catch {
+    return false;
+  }
+}
+
+function redactClientError(error: unknown, adminToken: string | undefined): Error {
+  let message = error instanceof Error ? error.message : String(error);
+  if (adminToken) message = message.split(adminToken).join("***REDACTED***");
+  message = message.replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1***REDACTED***");
+  const safe = new Error(message);
+  if (error instanceof Error) safe.name = error.name;
+  return safe;
 }
 
 function withQuery(

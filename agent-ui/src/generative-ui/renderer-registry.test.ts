@@ -149,6 +149,40 @@ describe('GenerativeUiRendererRegistry', () => {
     expect(runtime.unresolved_renderer_ids).toEqual([])
   })
 
+  it('projects custom Renderer metadata without importing plugin code into the host realm', () => {
+    const projection = topicProjection(true)
+    projection.kinds[0] = {
+      ...projection.kinds[0],
+      plugin_id: 'com.example.plugin',
+      plugin_version: '1.0.0',
+      kind: 'com.example.plugin/card',
+      schema_id: 'card-v1',
+    }
+    projection.renderers[0] = {
+      ...projection.renderers[0],
+      plugin_id: 'com.example.plugin',
+      plugin_version: '1.0.0',
+      renderer_id: 'card-custom',
+      kind: 'com.example.plugin/card',
+      mode: 'custom',
+      source: {
+        type: 'custom',
+        file: 'ui/card.mjs',
+        digest: 'c'.repeat(64),
+      },
+    }
+    const runtime = buildProjectedGenerativeUiRegistry(projection)
+    const resolved = runtime.renderers.resolve(node(), 'task', 'desktop')
+    expect(resolved).toMatchObject({
+      mode: 'custom',
+      source: { type: 'custom', file: 'ui/card.mjs', digest: 'c'.repeat(64) },
+      registration: { manifest_digest: 'a'.repeat(64) },
+    })
+    if (resolved.mode !== 'custom') throw new Error('custom Renderer did not resolve')
+    expect(Object.isFrozen(resolved.source)).toBe(true)
+    expect(runtime.unresolved_renderer_ids).toEqual([])
+  })
+
   it('keeps the old topic kind inside the isolated legacy compatibility path', () => {
     const runtime = buildProjectedGenerativeUiRegistry(topicProjection(true))
     const legacyTopic = node({

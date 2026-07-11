@@ -15,15 +15,38 @@ import {
   type VoiceUiRules,
 } from "./host-codex-manager-agent.js";
 import { listManagerSkills, type ManagerSkillSummary } from "./manager-skills.js";
-import { assemblePluginTurnContext } from "../plugins/context-assembler.js";
+import {
+  routePluginCapabilities,
+  type PluginCapabilityRouteResult,
+} from "../plugins/capability-router.js";
+import { assertCurrentPluginTurnContextSubset } from "../plugins/context-assembler.js";
+import { getPluginToolTurnAuthority } from "../plugins/action-bus.js";
 import {
   managerAgentRuntimePlacementForHarness,
   normalizeManagerAgentHarness,
   type ManagerAgentRuntimePlacement,
   type HomerailPluginTurnContextV1,
 } from "homerail-protocol";
+import type { GenerativeUiMode } from "../generative-ui/mode.js";
+import { getActivePlugin, isTrustedRegistryPluginAgentAsset } from "../persistence/plugins.js";
+import {
+  acknowledgePluginAgentToolContinuationLease,
+  leasePluginAgentToolContinuations,
+  releasePluginAgentToolContinuationLease,
+  type PluginAgentToolContinuationRecord,
+} from "../persistence/plugin-tool-continuations.js";
 
 export type ManagerAgentResponseMode = "chat" | "voice";
+
+export interface ManagerAgentPluginRoutingInput {
+  inputs?: Record<string, unknown>;
+  explicit_plugin_id?: string;
+  explicit_capability_id?: string;
+  top_k?: number;
+  prompt_byte_budget?: number;
+  /** Limit routing to an already assembled compatibility/mode boundary. */
+  source_context?: HomerailPluginTurnContextV1;
+}
 
 export interface RunManagerAgentTurnInput {
   message: string;
@@ -32,12 +55,17 @@ export interface RunManagerAgentTurnInput {
   voice_session_id?: string;
   continue_chat?: boolean;
   response_mode?: ManagerAgentResponseMode;
+  /** Trusted session rollout snapshot resolved by Manager, never by a Worker. */
+  generative_ui_mode?: GenerativeUiMode;
   history?: Array<{ role?: string; content?: string; timestamp?: string }>;
   required_tool_calls?: string[];
   agent_config: ManagerAgentRuntimeConfig;
   voice_ui_rules?: VoiceUiRules;
   manager_skills?: ManagerSkillSummary[];
+  /** Exact legacy/preselected context. When present it is forwarded unchanged. */
   plugin_context?: HomerailPluginTurnContextV1;
+  /** Router hints used only by Manager; they are never forwarded to a runtime. */
+  plugin_routing?: ManagerAgentPluginRoutingInput;
 }
 
 export interface RunManagerAgentTurnResult {
@@ -45,6 +73,14 @@ export interface RunManagerAgentTurnResult {
   worker_id: string | null;
   container_name: string | null;
   runtime_placement: ManagerAgentRuntimePlacement;
+  /** Exact selected context delivered to the host/container for this turn. */
+  plugin_context: HomerailPluginTurnContextV1;
+}
+
+export interface ResolvedManagerAgentTurnAssets {
+  plugin_context: HomerailPluginTurnContextV1;
+  manager_skills: ManagerSkillSummary[];
+  route: PluginCapabilityRouteResult | null;
 }
 
 export type RunManagerAgentTurnStreamEvent =
@@ -79,15 +115,121 @@ export function managerAgentRuntimePlacement(config: ManagerAgentRuntimeConfig):
   return harness ? managerAgentRuntimePlacementForHarness(harness) : "container";
 }
 
-export async function runManagerAgentTurn(
+function scopedManagerSkills(
+  provided: ManagerSkillSummary[] | undefined,
+  pluginContext: HomerailPluginTurnContextV1,
+): ManagerSkillSummary[] {
+  const resolved = listManagerSkills(pluginContext);
+  if (!provided) return resolved;
+  const local = provided.filter((skill) => skill.source !== "plugin");
+  const selectedPlugins = resolved.filter((skill) => skill.source === "plugin");
+  const byId = new Map(local.map((skill) => [skill.id, skill]));
+  for (const skill of selectedPlugins) byId.set(skill.id, skill);
+  return [...byId.values()].sort((left, right) => left.id.localeCompare(right.id));
+}
+
+/**
+ * Host and host-shell Agents remain same-UID authority and accept only
+ * bundled assets. The isolated container placement may additionally receive
+ * active Registry assets whose HRP publisher is still exactly trusted.
+ */
+function assertAgentPromptTrust(
+  context: HomerailPluginTurnContextV1,
+  placement: ManagerAgentRuntimePlacement,
+): void {
+  const plugins = new Map<string, string>();
+  for (const entry of [...context.skills, ...context.tools, ...context.actions]) {
+    const current = plugins.get(entry.plugin_id);
+    if (current && current !== entry.plugin_version) throw new Error("Plugin Agent context mixes package versions");
+    plugins.set(entry.plugin_id, entry.plugin_version);
+  }
+  for (const [pluginId, pluginVersion] of plugins) {
+    const plugin = getActivePlugin(pluginId);
+    if (plugin?.source === "builtin") continue;
+    if (placement !== "container"
+      || !plugin
+      || plugin.plugin_version !== pluginVersion
+      || !plugin.activation.enabled
+      || !isTrustedRegistryPluginAgentAsset(pluginId, pluginVersion)) {
+      throw new Error(
+        `Installed Plugin Agent assets require an active trusted Registry HRP and isolated container placement: ${pluginId}`,
+      );
+    }
+  }
+}
+
+/**
+ * Resolve Plugin assets once before runtime placement. This is the parity
+ * boundary shared by host Codex, host-shell and container workers.
+ */
+export function resolveManagerAgentTurnAssets(
+  input: RunManagerAgentTurnInput,
+): ResolvedManagerAgentTurnAssets {
+  const placement = managerAgentRuntimePlacement(input.agent_config);
+  if (input.plugin_context) {
+    const pluginContext = assertCurrentPluginTurnContextSubset(input.plugin_context, undefined, {
+      modality: input.response_mode === "voice" ? "voice" : "text",
+    });
+    assertAgentPromptTrust(pluginContext, placement);
+    return {
+      plugin_context: pluginContext,
+      manager_skills: scopedManagerSkills(input.manager_skills, pluginContext),
+      route: null,
+    };
+  }
+  const hints = input.plugin_routing;
+  const route = routePluginCapabilities({
+    utterance: input.message,
+    modality: input.response_mode === "voice" ? "voice" : "text",
+    ...(hints?.inputs ? { inputs: hints.inputs } : {}),
+    ...(hints?.explicit_plugin_id ? { explicit_plugin_id: hints.explicit_plugin_id } : {}),
+    ...(hints?.explicit_capability_id ? { explicit_capability_id: hints.explicit_capability_id } : {}),
+    ...(hints?.top_k !== undefined ? { top_k: hints.top_k } : {}),
+    ...(hints?.prompt_byte_budget !== undefined ? { prompt_byte_budget: hints.prompt_byte_budget } : {}),
+  }, undefined, {
+    ...(hints?.source_context ? { source_context: hints.source_context } : {}),
+  });
+  assertAgentPromptTrust(route.selected_context, placement);
+  return {
+    plugin_context: route.selected_context,
+    manager_skills: scopedManagerSkills(input.manager_skills, route.selected_context),
+    route,
+  };
+}
+
+function pluginToolTurnToken(
+  input: RunManagerAgentTurnInput,
+  context: HomerailPluginTurnContextV1,
+): string | undefined {
+  if (context.tools.length === 0) return undefined;
+  if (input.response_mode !== "voice") {
+    throw new Error("M5 Plugin Tools are available only in a bound voice turn");
+  }
+  if (input.generative_ui_mode === "off" || input.generative_ui_mode === undefined) {
+    throw new Error("Plugin Tool context is forbidden while Generative UI is off or unbound");
+  }
+  // Shadow retains the M3 pure local projection path. Only prefer makes the
+  // Tool Bus authoritative and therefore receives an invocation credential.
+  if (input.generative_ui_mode === "shadow") return undefined;
+  const scopeId = input.voice_session_id ?? input.session_id;
+  if (!scopeId) throw new Error("Plugin Tool routing requires a bound voice session id");
+  return getPluginToolTurnAuthority().issue({
+    context,
+    modality: "voice",
+    scope: { type: "voice_session", id: scopeId },
+    generative_ui_mode: "prefer",
+  }).token;
+}
+
+async function runManagerAgentTurnOnce(
   input: RunManagerAgentTurnInput,
   options?: ManagerAgentContainerOptions,
 ): Promise<RunManagerAgentTurnResult> {
   const runtimePlacement = managerAgentRuntimePlacement(input.agent_config);
-  const pluginContext = input.plugin_context ?? assemblePluginTurnContext(undefined, {
-    modality: input.response_mode === "voice" ? "voice" : "text",
-  });
-  const managerSkills = input.manager_skills ?? listManagerSkills(pluginContext);
+  const turnAssets = resolveManagerAgentTurnAssets(input);
+  const pluginContext = turnAssets.plugin_context;
+  const managerSkills = turnAssets.manager_skills;
+  const toolTurnToken = pluginToolTurnToken(input, pluginContext);
   if (runtimePlacement === "host") {
     try {
       const result = await runHostCodexManagerAgentTurn({
@@ -103,12 +245,14 @@ export async function runManagerAgentTurn(
         voice_ui_rules: input.voice_ui_rules,
         manager_skills: managerSkills,
         plugin_context: pluginContext,
+        ...(toolTurnToken ? { plugin_tool_turn_token: toolTurnToken } : {}),
       });
       return {
         result,
         worker_id: typeof result.worker_id === "string" ? result.worker_id : "host-codex",
         container_name: typeof result.container_name === "string" ? result.container_name : null,
         runtime_placement: runtimePlacement,
+        plugin_context: pluginContext,
       };
     } catch (err) {
       throw new ManagerAgentRuntimeError(
@@ -148,8 +292,10 @@ export async function runManagerAgentTurn(
         message: input.message,
         project_id: input.project_id,
         session_id: input.session_id,
+        voice_session_id: input.voice_session_id,
         continue_chat: input.continue_chat,
         response_mode: input.response_mode,
+        generative_ui_mode: input.generative_ui_mode,
         history: input.history,
         required_tool_calls: input.required_tool_calls,
         agent_config: input.agent_config,
@@ -157,12 +303,14 @@ export async function runManagerAgentTurn(
         voice_system_contract: input.response_mode === "voice" ? loadVoiceSystemContract() : undefined,
         manager_skills: managerSkills,
         plugin_context: pluginContext,
+        ...(toolTurnToken ? { plugin_tool_turn_token: toolTurnToken } : {}),
       });
       return {
         result,
         worker_id: hostAgent.workerId,
         container_name: hostAgent.processName,
         runtime_placement: runtimePlacement,
+        plugin_context: pluginContext,
       };
     } catch (err) {
       throw new ManagerAgentRuntimeError(
@@ -191,8 +339,10 @@ export async function runManagerAgentTurn(
       message: input.message,
       project_id: input.project_id,
       session_id: input.session_id,
+      voice_session_id: input.voice_session_id,
       continue_chat: input.continue_chat,
       response_mode: input.response_mode,
+      generative_ui_mode: input.generative_ui_mode,
       history: input.history,
       required_tool_calls: input.required_tool_calls,
       agent_config: input.agent_config,
@@ -200,12 +350,14 @@ export async function runManagerAgentTurn(
       voice_system_contract: input.response_mode === "voice" ? loadVoiceSystemContract() : undefined,
       manager_skills: managerSkills,
       plugin_context: pluginContext,
+      ...(toolTurnToken ? { plugin_tool_turn_token: toolTurnToken } : {}),
     });
     return {
       result,
       worker_id: container.containerId,
       container_name: container.containerName,
       runtime_placement: runtimePlacement,
+      plugin_context: pluginContext,
     };
   } catch (err) {
     throw new ManagerAgentRuntimeError(
@@ -221,6 +373,50 @@ export async function runManagerAgentTurn(
   }
 }
 
+function continuationLease(input: RunManagerAgentTurnInput): {
+  lease_id?: string;
+  records: PluginAgentToolContinuationRecord[];
+} {
+  const scopeId = input.voice_session_id ?? input.session_id;
+  if (input.response_mode !== "voice" || !scopeId) return { records: [] };
+  return leasePluginAgentToolContinuations({
+    scope: { type: "voice_session", id: scopeId },
+  });
+}
+
+function messageWithContinuations(
+  message: string,
+  records: readonly PluginAgentToolContinuationRecord[],
+): string {
+  if (!records.length) return message;
+  const payload = records.map((record) => record.payload);
+  return [
+    "Manager-confirmed Plugin Tool continuations are authoritative results from earlier user decisions.",
+    "Continue from them without repeating the Tool call. Explicitly explain denied, expired, failed, or indeterminate outcomes.",
+    `<homerail_plugin_tool_continuations>${JSON.stringify(payload)}</homerail_plugin_tool_continuations>`,
+    "",
+    message,
+  ].join("\n");
+}
+
+export async function runManagerAgentTurn(
+  input: RunManagerAgentTurnInput,
+  options?: ManagerAgentContainerOptions,
+): Promise<RunManagerAgentTurnResult> {
+  const lease = continuationLease(input);
+  try {
+    const result = await runManagerAgentTurnOnce({
+      ...input,
+      message: messageWithContinuations(input.message, lease.records),
+    }, options);
+    if (lease.lease_id) acknowledgePluginAgentToolContinuationLease(lease.lease_id);
+    return result;
+  } catch (cause) {
+    if (lease.lease_id) releasePluginAgentToolContinuationLease(lease.lease_id);
+    throw cause;
+  }
+}
+
 export async function* runManagerAgentTurnStream(
   input: RunManagerAgentTurnInput,
   options?: ManagerAgentContainerOptions,
@@ -231,13 +427,15 @@ export async function* runManagerAgentTurnStream(
     return;
   }
 
+  const lease = continuationLease(input);
+  let continuationAcknowledged = false;
   try {
-    const pluginContext = input.plugin_context ?? assemblePluginTurnContext(undefined, {
-      modality: input.response_mode === "voice" ? "voice" : "text",
-    });
-    const managerSkills = input.manager_skills ?? listManagerSkills(pluginContext);
+    const turnAssets = resolveManagerAgentTurnAssets(input);
+    const pluginContext = turnAssets.plugin_context;
+    const managerSkills = turnAssets.manager_skills;
+    const toolTurnToken = pluginToolTurnToken(input, pluginContext);
     for await (const event of runHostCodexManagerAgentTurnStream({
-      message: input.message,
+      message: messageWithContinuations(input.message, lease.records),
       project_id: input.project_id ?? undefined,
       session_id: input.session_id,
       voice_session_id: input.voice_session_id,
@@ -249,10 +447,15 @@ export async function* runManagerAgentTurnStream(
       voice_ui_rules: input.voice_ui_rules,
       manager_skills: managerSkills,
       plugin_context: pluginContext,
+      ...(toolTurnToken ? { plugin_tool_turn_token: toolTurnToken } : {}),
     })) {
       if (event.type === "commentary") {
         yield { type: "commentary", text: event.text };
       } else if (event.type === "result") {
+        if (lease.lease_id && !continuationAcknowledged) {
+          acknowledgePluginAgentToolContinuationLease(lease.lease_id);
+          continuationAcknowledged = true;
+        }
         yield {
           type: "result",
           result: {
@@ -260,6 +463,7 @@ export async function* runManagerAgentTurnStream(
             worker_id: typeof event.result.worker_id === "string" ? event.result.worker_id : "host-codex",
             container_name: typeof event.result.container_name === "string" ? event.result.container_name : null,
             runtime_placement: runtimePlacement,
+            plugin_context: pluginContext,
           },
         };
       }
@@ -271,5 +475,9 @@ export async function* runManagerAgentTurnStream(
       runtimePlacement,
       { worker_id: "host-codex", project_id: input.project_id ?? null },
     );
+  } finally {
+    if (lease.lease_id && !continuationAcknowledged) {
+      releasePluginAgentToolContinuationLease(lease.lease_id);
+    }
   }
 }

@@ -46,6 +46,7 @@ export function buildProjectedGenerativeUiRegistry(
             renderer_api_version: 1,
             plugin_id: renderer.plugin_id,
             plugin_version: renderer.plugin_version,
+            manifest_digest: renderer.manifest_digest,
             renderer_id: renderer.renderer_id,
             kind: renderer.kind,
             kind_version: renderer.kind_version,
@@ -53,6 +54,26 @@ export function buildProjectedGenerativeUiRegistry(
             device,
             mode: 'declarative',
             document: structuredClone(renderer.source.document),
+          })
+        }
+      }
+      continue
+    }
+    if (renderer.mode === 'custom' && renderer.source.type === 'custom') {
+      for (const surface of renderer.surfaces) {
+        for (const device of renderer.devices) {
+          registrations.push({
+            renderer_api_version: 1,
+            plugin_id: renderer.plugin_id,
+            plugin_version: renderer.plugin_version,
+            manifest_digest: renderer.manifest_digest,
+            renderer_id: renderer.renderer_id,
+            kind: renderer.kind,
+            kind_version: renderer.kind_version,
+            surface,
+            device,
+            mode: 'custom',
+            custom_source: structuredClone(renderer.source),
           })
         }
       }
@@ -73,6 +94,7 @@ export function buildProjectedGenerativeUiRegistry(
           renderer_api_version: 1,
           plugin_id: renderer.plugin_id,
           plugin_version: renderer.plugin_version,
+          manifest_digest: renderer.manifest_digest,
           renderer_id: renderer.renderer_id,
           kind: renderer.kind,
           kind_version: renderer.kind_version,

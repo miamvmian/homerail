@@ -4,13 +4,17 @@ import type {
   GenerativeUiDocumentScopeV1,
   GenerativeUiSurfaceContextV1,
 } from "homerail-protocol";
+import {
+  resolveVoiceSessionGenerativeUiMode,
+  VoiceGenerativeUiSessionNotFoundError,
+} from "../generative-ui/session-mode.js";
 import { getGenerativeUiKindRegistry } from "../generative-ui/kind-registry.js";
 import { persistentGenerativeUiDocumentService } from "../generative-ui/shadow-service.js";
 import { composeGenerativeUi } from "../generative-ui/surface-composer.js";
 import { persistentGenerativeUiUserOverrideService } from "../generative-ui/user-override-service.js";
+import { getPluginToolInvocationService } from "../plugins/action-bus.js";
 
 const STREAM_VERSION = 1 as const;
-const PURPOSE = "legacy_widget_shadow" as const;
 const MAX_OVERRIDE_BODY_BYTES = 16 * 1024;
 
 class GenerativeUiHttpError extends Error {
@@ -29,6 +33,17 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
 
 function scopeFor(sessionId: string): GenerativeUiDocumentScopeV1 {
   return { type: "voice_session", id: sessionId };
+}
+
+function sessionMode(sessionId: string) {
+  try {
+    return resolveVoiceSessionGenerativeUiMode(sessionId);
+  } catch (cause) {
+    if (cause instanceof VoiceGenerativeUiSessionNotFoundError) {
+      throw new GenerativeUiHttpError(404, "Voice workspace not found");
+    }
+    throw cause;
+  }
 }
 
 function enumParam<T extends string>(
@@ -57,10 +72,22 @@ function surfaceContext(url: URL, sessionId: string): GenerativeUiSurfaceContext
 
 function projection(sessionId: string, context: GenerativeUiSurfaceContextV1) {
   const scope = scopeFor(sessionId);
-  const activeDocument = persistentGenerativeUiDocumentService.findActiveForScope(scope, PURPOSE);
+  const mode = sessionMode(sessionId);
+  if (mode === "off") return null;
+  const purpose = mode === "prefer" ? "canonical" : "legacy_widget_shadow";
+  const activeDocument = persistentGenerativeUiDocumentService.findActiveForScope(scope, purpose);
   const document = activeDocument
-    ?? persistentGenerativeUiDocumentService.getLatestForScope(scope, PURPOSE, true);
-  if (!document) return null;
+    ?? persistentGenerativeUiDocumentService.getLatestForScope(scope, purpose, true);
+  const pendingToolConfirmations = mode === "prefer" && activeDocument
+    ? getPluginToolInvocationService().pendingConfirmations(scope)
+    : [];
+  if (
+    !document
+    || (mode === "prefer" && (
+      !activeDocument
+      || (document.nodes.length === 0 && pendingToolConfirmations.length === 0)
+    ))
+  ) return null;
   const cursor = persistentGenerativeUiDocumentService.getCursor(document.document_id, scope);
   const overrides = persistentGenerativeUiUserOverrideService.list(document.document_id, scope, true);
   const registry = getGenerativeUiKindRegistry();
@@ -71,23 +98,31 @@ function projection(sessionId: string, context: GenerativeUiSurfaceContextV1) {
     registry.compositionMetadata(),
   );
   return {
+    mode,
+    authoritative: mode === "prefer",
+    purpose,
     scope,
     document,
     cursor,
     overrides,
     composition,
     uiRegistry: registry.uiProjection(),
+    pendingToolConfirmations,
     active: Boolean(activeDocument),
   };
 }
 
 function projectionEtag(current: NonNullable<ReturnType<typeof projection>>): string {
   const hash = crypto.createHash("sha256").update(JSON.stringify({
+    mode: current.mode,
+    authoritative: current.authoritative,
+    purpose: current.purpose,
     document_id: current.document.document_id,
     revision: current.document.revision,
     overrides: current.overrides,
     context: current.composition.context,
     plugin_registry: current.uiRegistry.registry_fingerprint,
+    pending_tool_confirmations: current.pendingToolConfirmations,
   })).digest("hex").slice(0, 32);
   return `"gui-${hash}"`;
 }
@@ -243,14 +278,15 @@ export function generativeUiRoutesHandler(
         success: true,
         data: {
           stream_version: STREAM_VERSION,
-          mode: "shadow",
-          authoritative: false,
-          purpose: PURPOSE,
+          mode: current.mode,
+          authoritative: current.authoritative,
+          purpose: current.purpose,
           document: current.document,
           cursor: current.cursor,
           overrides: current.overrides,
           composition: current.composition,
           ui_registry: current.uiRegistry,
+          pending_tool_confirmations: current.pendingToolConfirmations,
         },
       });
       return true;
@@ -273,8 +309,8 @@ export function generativeUiRoutesHandler(
         type: "generative_ui",
         event: "snapshot",
         stream_version: STREAM_VERSION,
-        authoritative: false,
-        purpose: PURPOSE,
+        authoritative: current.authoritative,
+        purpose: current.purpose,
         cursor: current.cursor,
         document: current.document,
         overrides: current.overrides,
@@ -286,7 +322,8 @@ export function generativeUiRoutesHandler(
           type: "generative_ui",
           event: "transaction",
           stream_version: STREAM_VERSION,
-          authoritative: false,
+          authoritative: current.authoritative,
+          purpose: current.purpose,
           ...committed,
           revision: committed.committed_revision,
         })}\n`);
@@ -299,8 +336,8 @@ export function generativeUiRoutesHandler(
       success: true,
       data: {
         stream_version: STREAM_VERSION,
-        authoritative: false,
-        purpose: PURPOSE,
+        authoritative: current.authoritative,
+        purpose: current.purpose,
         document_id: current.document.document_id,
         head_revision: current.document.revision,
         transactions: page,

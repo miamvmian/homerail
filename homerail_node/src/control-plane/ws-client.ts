@@ -1,6 +1,7 @@
 import WebSocket from "ws";
 import type { ExecutionProvider } from "../providers/types.js";
 import { handleLifecycleRequest, type LifecycleRequest, type LifecycleResponse } from "./lifecycle-handler.js";
+import type { PluginRuntimeService } from "../runtime/plugin-runtime-service.js";
 
 export interface NodeClientOptions {
   managerUrl: string;
@@ -10,6 +11,7 @@ export interface NodeClientOptions {
   capabilities?: string[];
   reconnectInitialDelayMs?: number;
   reconnectMaxDelayMs?: number;
+  pluginRuntime?: PluginRuntimeService;
 }
 
 export interface NodeClient {
@@ -110,7 +112,7 @@ export function createNodeClient(options: NodeClientOptions): NodeClient {
               socket.send(JSON.stringify(resp));
             }
           };
-          handleLifecycleRequest(request, provider, send).catch(() => {
+          handleLifecycleRequest(request, provider, send, { pluginRuntime: options.pluginRuntime }).catch(() => {
             // Handler already sends error response
           });
         }

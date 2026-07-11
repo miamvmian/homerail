@@ -2,14 +2,16 @@ import AjvModule from "ajv";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { validatePluginSkill } from "homerail-plugin-sdk";
+import {
+  validatePluginCustomRendererSource,
+  validatePluginSkill,
+} from "homerail-plugin-sdk";
 import {
   GENERATIVE_UI_IR_VERSION,
   HOMERAIL_PLUGIN_SCHEMA_MAX_BYTES,
   HOMERAIL_PLUGIN_SKILL_MAX_BYTES,
   HOMERAIL_PLUGIN_API_VERSION,
   HOMERAIL_RENDERER_API_VERSION,
-  HomerailPluginRendererMode,
   HomerailPluginRuntimeTrust,
   analyzeHomerailPluginSchemaPolicy,
   decodeHomerailPluginUtf8,
@@ -38,6 +40,8 @@ const MAX_PACKAGE_BYTES = 4 * 1024 * 1024;
 
 export interface LoadPluginPackageOptions {
   source: "builtin" | "installed" | "development";
+  /** Package lifecycle only: resolve executable bytes that remain staged until explicit M6 Runtime preflight. */
+  allow_staged_runtime?: boolean;
   trusted_builtin_ids?: ReadonlySet<string>;
   builtin_renderer_ids?: ReadonlySet<string>;
   legacy_bridge_plugin_ids?: ReadonlySet<string>;
@@ -96,12 +100,30 @@ function validateCompiledSchema(schemaId: string, schema: Record<string, unknown
   }
 }
 
+function schemaAtPointer(schema: Record<string, unknown>, pointer: string): Record<string, unknown> | undefined {
+  if (pointer === "") return schema;
+  let current: unknown = schema;
+  for (const encoded of pointer.slice(1).split("/")) {
+    const segment = encoded.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
+    const properties = (current as Record<string, unknown>).properties;
+    if (!properties || typeof properties !== "object" || Array.isArray(properties)) return undefined;
+    current = (properties as Record<string, unknown>)[segment];
+  }
+  return current && typeof current === "object" && !Array.isArray(current)
+    ? current as Record<string, unknown>
+    : undefined;
+}
+
 function enforceM3TrustPolicy(
   manifest: HomerailPluginManifestV1,
   options: LoadPluginPackageOptions,
 ): void {
-  if (manifest.runtime.trust === HomerailPluginRuntimeTrust.SANDBOXED_RUNTIME) {
-    throw new Error(`Executable plugin runtimes are not enabled in M3: ${manifest.id}`);
+  if (
+    manifest.runtime.trust === HomerailPluginRuntimeTrust.SANDBOXED_RUNTIME
+    && (options.source !== "installed" || options.allow_staged_runtime !== true)
+  ) {
+    throw new Error(`Executable plugin runtimes may only be retained as staged installed packages before M6: ${manifest.id}`);
   }
   if (
     manifest.runtime.trust === HomerailPluginRuntimeTrust.TRUSTED_BUILTIN
@@ -110,9 +132,6 @@ function enforceM3TrustPolicy(
     throw new Error(`Plugin is not authorized for trusted_builtin: ${manifest.id}`);
   }
   for (const renderer of manifest.renderers) {
-    if (renderer.mode === HomerailPluginRendererMode.CUSTOM) {
-      throw new Error(`Custom renderers are not enabled in M3: ${renderer.id}`);
-    }
     if (
       renderer.source.type === "builtin"
       && (
@@ -183,11 +202,17 @@ export function loadPluginPackage(
     };
   });
   for (const renderer of manifest.renderers) {
-    if (renderer.source.type !== "declarative") continue;
-    const document = parseJsonObject(buffers.get(renderer.source.file)!, renderer.source.file);
-    const rendererValidation = validateHomerailDeclarativeRenderer(document);
-    if (!rendererValidation.valid) {
-      throw new Error(`Invalid declarative Renderer ${renderer.id}: ${JSON.stringify(rendererValidation.errors)}`);
+    if (renderer.source.type === "declarative") {
+      const document = parseJsonObject(buffers.get(renderer.source.file)!, renderer.source.file);
+      const rendererValidation = validateHomerailDeclarativeRenderer(document);
+      if (!rendererValidation.valid) {
+        throw new Error(`Invalid declarative Renderer ${renderer.id}: ${JSON.stringify(rendererValidation.errors)}`);
+      }
+    } else if (renderer.source.type === "custom") {
+      validatePluginCustomRendererSource(
+        buffers.get(renderer.source.file)!,
+        `Custom Renderer ${renderer.id} (${renderer.source.file})`,
+      );
     }
   }
   for (const tool of manifest.tools) {
@@ -218,6 +243,25 @@ export function loadPluginPackage(
     if (tool.output_schema !== targetVersion.content_schema) {
       throw new Error(`Tool projection ${tool.id} output_schema must match its target kind content schema`);
     }
+    const inputSchema = schemas.find((schema) => schema.id === tool.input_schema)?.schema;
+    for (const projectedAction of projectionValidation.value.actions ?? []) {
+      const action = manifest.actions.find((entry) => entry.id === projectedAction.id);
+      if (!action || !targetVersion.actions.includes(action.id)) {
+        throw new Error(`Tool projection ${tool.id} materializes an Action not allowed by its target Kind: ${projectedAction.id}`);
+      }
+      const delegatedTool = manifest.tools.find((entry) => entry.id === action.tool);
+      if (!delegatedTool?.exposure.includes("action")) {
+        throw new Error(`Projected Action ${action.id} does not delegate to an Action-exposed Tool`);
+      }
+      if (projectedAction.arguments_pointer) {
+        const argumentSchema = inputSchema
+          ? schemaAtPointer(inputSchema, projectedAction.arguments_pointer)
+          : undefined;
+        if (!argumentSchema || argumentSchema.type !== "object") {
+          throw new Error(`Projected Action ${action.id} arguments_pointer must resolve to an object in Tool input_schema`);
+        }
+      }
+    }
     const outputSchema = schemas.find((schema) => schema.id === tool.output_schema)?.schema;
     const outputProperties = outputSchema?.properties;
     if (
@@ -228,6 +272,31 @@ export function loadPluginPackage(
       && Object.prototype.hasOwnProperty.call(outputProperties, "visual")
     ) {
       throw new Error(`Legacy UI bridge Tool ${tool.id} cannot reserve the content field visual`);
+    }
+  }
+  for (const action of manifest.actions) {
+    const delegatedTool = manifest.tools.find((tool) => tool.id === action.tool);
+    if (!delegatedTool) throw new Error(`Action ${action.id} delegates to a missing Tool`);
+    if (!manifest.capabilities.some((capability) => capability.actions.includes(action.id))) {
+      throw new Error(`Action ${action.id} is not reachable from a capability`);
+    }
+    const exposedBy = manifest.kinds.flatMap((kind) => kind.versions
+      .filter((version) => version.actions.includes(action.id))
+      .map((version) => ({ kind, version })));
+    if (!exposedBy.length) throw new Error(`Action is not exposed by a Kind version: ${action.id}`);
+    if (delegatedTool.handler.type === "projection") {
+      const projection = validateHomerailDirectUiProjection(
+        parseJsonObject(buffers.get(delegatedTool.handler.file)!, delegatedTool.handler.file),
+      );
+      if (!projection.valid || !projection.value) throw new Error(`Action Tool projection is invalid: ${action.id}`);
+      if (projection.value.legacy_bridge) {
+        throw new Error(`Action Tool projections cannot emit legacy UI bridges: ${manifest.id}:${action.id}`);
+      }
+      for (const { kind, version } of exposedBy) {
+        if (kind.kind !== projection.value.kind || version.version !== projection.value.kind_version) {
+          throw new Error(`Action Tool ${delegatedTool.id} must preserve every exposing Kind version for ${action.id}`);
+        }
+      }
     }
   }
   const skills = manifest.skills.map((declaration) => {

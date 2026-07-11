@@ -1,9 +1,10 @@
 /**
  * Generative UI rollout modes that are safe to use before the new UI becomes
- * authoritative. `prefer` and `strict` are intentionally reserved for a later
- * milestone and must not silently degrade to shadow mode.
+ * authoritative. `prefer` keeps the legacy workspace as a fallback while an
+ * available canonical Document becomes authoritative. `strict` remains
+ * reserved until the legacy production path can be retired explicitly.
  */
-export const GENERATIVE_UI_MODES = ["off", "shadow"] as const;
+export const GENERATIVE_UI_MODES = ["off", "shadow", "prefer"] as const;
 
 export type GenerativeUiMode = (typeof GENERATIVE_UI_MODES)[number];
 
@@ -24,7 +25,7 @@ export class GenerativeUiModeValidationError extends Error {
 
   constructor(value: unknown, source: string) {
     const rendered = typeof value === "string" ? value.trim() : String(value);
-    const detail = rendered === "prefer" || rendered === "strict"
+    const detail = rendered === "strict"
       ? `Generative UI mode '${rendered}' is reserved and is not available in this release.`
       : `Generative UI mode must be one of: ${GENERATIVE_UI_MODES.join(", ")}. Received: '${rendered}'.`;
     super(`${source}: ${detail}`);
@@ -43,7 +44,7 @@ export function parseGenerativeUiMode(
   if (typeof value !== "string") throw new GenerativeUiModeValidationError(value, source);
   const normalized = value.trim().toLowerCase();
   if (!normalized) return DEFAULT_GENERATIVE_UI_MODE;
-  if (normalized === "off" || normalized === "shadow") return normalized;
+  if (normalized === "off" || normalized === "shadow" || normalized === "prefer") return normalized;
   throw new GenerativeUiModeValidationError(normalized, source);
 }
 
@@ -89,7 +90,7 @@ export function resolveConfiguredGenerativeUiModeDetails(
 /**
  * Resolve an existing session without silently upgrading it. Sessions created
  * before the snapshot field existed remain off. A current global `off` always
- * wins so operators can disable shadow work immediately.
+ * wins so operators can disable projection work immediately.
  */
 export function resolveSessionGenerativeUiMode(
   sessionSnapshotValue: unknown,

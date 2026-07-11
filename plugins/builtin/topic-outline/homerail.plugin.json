@@ -76,6 +76,7 @@
     {
       "id": "upsert_topic_outline",
       "description": "Create or replace the complete current topic outline. Reuse a stable id across revisions.",
+      "exposure": ["agent"],
       "input_schema": "topic-outline-input-v1",
       "output_schema": "topic-outline-content-v1",
       "effect": "write",

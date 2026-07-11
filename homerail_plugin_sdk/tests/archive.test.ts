@@ -1,9 +1,12 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { generateKeyPairSync } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildHrpArchive,
+  buildSignedHrpArchive,
+  canonicalHrpJsonBytes,
   decodeHrpZip,
   encodeHrpZip,
   extractVerifiedHrpArchive,
@@ -185,6 +188,69 @@ describe("deterministic HRP archive", () => {
     decoded.set(HRP_LOCK_FILE, Buffer.from(`${JSON.stringify(lock, null, 2)}\n`));
     const noncanonical = encodeHrpZip([...decoded.entries()].map(([filePath, content]) => ({ path: filePath, content })));
     expect(() => verifyHrpArchive(noncanonical)).toThrow(/canonical JSON bytes/);
+  });
+
+  it("signs the immutable lock deterministically and resolves publisher trust", () => {
+    const { privateKey } = generateKeyPairSync("ed25519");
+    const first = buildSignedHrpArchive(files(), {
+      publisher: "Example Publisher",
+      private_key: privateKey,
+    });
+    const second = buildSignedHrpArchive([...files()].reverse(), {
+      publisher: "Example Publisher",
+      private_key: privateKey,
+    });
+    expect(first.archive.equals(second.archive)).toBe(true);
+
+    const untrusted = verifyHrpArchive(first.archive, { allow_signature: true });
+    expect(untrusted.signature_state).toBe("untrusted");
+    expect(untrusted.signature?.statement).toEqual(first.signature);
+
+    const trustEntry = {
+      publisher: first.signature.publisher,
+      key_id: first.signature.key_id,
+      public_key_spki: first.signature.public_key_spki,
+      state: "trusted" as const,
+    };
+    expect(verifyHrpArchive(first.archive, {
+      allow_signature: true,
+      trust_store: [trustEntry],
+      require_trusted_signature: true,
+    }).signature_state).toBe("verified");
+    expect(verifyHrpArchive(first.archive, {
+      allow_signature: true,
+      trust_store: [{ ...trustEntry, state: "revoked" }],
+    }).signature_state).toBe("revoked");
+    expect(() => verifyHrpArchive(first.archive, {
+      allow_signature: true,
+      trust_store: [{ ...trustEntry, state: "revoked" }],
+      require_trusted_signature: true,
+    })).toThrow(/requires a trusted publisher signature; received revoked/);
+  });
+
+  it("rejects signature tampering, noncanonical metadata, and unsigned trust requirements", () => {
+    const { privateKey } = generateKeyPairSync("ed25519");
+    const signed = buildSignedHrpArchive(files(), {
+      publisher: "Example Publisher",
+      private_key: privateKey,
+    });
+    const decoded = decodeHrpZip(signed.archive);
+    const statement = JSON.parse(decoded.get(HRP_SIGNATURE_FILE)!.toString("utf8")) as Record<string, unknown>;
+    statement.signature = Buffer.alloc(64, 0xa5).toString("base64url");
+    decoded.set(HRP_SIGNATURE_FILE, canonicalHrpJsonBytes(statement));
+    const tampered = encodeHrpZip([...decoded.entries()].map(([filePath, content]) => ({ path: filePath, content })));
+    expect(() => verifyHrpArchive(tampered, { allow_signature: true })).toThrow(/signature is invalid/);
+
+    const noncanonicalFiles = decodeHrpZip(signed.archive);
+    const validStatement = JSON.parse(noncanonicalFiles.get(HRP_SIGNATURE_FILE)!.toString("utf8")) as unknown;
+    noncanonicalFiles.set(HRP_SIGNATURE_FILE, Buffer.from(`${JSON.stringify(validStatement, null, 2)}\n`));
+    const noncanonical = encodeHrpZip([...noncanonicalFiles.entries()]
+      .map(([filePath, content]) => ({ path: filePath, content })));
+    expect(() => verifyHrpArchive(noncanonical, { allow_signature: true })).toThrow(/canonical JSON bytes/);
+
+    expect(() => verifyHrpArchive(buildHrpArchive(files()).archive, {
+      require_trusted_signature: true,
+    })).toThrow(/received unsigned/);
   });
 
   it("fails boundedly for oversized files and entry counts", () => {

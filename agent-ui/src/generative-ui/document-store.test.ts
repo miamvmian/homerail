@@ -147,6 +147,26 @@ describe('GenerativeUiProjectionCache', () => {
     expect(cache.current()?.ui_registry.registry_revision).toBe(2)
   })
 
+  it('accepts only the exact authoritative prefer/canonical envelope pairing', () => {
+    const cache = new GenerativeUiProjectionCache()
+    const canonical: GenerativeUiProjectionV1 = {
+      ...projection(),
+      mode: 'prefer',
+      authoritative: true,
+      purpose: 'canonical',
+      pending_tool_confirmations: [],
+    }
+    cache.acceptProjection(canonical)
+    expect(cache.current()).toMatchObject({
+      mode: 'prefer',
+      authoritative: true,
+      purpose: 'canonical',
+    })
+
+    const downgraded = { ...canonical, authoritative: false } as unknown as GenerativeUiProjectionV1
+    expect(() => cache.acceptProjection(downgraded)).toThrow('projection envelope')
+  })
+
   it('accepts snapshot stream events and ignores ledger rows already covered by the snapshot cursor', () => {
     const cache = new GenerativeUiProjectionCache()
     const current = projection()

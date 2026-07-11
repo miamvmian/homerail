@@ -9,10 +9,12 @@ import {
 import {
   buildHrpArchive,
   generatePluginTypes,
+  HOMERAIL_CUSTOM_RENDERER_SOURCE_MAX_BYTES,
   runPluginFixtureMatrix,
   scaffoldPluginProject,
   scanPluginSource,
   sourceFilesForPack,
+  validatePluginCustomRendererSource,
   validatePluginFiles,
   verifyPluginArchive,
 } from "../src/index.js";
@@ -29,6 +31,113 @@ function temp(name: string): string {
   return root;
 }
 
+function addProjectionAction(root: string): void {
+  const manifestFile = path.join(root, "homerail.plugin.json");
+  const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8")) as {
+    id: string;
+    capabilities: Array<{ actions: string[]; tools: string[] }>;
+    schemas: Array<{ id: string; file: string }>;
+    kinds: Array<{ versions: Array<{ actions: string[] }> }>;
+    tools: Array<Record<string, unknown>>;
+    actions: Array<Record<string, unknown>>;
+    permissions: { optional: Array<Record<string, unknown>> };
+  };
+  const contentSchema = JSON.parse(
+    fs.readFileSync(path.join(root, "schemas/card-content.v1.schema.json"), "utf8"),
+  ) as Record<string, unknown>;
+  fs.writeFileSync(path.join(root, "schemas/card-action.v1.schema.json"), `${JSON.stringify({
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    properties: {
+      id: { type: "string", minLength: manifest.id.length + 2, maxLength: 256 },
+      content: contentSchema,
+    },
+    required: ["id", "content"],
+    additionalProperties: false,
+  }, null, 2)}\n`);
+  fs.writeFileSync(path.join(root, "ui/projectors/card-action.v1.json"), `${JSON.stringify({
+    projection_version: 1,
+    type: "direct_ui_node",
+    kind: `${manifest.id}/card`,
+    kind_version: 1,
+    node_id_pointer: "/id",
+    content_pointer: "/content",
+    omit_content_fields: [],
+    fallback: { title_pointer: "/content/title", summary_pointer: "/content/summary" },
+    defaults: { surface: "task", importance: "primary", density: "detail", persistence: "session" },
+  }, null, 2)}\n`);
+  manifest.schemas.push({ id: "card-action-v1", file: "schemas/card-action.v1.schema.json" });
+  manifest.capabilities[0].actions.push("replace_card");
+  manifest.kinds[0].versions[0].actions.push("replace_card");
+  manifest.tools.push({
+    id: "replace_card_tool",
+    description: "Replace the selected card through an Action-bound Tool.",
+    exposure: ["action"],
+    input_schema: "card-action-v1",
+    output_schema: "card-content-v1",
+    effect: "write",
+    permissions: ["artifact.write"],
+    confirmation: "always",
+    handler: { type: "projection", file: "ui/projectors/card-action.v1.json" },
+  });
+  manifest.permissions.optional.push({ permission: "artifact.write" });
+  manifest.actions.push({
+    id: "replace_card",
+    intent: `${manifest.id}.replace_card`,
+    tool: "replace_card_tool",
+  });
+  fs.writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+function addWorkflow(root: string, options: { reachable?: boolean; runtime?: boolean } = {}): void {
+  const manifestFile = path.join(root, "homerail.plugin.json");
+  const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8")) as {
+    id: string;
+    capabilities: Array<{ tools: string[]; workflows: string[] }>;
+    tools: Array<Record<string, unknown>>;
+    workflows: Array<Record<string, unknown>>;
+    runtime: Record<string, unknown>;
+  };
+  manifest.capabilities[0].tools = [];
+  manifest.capabilities[0].workflows = options.reachable === false ? [] : ["compose-workflow"];
+  manifest.tools = [];
+  manifest.workflows = [{
+    id: "compose-workflow",
+    uri: `plugin://${manifest.id}/workflows/compose-workflow`,
+    file: "workflows/compose-workflow.yaml",
+    effect: "read",
+    permissions: [],
+    confirmation: "never",
+  }];
+  fs.mkdirSync(path.join(root, "workflows"), { recursive: true });
+  fs.writeFileSync(path.join(root, "workflows/compose-workflow.yaml"), "workflow_version: 1\nid: compose-workflow\n");
+  fs.rmSync(path.join(root, "ui/projectors/card.v1.json"));
+  if (options.runtime) {
+    manifest.runtime = {
+      trust: "sandboxed_runtime",
+      plugin_api: 1,
+      entrypoint: { file: "runtime/index.js", args: [] },
+    };
+    fs.mkdirSync(path.join(root, "runtime"), { recursive: true });
+    fs.writeFileSync(path.join(root, "runtime/index.js"), "export {};\n");
+  }
+  fs.writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+function addCustomRenderer(root: string, source: string): void {
+  const manifestFile = path.join(root, "homerail.plugin.json");
+  const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8")) as {
+    renderers: Array<Record<string, unknown>>;
+  };
+  manifest.renderers[0] = {
+    ...manifest.renderers[0],
+    mode: "custom",
+    source: { type: "custom", file: "ui/views/custom.mjs" },
+  };
+  fs.writeFileSync(path.join(root, "ui/views/custom.mjs"), source);
+  fs.writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
 describe("HomeRail plugin project SDK", () => {
   it("runs empty directory -> scaffold -> codegen -> fixture matrix -> pack -> verify", () => {
     const root = temp("homerail-plugin-scaffold");
@@ -36,7 +145,12 @@ describe("HomeRail plugin project SDK", () => {
     expect(scaffold.files).toContain("homerail.plugin.json");
 
     const snapshot = scanPluginSource(root);
-    expect(snapshot).toMatchObject({ valid: true, m4_data_only_eligible: true });
+    expect(snapshot).toMatchObject({
+      valid: true,
+      m4_data_only_eligible: true,
+      m5_projection_action_eligible: false,
+      m5_projection_action_eligibility_reasons: ["projection_action_required"],
+    });
     expect(snapshot.issues).toEqual([]);
 
     expect(() => generatePluginTypes(root, { check: true })).toThrow(/types are stale/);
@@ -59,8 +173,272 @@ describe("HomeRail plugin project SDK", () => {
     expect(verifyPluginArchive(first.archive).snapshot).toMatchObject({
       valid: true,
       m4_data_only_eligible: true,
+      m5_projection_action_eligible: false,
+      m5_projection_action_eligibility_reasons: ["projection_action_required"],
       manifest: { id: "com.example.release-notes", version: "0.1.0" },
     });
+  });
+
+  it("snapshots, packs, and verifies an M5 data-only projection Action without changing M4 eligibility", () => {
+    const root = temp("homerail-plugin-action");
+    scaffoldPluginProject(root, "com.example.action-card");
+    addProjectionAction(root);
+
+    const snapshot = scanPluginSource(root);
+    expect(snapshot.issues).toEqual([expect.objectContaining({
+      severity: "warning",
+      message: expect.stringContaining("M4 data-only"),
+    })]);
+    expect(snapshot).toMatchObject({
+      valid: true,
+      m4_data_only_eligible: false,
+      m5_projection_action_eligible: true,
+      m5_projection_action_eligibility_reasons: [],
+    });
+    const built = buildHrpArchive(sourceFilesForPack(snapshot));
+    expect(verifyPluginArchive(built.archive).snapshot).toMatchObject({
+      valid: true,
+      m4_data_only_eligible: false,
+      m5_projection_action_eligible: true,
+      m5_projection_action_eligibility_reasons: [],
+    });
+  });
+
+  it("classifies immutable data-only Workflows for the M5 resolution-only tier", () => {
+    const root = temp("homerail-plugin-workflow");
+    scaffoldPluginProject(root, "com.example.workflow-card");
+    addWorkflow(root);
+
+    const snapshot = scanPluginSource(root);
+    expect(snapshot).toMatchObject({
+      valid: true,
+      m4_data_only_eligible: false,
+      m5_projection_action_eligible: false,
+      m5_workflow_resolution_eligible: true,
+      m5_workflow_resolution_eligibility_reasons: [],
+    });
+    const verified = verifyPluginArchive(
+      buildHrpArchive(sourceFilesForPack(snapshot)).archive,
+    ).snapshot;
+    expect(verified).toMatchObject({
+      m5_workflow_resolution_eligible: true,
+      m5_workflow_resolution_eligibility_reasons: [],
+    });
+
+    const unreachable = temp("homerail-plugin-unreachable-workflow");
+    scaffoldPluginProject(unreachable, "com.example.unreachable-workflow");
+    addWorkflow(unreachable, { reachable: false });
+    expect(scanPluginSource(unreachable)).toMatchObject({
+      valid: true,
+      m5_workflow_resolution_eligible: false,
+      m5_workflow_resolution_eligibility_reasons: ["unreachable_workflow"],
+    });
+
+    const executable = temp("homerail-plugin-runtime-workflow");
+    scaffoldPluginProject(executable, "com.example.runtime-workflow");
+    addWorkflow(executable, { runtime: true });
+    expect(scanPluginSource(executable)).toMatchObject({
+      valid: true,
+      m5_workflow_resolution_eligible: false,
+      m5_workflow_resolution_eligibility_reasons: expect.arrayContaining([
+        "runtime_trust_not_data_only",
+        "runtime_entrypoint_present",
+      ]),
+    });
+  });
+
+  it("rejects unsafe Action projections and reports runtime Actions as M6-only", () => {
+    const invalidProjection = temp("homerail-plugin-invalid-action-projection");
+    scaffoldPluginProject(invalidProjection, "com.example.invalid-action");
+    addProjectionAction(invalidProjection);
+    const projectionFile = path.join(invalidProjection, "ui/projectors/card-action.v1.json");
+    const projection = JSON.parse(fs.readFileSync(projectionFile, "utf8")) as Record<string, unknown>;
+    projection.node_id_pointer = "/input/id";
+    projection.content_pointer = "/node/content";
+    fs.writeFileSync(projectionFile, `${JSON.stringify(projection, null, 2)}\n`);
+    expect(scanPluginSource(invalidProjection)).toMatchObject({
+      valid: false,
+      m4_data_only_eligible: false,
+      m5_projection_action_eligible: false,
+      m5_projection_action_eligibility_reasons: expect.arrayContaining(["package_validation_failed"]),
+      issues: expect.arrayContaining([
+        expect.objectContaining({ severity: "error", message: expect.stringContaining("selected node id") }),
+      ]),
+    });
+
+    const schemaMismatch = temp("homerail-plugin-action-schema-mismatch");
+    scaffoldPluginProject(schemaMismatch, "com.example.action-schema-mismatch");
+    addProjectionAction(schemaMismatch);
+    const actionSchemaFile = path.join(schemaMismatch, "schemas/card-action.v1.schema.json");
+    const actionSchema = JSON.parse(fs.readFileSync(actionSchemaFile, "utf8")) as {
+      properties: { content: { properties: { title: Record<string, unknown> } } };
+    };
+    actionSchema.properties.content.properties.title = { type: "number" };
+    fs.writeFileSync(actionSchemaFile, `${JSON.stringify(actionSchema, null, 2)}\n`);
+    expect(scanPluginSource(schemaMismatch)).toMatchObject({
+      valid: false,
+      m5_projection_action_eligible: false,
+      issues: expect.arrayContaining([
+        expect.objectContaining({
+          severity: "error",
+          message: expect.stringContaining("exactly match its exposing Kind content schema"),
+        }),
+      ]),
+    });
+
+    const runtimeAction = temp("homerail-plugin-runtime-action");
+    scaffoldPluginProject(runtimeAction, "com.example.runtime-action");
+    addProjectionAction(runtimeAction);
+    const manifestFile = path.join(runtimeAction, "homerail.plugin.json");
+    const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8")) as {
+      runtime: Record<string, unknown>;
+      tools: Array<{ id: string; handler: Record<string, unknown> }>;
+    };
+    manifest.runtime = {
+      trust: "sandboxed_runtime",
+      plugin_api: 1,
+      entrypoint: { file: "runtime/index.js", args: [] },
+    };
+    manifest.tools.find((tool) => tool.id === "replace_card_tool")!.handler = {
+      type: "runtime",
+      method: "replace_card",
+    };
+    fs.mkdirSync(path.join(runtimeAction, "runtime"));
+    fs.writeFileSync(path.join(runtimeAction, "runtime/index.js"), "export {};\n");
+    fs.writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+    expect(scanPluginSource(runtimeAction)).toMatchObject({
+      valid: true,
+      m4_data_only_eligible: false,
+      m5_projection_action_eligible: false,
+      m5_projection_action_eligibility_reasons: expect.arrayContaining([
+        "runtime_trust_not_data_only",
+        "runtime_entrypoint_present",
+        "runtime_handler_present",
+      ]),
+    });
+
+    const customRenderer = temp("homerail-plugin-custom-action-renderer");
+    scaffoldPluginProject(customRenderer, "com.example.custom-action");
+    addProjectionAction(customRenderer);
+    addCustomRenderer(customRenderer, [
+      "export function render(payload) {",
+      "  const title = typeof payload.node?.fallback?.title === 'string'",
+      "    ? payload.node.fallback.title.slice(0, 120)",
+      "    : 'Custom card';",
+      "  return { view_version: 1, root: { type: 'text', variant: 'title', text: title } };",
+      "}",
+      "",
+    ].join("\n"));
+    expect(scanPluginSource(customRenderer)).toMatchObject({
+      valid: true,
+      m5_projection_action_eligible: false,
+      m5_projection_action_eligibility_reasons: expect.arrayContaining(["custom_renderer_present"]),
+      m6_custom_renderer_eligible: true,
+      m6_custom_renderer_eligibility_reasons: [],
+    });
+
+    const builtinAction = temp("homerail-plugin-builtin-action");
+    scaffoldPluginProject(builtinAction, "com.example.builtin-action");
+    addProjectionAction(builtinAction);
+    const builtinManifestFile = path.join(builtinAction, "homerail.plugin.json");
+    const builtinManifest = JSON.parse(fs.readFileSync(builtinManifestFile, "utf8")) as {
+      runtime: Record<string, unknown>;
+      tools: Array<{ id: string; handler: Record<string, unknown> }>;
+    };
+    builtinManifest.runtime = { trust: "trusted_builtin", plugin_api: 1 };
+    builtinManifest.tools.find((tool) => tool.id === "replace_card_tool")!.handler = {
+      type: "builtin",
+      id: "replace_card",
+    };
+    fs.writeFileSync(builtinManifestFile, `${JSON.stringify(builtinManifest, null, 2)}\n`);
+    expect(scanPluginSource(builtinAction)).toMatchObject({
+      valid: true,
+      m5_projection_action_eligible: false,
+      m5_projection_action_eligibility_reasons: expect.arrayContaining([
+        "runtime_trust_not_data_only",
+        "builtin_handler_present",
+      ]),
+    });
+  });
+
+  it("enforces the single-file Worker Renderer contract in validate, pack, and verify", () => {
+    const invalidSources = [
+      {
+        name: "legacy DOM bridge",
+        source: [
+          "export function render({ root, node }, bridge) {",
+          "  root.textContent = node.fallback.title;",
+          "  root.onclick = () => bridge.action('approve');",
+          "}",
+        ].join("\n"),
+        message: "exactly one export",
+      },
+      {
+        name: "module import",
+        source: [
+          "import { helper } from './helper.mjs';",
+          "export function render(payload) {",
+          "  return helper(payload);",
+          "}",
+        ].join("\n"),
+        message: "imports are forbidden",
+      },
+      {
+        name: "additional export",
+        source: [
+          "export const helper = () => 'not allowed';",
+          "export function render(payload) {",
+          "  return { view_version: 1, root: { type: 'text', text: helper(payload) } };",
+          "}",
+        ].join("\n"),
+        message: "exactly one export",
+      },
+    ];
+
+    for (const invalid of invalidSources) {
+      const root = temp(`homerail-plugin-custom-${invalid.name.replaceAll(" ", "-")}`);
+      scaffoldPluginProject(root, "com.example.invalid-custom");
+      addCustomRenderer(root, invalid.source);
+
+      const snapshot = scanPluginSource(root);
+      expect(snapshot).toMatchObject({
+        valid: false,
+        m6_custom_renderer_eligible: false,
+        m6_custom_renderer_eligibility_reasons: expect.arrayContaining(["package_validation_failed"]),
+      });
+      expect(snapshot.issues).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          path: "ui/views/custom.mjs",
+          severity: "error",
+          message: expect.stringContaining(invalid.message),
+        }),
+      ]));
+      expect(() => sourceFilesForPack(snapshot)).toThrow(/Cannot pack invalid plugin source/);
+
+      const archive = buildHrpArchive([...snapshot.files.entries()].map(([filePath, content]) => ({
+        path: filePath,
+        content,
+      }))).archive;
+      expect(() => verifyPluginArchive(archive)).toThrow(invalid.message);
+    }
+  });
+
+  it("bounds Worker Renderer source bytes and requires fatal UTF-8 decoding", () => {
+    const validPrefix = Buffer.from([
+      "export async function render(payload) {",
+      "  return { view_version: 1, root: { type: 'text', text: 'bounded' } };",
+      "}",
+      "",
+    ].join("\n"));
+    const atLimit = Buffer.concat([
+      validPrefix,
+      Buffer.alloc(HOMERAIL_CUSTOM_RENDERER_SOURCE_MAX_BYTES - validPrefix.byteLength, 0x20),
+    ]);
+    expect(validatePluginCustomRendererSource(atLimit)).toContain("async function render(payload)");
+    expect(() => validatePluginCustomRendererSource(Buffer.concat([atLimit, Buffer.from(" ")])))
+      .toThrow(`exceeds ${HOMERAIL_CUSTOM_RENDERER_SOURCE_MAX_BYTES} bytes`);
+    expect(() => validatePluginCustomRendererSource(Buffer.from([0xff])))
+      .toThrow(/valid UTF-8/);
   });
 
   it("rejects symbolic-link and non-directory codegen parents component by component", () => {

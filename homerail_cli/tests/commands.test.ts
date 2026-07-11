@@ -11,6 +11,7 @@ import {
   agentUiDevServerCommand,
   dockerMissingMessage,
   isMissingModelCredential,
+  mergeManagerAdminOrigins,
   shouldAbortStartForModelConfig,
   shouldServeStaticAgentUi,
   runWorkerImageDockerBuild,
@@ -1921,6 +1922,29 @@ describe("runtime command", () => {
     expect(options.windowsHide).toBe(true);
     expect(options).not.toHaveProperty("maxBuffer");
     expect(options.env?.HOMERAIL_HOME).toBe(tempHome);
+  });
+
+  it("lets process environment override local secrets for child services", () => {
+    const secretDir = join(tempHome, "secrets");
+    mkdirSync(secretDir, { recursive: true });
+    writeFileSync(join(secretDir, "env"), "HOMERAIL_TEST_PRECEDENCE=from-secret\n", { mode: 0o600 });
+    const previous = process.env.HOMERAIL_TEST_PRECEDENCE;
+    process.env.HOMERAIL_TEST_PRECEDENCE = "from-environment";
+    try {
+      expect(workerImageDockerBuildSpawnOptions().env?.HOMERAIL_TEST_PRECEDENCE)
+        .toBe("from-environment");
+    } finally {
+      restoreEnv("HOMERAIL_TEST_PRECEDENCE", previous);
+    }
+  });
+
+  it("derives exact UI proxy Origins while preserving explicit trusted Origins", () => {
+    expect(mergeManagerAdminOrigins(
+      "https://admin.example.test",
+      ["https://ui.example.test/app", "http://localhost:19193"],
+    )).toBe("http://localhost:19193,https://admin.example.test,https://ui.example.test");
+    expect(() => mergeManagerAdminOrigins("https://bad.example.test/path", []))
+      .toThrow(/without paths/);
   });
 
   it("streams worker image build output without buffering it", async () => {

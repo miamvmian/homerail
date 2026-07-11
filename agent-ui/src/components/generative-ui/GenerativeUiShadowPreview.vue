@@ -49,6 +49,11 @@ async function refresh(): Promise<void> {
   try {
     const response = await getVoiceGenerativeUiProjection(props.sessionId, currentContext())
     if (generation !== requestGeneration) return
+    if (
+      response.data.mode !== 'shadow'
+      || response.data.authoritative !== false
+      || response.data.purpose !== 'legacy_widget_shadow'
+    ) throw new Error('Manager did not return a read-only shadow Generative UI projection')
     cache.acceptProjection(response.data)
     projection.value = cache.current()
   } catch (cause) {
@@ -109,6 +114,7 @@ defineExpose({ acceptStreamEvent, refresh })
       :registry="runtimeRegistry?.renderers"
       :action-registry="runtimeRegistry?.actions"
       :interactive="false"
+      action-mode="disabled"
       @open-preview="emit('open-preview', $event)"
     />
   </section>

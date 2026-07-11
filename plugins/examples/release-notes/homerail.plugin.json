@@ -101,6 +101,7 @@
     {
       "id": "publish_release_notes",
       "description": "Create or replace one complete release-notes snapshot using a stable plugin-owned id.",
+      "exposure": ["agent"],
       "input_schema": "release-notes-input-v1",
       "output_schema": "release-notes-content-v1",
       "effect": "write",

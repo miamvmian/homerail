@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import {
+  homerailPluginTurnContextDigestInput,
   type HomerailPluginResolvedHandlerV1,
   type HomerailPluginSkillDescriptorV1,
   type HomerailPluginModality,
@@ -10,6 +12,7 @@ import {
 } from "homerail-protocol";
 import {
   getPluginRegistryState,
+  getPluginPermissionRevision,
   listPluginPackages,
   type ActivePluginRecord,
   type PluginPackageRecord,
@@ -131,16 +134,9 @@ export function assemblePluginTurnContext(
       });
     }
     for (const tool of manifest.tools) {
+      if (!tool.exposure.includes("agent")) continue;
       const toolCapabilities = capabilities.filter((capability) => capability.tools.includes(tool.id));
       if (!toolCapabilities.length) continue;
-      // M3 exposes only the policy subset implemented by the shared executor.
-      if (
-        tool.handler.type !== "projection"
-        || tool.effect !== "write"
-        || tool.permissions.length
-        || tool.confirmation !== "never"
-        || !tool.output_schema
-      ) continue;
       const inputSchema = schemas.get(tool.input_schema);
       const outputSchema = tool.output_schema ? schemas.get(tool.output_schema) : undefined;
       if (!inputSchema || (tool.output_schema && !outputSchema)) {
@@ -162,7 +158,7 @@ export function assemblePluginTurnContext(
         input_schema: structuredClone(inputSchema),
         ...(outputSchema ? { output_schema: structuredClone(outputSchema) } : {}),
         effect: tool.effect,
-        permissions: [],
+        permissions: [...tool.permissions],
         confirmation: tool.confirmation,
         handler: resolvedHandler(plugin, tool.handler),
       });
@@ -196,7 +192,7 @@ export function assemblePluginTurnContext(
     skills,
     tools,
     actions,
-    permission_revision: 0,
+    permission_revision: getPluginPermissionRevision(),
   };
   const context: HomerailPluginTurnContextV1 = {
     ...unsigned,
@@ -205,6 +201,93 @@ export function assemblePluginTurnContext(
   const validation = validateHomerailPluginTurnContext(context);
   if (!validation.valid) throw new Error(`Invalid assembled Plugin Context: ${JSON.stringify(validation.errors)}`);
   return validation.value ?? context;
+}
+
+/**
+ * Produce a wire-compatible M3 context containing only assets reachable from
+ * the router's explicit capability selection. The source context remains
+ * immutable and its exact plugin versions/digests are preserved.
+ */
+export function selectPluginTurnContext(
+  context: HomerailPluginTurnContextV1,
+  selectedCapabilityIds: readonly string[],
+  permissionRevision = context.permission_revision,
+): HomerailPluginTurnContextV1 {
+  const selected = new Set(selectedCapabilityIds);
+  const filterCapabilities = (capabilityIds: readonly string[]): string[] => (
+    capabilityIds.filter((id) => selected.has(id)).sort()
+  );
+  const skills = context.skills
+    .map((skill) => ({ ...structuredClone(skill), capability_ids: filterCapabilities(skill.capability_ids) }))
+    .filter((skill) => skill.capability_ids.length > 0);
+  const tools = context.tools
+    .map((tool) => ({ ...structuredClone(tool), capability_ids: filterCapabilities(tool.capability_ids) }))
+    .filter((tool) => tool.capability_ids.length > 0);
+  const actions = context.actions
+    .map((action) => ({ ...structuredClone(action), capability_ids: filterCapabilities(action.capability_ids) }))
+    .filter((action) => action.capability_ids.length > 0);
+  const pluginIds = new Set([
+    ...skills.map((skill) => skill.plugin_id),
+    ...tools.map((tool) => tool.plugin_id),
+    ...actions.map((action) => action.plugin_id),
+  ]);
+  const unsigned = {
+    context_version: 1 as const,
+    registry_revision: context.registry_revision,
+    enabled_plugins: context.enabled_plugins.filter((plugin) => pluginIds.has(plugin.id)),
+    skills,
+    tools,
+    actions,
+    permission_revision: permissionRevision,
+  };
+  const selectedContext: HomerailPluginTurnContextV1 = {
+    ...unsigned,
+    context_digest: pluginJsonDigest(unsigned),
+  };
+  const validation = validateHomerailPluginTurnContext(selectedContext);
+  if (!validation.valid) throw new Error(`Invalid selected Plugin Context: ${JSON.stringify(validation.errors)}`);
+  return validation.value ?? selectedContext;
+}
+
+/**
+ * A context digest is an integrity checksum, not an authority proof. Require
+ * every supplied entry to be byte-for-byte present in the current
+ * Manager-owned snapshot before it can influence a prompt or Tool catalog.
+ */
+export function assertCurrentPluginTurnContextSubset(
+  value: HomerailPluginTurnContextV1,
+  state?: PluginRegistryState,
+  options: { modality?: HomerailPluginModality } = {},
+): HomerailPluginTurnContextV1 {
+  if (!state) ensureBuiltinPluginsSynced();
+  const registry = state ?? getPluginRegistryState();
+  const validation = validateHomerailPluginTurnContext(value);
+  if (
+    !validation.valid
+    || !validation.value
+    || pluginJsonDigest(homerailPluginTurnContextDigestInput(value)) !== value.context_digest
+  ) throw new Error("Plugin Context failed validation or digest verification");
+  const supplied = validation.value;
+  const current = assemblePluginTurnContext(registry, options);
+  if (
+    supplied.registry_revision !== current.registry_revision
+    || supplied.permission_revision !== current.permission_revision
+  ) throw new Error("Plugin Context does not match the current registry and permission snapshot");
+  const exactSubset = <T>(
+    entries: readonly T[],
+    candidates: readonly T[],
+    identity: (entry: T) => string,
+  ): boolean => entries.every((entry) => {
+    const candidate = candidates.find((valueEntry) => identity(valueEntry) === identity(entry));
+    return candidate !== undefined && isDeepStrictEqual(entry, candidate);
+  });
+  if (
+    !exactSubset(supplied.enabled_plugins, current.enabled_plugins, (entry) => entry.id)
+    || !exactSubset(supplied.skills, current.skills, (entry) => entry.qualified_id)
+    || !exactSubset(supplied.tools, current.tools, (entry) => entry.qualified_id)
+    || !exactSubset(supplied.actions, current.actions, (entry) => entry.qualified_id)
+  ) throw new Error("Plugin Context contains an entry not owned by the current registry snapshot");
+  return structuredClone(supplied);
 }
 
 export interface ArchivedPluginSkill {

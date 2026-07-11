@@ -27,7 +27,13 @@ import {
   loadLocalConfig,
   loadLocalSecrets,
   managerWsUrl,
+  resolveConfiguredManagerAdminToken,
 } from "../local-config.js";
+import {
+  HOMERAIL_UI_ADMIN_PROXY_ENABLED,
+  HOMERAIL_UI_ORIGIN,
+  createUiAdminProxyPolicy,
+} from "../ui-admin-proxy.js";
 import { applyStoredModelConfig } from "./config.js";
 import { dockerNotFoundDetail, resolveDockerBinary } from "../docker-bin.js";
 import {
@@ -156,6 +162,7 @@ type RuntimeServiceName = "manager" | "node" | "worker" | "ui" | "ui-https";
 
 export const WORKER_IMAGE_SOURCE_LABEL = "org.homerail.worker.source_fingerprint";
 const WORKER_IMAGE_TAG = "homerail-worker:latest";
+const MANAGER_ADMIN_ORIGINS_ENV = "HOMERAIL_MANAGER_ADMIN_ORIGINS";
 type WorkerImageRuntimeStatus = "checking" | "building" | "ready" | "error" | "skipped";
 const WORKER_IMAGE_SOURCE_INPUTS = [
   "homerail_worker/Dockerfile",
@@ -170,6 +177,64 @@ const WORKER_IMAGE_SOURCE_INPUTS = [
 ];
 
 export type WorkerImageBuildReason = "forced" | "missing" | "stale";
+
+/** Merge operator-provided exact Origins with the two UI proxy origins. */
+export function mergeManagerAdminOrigins(
+  configured: string | undefined,
+  uiUrls: readonly string[],
+): string {
+  const origins = new Set<string>();
+  for (const value of (configured ?? "").split(",").map((entry) => entry.trim()).filter(Boolean)) {
+    let parsed: URL;
+    try { parsed = new URL(value); } catch { throw new Error(`${MANAGER_ADMIN_ORIGINS_ENV} contains an invalid Origin`); }
+    if (
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+      || parsed.username
+      || parsed.password
+      || parsed.pathname !== "/"
+      || parsed.search
+      || parsed.hash
+      || parsed.origin !== value
+    ) throw new Error(`${MANAGER_ADMIN_ORIGINS_ENV} must contain exact http(s) Origins without paths`);
+    origins.add(value);
+  }
+  for (const value of uiUrls) {
+    let parsed: URL;
+    try { parsed = new URL(value); } catch { throw new Error(`Agent UI public URL is invalid: ${value}`); }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error(`Agent UI public URL must use http(s): ${value}`);
+    }
+    origins.add(parsed.origin);
+  }
+  return [...origins].sort().join(",");
+}
+
+export interface UiAdminProxyProcessEnvOptions {
+  uiBindHost: string;
+  uiPublicUrl: string;
+  managerUrl: string;
+  adminToken?: string;
+}
+
+/** Compute, rather than inherit, the only mode in which a UI may proxy writes. */
+export function resolveUiAdminProxyProcessEnv(
+  options: UiAdminProxyProcessEnvOptions,
+): Record<string, string> {
+  const uiOrigin = new URL(options.uiPublicUrl).origin;
+  const policy = createUiAdminProxyPolicy({
+    enabled: true,
+    uiOrigin,
+    uiBindHost: options.uiBindHost,
+    managerUrl: options.managerUrl,
+    adminToken: options.adminToken,
+  });
+  return {
+    [HOMERAIL_UI_ORIGIN]: uiOrigin,
+    [HOMERAIL_UI_ADMIN_PROXY_ENABLED]: policy.enabled ? "1" : "0",
+    // Explicitly erase an inherited credential outside the loopback boundary.
+    HOMERAIL_MANAGER_ADMIN_TOKEN: policy.enabled ? options.adminToken || "" : "",
+  };
+}
 
 export interface ModelConfigApplyStatus {
   applied: boolean;
@@ -411,6 +476,17 @@ async function startRuntime(globalOpts: GlobalOpts, opts: StartOpts): Promise<nu
   const managerPublicUrl = configuredManagerAccessUrl(cfg, opts.publicUrl || globalOpts.baseUrl);
   const hasExplicitManagerPublicUrl = hasManagerPublicUrl(cfg, opts.publicUrl || globalOpts.baseUrl);
   const managerPort = configuredManagerPort(cfg);
+  const uiBindHost = opts.public && !opts.uiHost ? detectedMachineHost() : configuredUiHost(cfg, opts.uiHost);
+  const uiHttpsPort = configuredUiPort(cfg, opts.uiPort);
+  const uiHttpPort = configuredUiHttpPort(cfg);
+  const secrets = loadLocalSecrets();
+  const managerAdminOrigins = mergeManagerAdminOrigins(
+    process.env[MANAGER_ADMIN_ORIGINS_ENV] ?? secrets[MANAGER_ADMIN_ORIGINS_ENV],
+    [
+      configuredUiPublicUrl(cfg, uiBindHost, uiHttpsPort, opts.uiPublicUrl),
+      configuredUiHttpPublicUrl(cfg, uiBindHost, uiHttpPort),
+    ],
+  );
   const client = new HomeRailClient({ baseUrl: managerLocalUrl, timeoutMs: globalOpts.requestTimeout });
 
   ensureBuiltArtifact("homerail_manager/dist/index.js");
@@ -422,6 +498,8 @@ async function startRuntime(globalOpts: GlobalOpts, opts: StartOpts): Promise<nu
       HOMERAIL_HOME: getHomerailHome(),
       HOMERAIL_MANAGER_PORT: String(managerPort),
       HOMERAIL_MANAGER_HOST: managerHost,
+      HOMERAIL_MANAGER_ADMIN_ORIGINS: managerAdminOrigins,
+      ...(hasExplicitManagerPublicUrl ? { HOMERAIL_MANAGER_PUBLIC_URL: managerPublicUrl } : {}),
       HOMERAIL_PROJECT_ID: cfg.node?.projectId || "p1",
       ...assetEnv,
     });
@@ -614,8 +692,8 @@ function startService(name: RuntimeServiceName, relativeScript: string, env: Rec
   const child = spawn(process.execPath, [script], {
     cwd: repoRoot,
     env: {
-      ...process.env,
       ...loadLocalSecrets(),
+      ...process.env,
       ...env,
     },
     detached: true,
@@ -743,23 +821,30 @@ function startUiProcess(opts: StartUiProcessOpts): number {
   // to ship agent-ui's full node_modules (vite toolchain). On Windows this is
   // also the most reliable source-deploy path when dist exists.
   const serveStatic = shouldServeStaticAgentUi(agentUiDir);
+  const managerHttp = opts.managerUrl || `http://localhost:${opts.managerPort}`;
+  const adminProxyEnv = resolveUiAdminProxyProcessEnv({
+    uiBindHost: opts.host,
+    uiPublicUrl: opts.publicUrl,
+    managerUrl: managerHttp,
+    adminToken: resolveConfiguredManagerAdminToken(),
+  });
 
   let child: import("child_process").ChildProcess;
   if (serveStatic) {
     const serverScript = path.join(resolveRepoRoot(), "homerail_cli", "dist", "static-ui-server.js");
-    const managerHttp = opts.managerUrl || `http://localhost:${opts.managerPort}`;
     const managerWs = managerHttp.replace(/^http/, "ws");
     child = spawn(process.execPath, [serverScript], {
       cwd: agentUiDir,
       env: {
-        ...process.env,
         ...loadLocalSecrets(),
+        ...process.env,
         HOMERAIL_HOME: getHomerailHome(),
         HOMERAIL_STATIC_UI_DIR: path.join(agentUiDir, "dist"),
         HOMERAIL_UI_HOST: opts.host,
         HOMERAIL_UI_PORT: String(opts.port),
         HOMERAIL_MANAGER_HTTP: managerHttp,
         HOMERAIL_MANAGER_WS: managerWs,
+        ...adminProxyEnv,
         ...(opts.protocol === "https"
           ? {
             HOMERAIL_UI_HTTPS: "1",
@@ -775,6 +860,7 @@ function startUiProcess(opts: StartUiProcessOpts): number {
     });
   } else {
     const devServer = agentUiDevServerCommand(agentUiDir);
+    const uiApiOrigin = new URL(opts.publicUrl).origin;
     child = spawn(devServer.command, [
       ...devServer.args,
       "--host",
@@ -785,14 +871,17 @@ function startUiProcess(opts: StartUiProcessOpts): number {
     ], {
       cwd: agentUiDir,
       env: {
-        ...process.env,
         ...loadLocalSecrets(),
+        ...process.env,
         HOMERAIL_HOME: getHomerailHome(),
+        HOMERAIL_UI_HOST: opts.host,
         HOMERAIL_UI_PORT: String(opts.port),
         VITE_HOMERAIL_UI_PORT: String(opts.port),
         VITE_HOMERAIL_MANAGER_PORT: opts.managerPort,
         VITE_HOMERAIL_ENABLE_TEXT_MODE: opts.textModeEnabled ? "1" : "0",
-        ...(opts.managerUrl ? { VITE_API_BASE_URL: opts.managerUrl } : {}),
+        HOMERAIL_MANAGER_HTTP: managerHttp,
+        VITE_API_BASE_URL: uiApiOrigin,
+        ...adminProxyEnv,
         ...(opts.protocol === "https"
           ? {
             HOMERAIL_UI_HTTPS: "1",
@@ -1251,7 +1340,7 @@ export function workerImageDockerBuildSpawnOptions(): SpawnOptions {
   return {
     cwd: resolveRepoRoot(),
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, ...loadLocalSecrets(), HOMERAIL_HOME: getHomerailHome() },
+    env: { ...loadLocalSecrets(), ...process.env, HOMERAIL_HOME: getHomerailHome() },
     shell: false,
     windowsHide: true,
   };

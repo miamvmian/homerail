@@ -82,14 +82,21 @@ function writeActionPlugin(root: string): string {
     }],
     migrations: [],
   }];
-  manifest.actions = [{
-    id: "pin_note",
-    intent: "com.example.actions:pin_note",
+  manifest.tools = [{
+    id: "pin_note_tool",
+    description: "Pin the selected note through an Action-bound Tool.",
+    exposure: ["action"],
     input_schema: "notes-v1",
+    output_schema: "notes-v1",
     effect: "write",
     permissions: [],
     confirmation: "never",
     handler: { type: "projection", file: "ui/pin-note.v1.json" },
+  }];
+  manifest.actions = [{
+    id: "pin_note",
+    intent: "com.example.actions:pin_note",
+    tool: "pin_note_tool",
   }];
   fs.mkdirSync(path.join(packageRoot, "ui"), { recursive: true });
   fs.writeFileSync(path.join(packageRoot, "ui", "pin-note.v1.json"), JSON.stringify({
@@ -97,9 +104,9 @@ function writeActionPlugin(root: string): string {
     type: "direct_ui_node",
     kind: "com.example.actions/note",
     kind_version: 1,
-    node_id_pointer: "/id",
+    node_id_pointer: "/note",
     content_pointer: "",
-    omit_content_fields: ["id"],
+    omit_content_fields: [],
     fallback: { title_pointer: "/note" },
     defaults: { surface: "task", importance: "primary", density: "summary", persistence: "session" },
   }, null, 2));

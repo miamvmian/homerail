@@ -8,6 +8,7 @@
 
 import type { AgentClient, AgentEvent, AgentRunContext, AgentUsage, DagToolDefinition } from "./types.js";
 import { jsonSchemaObjectToZodRawShape } from "./json-schema-zod.js";
+import { sanitizedAgentChildEnv } from "./child-env.js";
 
 const BUILTIN_TOOLS = ["Bash", "Read", "Write", "Edit", "MultiEdit", "Grep", "Glob", "LS"] as const;
 
@@ -76,6 +77,20 @@ interface SdkMessage {
   };
   permission_denials?: unknown[];
   is_error?: boolean;
+}
+
+function sdkToolCallId(extra: unknown): string | undefined {
+  if (!extra || typeof extra !== "object" || Array.isArray(extra)) return undefined;
+  const record = extra as Record<string, unknown>;
+  for (const value of [
+    record.toolUseId,
+    record.tool_use_id,
+    record.requestId,
+    record.request_id,
+  ]) {
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return undefined;
 }
 
 interface SdkTransportGuard {
@@ -214,8 +229,9 @@ export class ClaudeSdkAdapter implements AgentClient {
       // Register DAG tools as an in-process MCP server
       if (tools.length > 0 && sdk.createSdkMcpServer && sdk.tool) {
         const sdkTools = tools.map((t) =>
-          sdk.tool(t.name, t.description, jsonSchemaObjectToZodRawShape(t.input_schema), async (args) => {
-            const res = await t.handler(args);
+          sdk.tool(t.name, t.description, jsonSchemaObjectToZodRawShape(t.input_schema), async (args, extra) => {
+            const toolCallId = sdkToolCallId(extra);
+            const res = await t.handler(args, toolCallId ? { tool_call_id: toolCallId } : undefined);
             return {
               content: [{ type: "text" as const, text: res.content.map((c) => c.text).join("") }],
               isError: res.is_error,
@@ -437,7 +453,7 @@ export class ClaudeSdkAdapter implements AgentClient {
     const fromAnthropicBaseUrl = process.env.ANTHROPIC_BASE_URL ?? "";
     const fromLlmBaseUrl = process.env.LLM_BASE_URL ?? "";
     const baseUrl = fromContextBaseUrl || fromAnthropicBaseUrl || fromLlmBaseUrl;
-    const env = { ...process.env };
+    const env = sanitizedAgentChildEnv();
     if (apiKey) env.ANTHROPIC_API_KEY = apiKey;
     if (baseUrl) {
       env.ANTHROPIC_BASE_URL = baseUrl;

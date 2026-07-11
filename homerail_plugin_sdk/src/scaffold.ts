@@ -89,6 +89,7 @@ export function scaffoldPluginProject(
       tools: [{
         id: "upsert_card",
         description: "Create or replace the complete current card using one stable plugin-owned id.",
+        exposure: ["agent"],
         input_schema: "card-input-v1",
         output_schema: "card-content-v1",
         effect: "write",

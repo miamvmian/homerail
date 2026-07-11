@@ -146,6 +146,18 @@ export class PersistentGenerativeUiDocumentService implements GenerativeUiDocume
     return structuredClone(decodeDocument(row));
   }
 
+  /**
+   * Trusted internal lookup for brokers that resume an already-authorized
+   * request by document id. HTTP callers must still prove the scope on the
+   * initial interaction; this method is intentionally not exposed as a route.
+   */
+  resolveScope(documentId: string): GenerativeUiDocumentScopeV1 | undefined {
+    const row = this.#row(documentId);
+    if (!row || row.deleted_at) return undefined;
+    decodeDocument(row);
+    return structuredClone(rowScope(row));
+  }
+
   getIncludingDeleted(
     documentId: string,
     expectedScope: GenerativeUiDocumentScopeV1,
@@ -180,6 +192,18 @@ export class PersistentGenerativeUiDocumentService implements GenerativeUiDocume
     purpose: DocumentRow["purpose"],
   ): GenerativeUiDocumentV1 | undefined {
     return this.getLatestForScope(scope, purpose, false);
+  }
+
+  /** Trusted migration-only snapshot of every live canonical document. */
+  listActiveCanonicalDocuments(): GenerativeUiDocumentV1[] {
+    const rows = getDb().prepare(`
+      SELECT document_id, purpose, scope_type, scope_id, ir_version, revision,
+             snapshot_json, snapshot_hash, updated_at, deleted_at
+      FROM generative_ui_documents
+      WHERE purpose = 'canonical' AND deleted_at IS NULL
+      ORDER BY document_id
+    `).all() as DocumentRow[];
+    return rows.map((row) => structuredClone(decodeDocument(row)));
   }
 
   apply(

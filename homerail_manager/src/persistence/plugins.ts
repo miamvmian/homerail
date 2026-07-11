@@ -1,7 +1,12 @@
 import {
   validateHomerailPluginManifest,
   type HomerailResolvedPluginDescriptorV1,
+  type HomerailPluginRuntimeSandboxAttestationV1,
 } from "homerail-protocol";
+import {
+  validateHrpPublisherTrustEntry,
+  type HrpSignatureFileV1,
+} from "homerail-plugin-sdk";
 import { validateResolvedPluginDescriptor, pluginJsonDigest } from "../plugins/descriptor.js";
 import { encodeJson, getDb, parseJsonRow } from "./db.js";
 import { nowIso } from "./time.js";
@@ -89,6 +94,150 @@ export interface PluginPermissionGrantRecord {
   status: "pending" | "granted" | "denied";
   revision: number;
   updated_at: string;
+}
+
+export interface PluginPermissionEventRecord {
+  seq: number;
+  plugin_id: string;
+  plugin_version: string;
+  permission: string;
+  event_type: "declared" | "granted" | "denied" | "reset";
+  from_status: "pending" | "granted" | "denied" | null;
+  to_status: "pending" | "granted" | "denied";
+  grant_revision: number;
+  permission_revision: number;
+  actor_type: "system" | "operator" | "action";
+  actor_id: string | null;
+  request_digest: string | null;
+  created_at: string;
+  data: Record<string, unknown>;
+}
+
+/** Exact publisher/install boundary for assets entering an isolated Agent prompt. */
+export function isTrustedRegistryPluginAgentAsset(pluginId: string, pluginVersion: string): boolean {
+  const row = getDb().prepare(`
+    SELECT p.source, a.active_version, a.enabled,
+           i.channel, i.lifecycle_state, i.health_state, i.signature_state,
+           s.publisher, s.public_key_spki,
+           t.publisher AS trust_publisher,
+           t.public_key_spki AS trust_public_key_spki,
+           t.state AS trust_state
+    FROM plugin_packages p
+    JOIN plugin_activations a ON a.plugin_id = p.plugin_id
+    JOIN plugin_installations i
+      ON i.plugin_id = p.plugin_id AND i.plugin_version = p.plugin_version
+    JOIN plugin_package_signatures s
+      ON s.plugin_id = p.plugin_id AND s.plugin_version = p.plugin_version
+    JOIN plugin_publisher_trust t ON t.key_id = s.key_id
+    WHERE p.plugin_id = ? AND p.plugin_version = ?
+  `).get(pluginId, pluginVersion) as {
+    source: PluginPackageSource;
+    active_version: string;
+    enabled: number;
+    channel: PluginInstallationRow["channel"];
+    lifecycle_state: PluginInstallationRow["lifecycle_state"];
+    health_state: PluginInstallationRow["health_state"];
+    signature_state: PluginInstallationRow["signature_state"];
+    publisher: string;
+    public_key_spki: string;
+    trust_publisher: string;
+    trust_public_key_spki: string;
+    trust_state: "trusted" | "revoked";
+  } | undefined;
+  return Boolean(row
+    && row.source === "installed"
+    && row.active_version === pluginVersion
+    && row.enabled === 1
+    && row.channel === "registry"
+    && row.lifecycle_state === "installed"
+    && row.health_state === "healthy"
+    && row.signature_state === "verified"
+    && row.trust_state === "trusted"
+    && row.trust_publisher === row.publisher
+    && row.trust_public_key_spki === row.public_key_spki);
+}
+
+export function getPluginPermissionRevision(): number {
+  const row = getDb().prepare(`
+    SELECT revision FROM plugin_permission_meta WHERE singleton = 1
+  `).get() as { revision: number } | undefined;
+  if (!row || !Number.isSafeInteger(row.revision) || row.revision < 0) {
+    throw new Error("Invalid persisted plugin permission revision");
+  }
+  return row.revision;
+}
+
+function appendPermissionEvent(input: {
+  plugin_id: string;
+  plugin_version: string;
+  permission: string;
+  event_type: PluginPermissionEventRecord["event_type"];
+  from_status: PluginPermissionEventRecord["from_status"];
+  to_status: PluginPermissionEventRecord["to_status"];
+  grant_revision: number;
+  actor_type: PluginPermissionEventRecord["actor_type"];
+  actor_id?: string;
+  request_digest?: string;
+  created_at: string;
+  data?: Record<string, unknown>;
+}): void {
+  if (input.request_digest !== undefined && !/^[a-f0-9]{64}$/.test(input.request_digest)) {
+    throw new Error("Plugin permission audit request digest must be SHA-256");
+  }
+  getDb().prepare(`
+    INSERT INTO plugin_permission_events(
+      plugin_id, plugin_version, permission, event_type, from_status, to_status,
+      grant_revision, permission_revision, actor_type, actor_id,
+      request_digest, created_at, data_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    input.plugin_id,
+    input.plugin_version,
+    input.permission,
+    input.event_type,
+    input.from_status,
+    input.to_status,
+    input.grant_revision,
+    getPluginPermissionRevision(),
+    input.actor_type,
+    input.actor_id ?? null,
+    input.request_digest ?? null,
+    input.created_at,
+    encodeJson(input.data ?? {}),
+  );
+}
+
+function syncDeclaredPermissionGrants(
+  manifest: HomerailResolvedPluginDescriptorV1["manifest"],
+  timestamp: string,
+): void {
+  const grants = [
+    ...manifest.permissions.required.map((grant) => ({ required: true, grant })),
+    ...manifest.permissions.optional.map((grant) => ({ required: false, grant })),
+  ];
+  for (const grant of grants) {
+    const inserted = getDb().prepare(`
+      INSERT INTO plugin_permission_grants(
+        plugin_id, plugin_version, permission, grant_json, status, revision, updated_at
+      ) VALUES (?, ?, ?, ?, 'pending', 1, ?)
+      ON CONFLICT(plugin_id, plugin_version, permission) DO NOTHING
+    `).run(manifest.id, manifest.version, grant.grant.permission, encodeJson(grant), timestamp);
+    if (inserted.changes === 1) {
+      appendPermissionEvent({
+        plugin_id: manifest.id,
+        plugin_version: manifest.version,
+        permission: grant.grant.permission,
+        event_type: "declared",
+        from_status: null,
+        to_status: "pending",
+        grant_revision: 1,
+        actor_type: "system",
+        actor_id: "plugin-install",
+        created_at: timestamp,
+        data: { required: grant.required },
+      });
+    }
+  }
 }
 
 function decodePackage(row: PluginPackageRow): PluginPackageRecord {
@@ -186,6 +335,38 @@ function assertExternalVersionReady(pluginId: string, version: string): PluginIn
   if (decoded.lifecycle_state !== "installed" || decoded.health_state !== "healthy") {
     throw new Error(`Plugin version is not healthy and installed: ${pluginId}@${version}`);
   }
+  if (decoded.signature_state === "revoked") {
+    throw new Error(`Plugin publisher signature is revoked: ${pluginId}@${version}`);
+  }
+  const signature = getDb().prepare(`
+    SELECT s.key_id, s.publisher, s.public_key_spki,
+           t.publisher AS trust_publisher, t.public_key_spki AS trust_public_key_spki,
+           t.state AS trust_state
+    FROM plugin_package_signatures s
+    LEFT JOIN plugin_publisher_trust t ON t.key_id = s.key_id
+    WHERE s.plugin_id = ? AND s.plugin_version = ?
+  `).get(pluginId, version) as {
+    key_id: string;
+    publisher: string;
+    public_key_spki: string;
+    trust_publisher: string | null;
+    trust_public_key_spki: string | null;
+    trust_state: "trusted" | "revoked" | null;
+  } | undefined;
+  if (decoded.signature_state !== "unsigned" && !signature) {
+    throw new Error(`Plugin signature identity is missing: ${pluginId}@${version}`);
+  }
+  if (signature?.trust_state === "revoked") {
+    throw new Error(`Plugin publisher signature is revoked: ${pluginId}@${version}`);
+  }
+  if (decoded.channel === "registry" && decoded.signature_state !== "verified") {
+    throw new Error(`Registry plugin requires a verified publisher signature: ${pluginId}@${version}`);
+  }
+  if (decoded.channel === "registry" && (
+    signature?.trust_state !== "trusted"
+    || signature.trust_publisher !== signature.publisher
+    || signature.trust_public_key_spki !== signature.public_key_spki
+  )) throw new Error(`Registry plugin publisher is no longer trusted: ${pluginId}@${version}`);
   const pendingRequired = getDb().prepare(`
     SELECT permission FROM plugin_permission_grants
     WHERE plugin_id = ? AND plugin_version = ? AND status != 'granted'
@@ -211,9 +392,53 @@ function activeRow(pluginId: string): ActivePluginRow | undefined {
 }
 
 function decodeActive(row: ActivePluginRow): ActivePluginRecord {
+  const activation = decodeActivation(row);
+  // Defense in depth for crash recovery and out-of-band trust updates. Even
+  // if an older process committed publisher revocation before it disabled the
+  // activation row, no registry/context/runtime reader may expose that package
+  // as enabled after restart.
+  const external = row.source === "installed" ? getDb().prepare(`
+    SELECT i.lifecycle_state, i.health_state, i.signature_state, i.channel,
+           s.publisher, s.public_key_spki,
+           t.publisher AS trust_publisher,
+           t.public_key_spki AS trust_public_key_spki,
+           t.state AS trust_state
+    FROM plugin_installations i
+    LEFT JOIN plugin_package_signatures s
+      ON s.plugin_id = i.plugin_id AND s.plugin_version = i.plugin_version
+    LEFT JOIN plugin_publisher_trust t ON t.key_id = s.key_id
+    WHERE i.plugin_id = ? AND i.plugin_version = ?
+  `).get(row.plugin_id, row.plugin_version) as {
+    lifecycle_state: PluginInstallationRow["lifecycle_state"];
+    health_state: PluginInstallationRow["health_state"];
+    signature_state: PluginInstallationRow["signature_state"];
+    channel: PluginInstallationRow["channel"];
+    publisher: string | null;
+    public_key_spki: string | null;
+    trust_publisher: string | null;
+    trust_public_key_spki: string | null;
+    trust_state: "trusted" | "revoked" | null;
+  } | undefined : undefined;
+  const unsafeExternal = row.source === "installed" && (
+    !external
+    || external.lifecycle_state !== "installed"
+    || external.health_state !== "healthy"
+    || external.signature_state === "revoked"
+    || external.trust_state === "revoked"
+    || (external.channel === "registry" && (
+      external.signature_state !== "verified"
+      || external.trust_state !== "trusted"
+      || external.publisher === null
+      || external.trust_publisher !== external.publisher
+      || external.public_key_spki === null
+      || external.trust_public_key_spki !== external.public_key_spki
+    ))
+  );
   return {
     ...decodePackage(row),
-    activation: decodeActivation(row),
+    activation: unsafeExternal && activation.enabled
+      ? { ...activation, enabled: false }
+      : activation,
   };
 }
 
@@ -262,6 +487,8 @@ export function syncPluginPackage(input: {
       );
     }
 
+    syncDeclaredPermissionGrants(manifest, timestamp);
+
     const activation = getDb().prepare(`
       SELECT plugin_id, active_version, enabled, locked, revision, updated_at
       FROM plugin_activations WHERE plugin_id = ?
@@ -295,7 +522,12 @@ export function syncPluginPackage(input: {
 export function setPluginEnabled(
   pluginId: string,
   enabled: boolean,
-  options: { expected_revision?: number; expected_active_version?: string; timestamp?: string } = {},
+  options: {
+    expected_revision?: number;
+    expected_active_version?: string;
+    timestamp?: string;
+    registry_authorized?: boolean;
+  } = {},
 ): PluginActivationRecord {
   const timestamp = options.timestamp ?? nowIso();
   return getDb().transaction(() => {
@@ -315,7 +547,15 @@ export function setPluginEnabled(
     if (enabled) {
       const packageRow = getDb().prepare("SELECT source FROM plugin_packages WHERE plugin_id = ? AND plugin_version = ?")
         .get(pluginId, current.active_version) as { source: PluginPackageSource } | undefined;
-      if (packageRow?.source === "installed") assertExternalVersionReady(pluginId, current.active_version);
+      if (packageRow?.source === "installed") {
+        const installation = getDb().prepare(`
+          SELECT channel FROM plugin_installations WHERE plugin_id = ? AND plugin_version = ?
+        `).get(pluginId, current.active_version) as { channel: PluginInstallationRow["channel"] } | undefined;
+        if (installation?.channel === "registry" && options.registry_authorized !== true) {
+          throw new Error("Registry plugin enablement requires the signed Registry lifecycle endpoint");
+        }
+        assertExternalVersionReady(pluginId, current.active_version);
+      }
     }
     if (current.enabled === enabled) return current;
     const update = getDb().prepare(`
@@ -348,6 +588,10 @@ export function installExternalPluginPackage(input: {
   lifecycle_state: PluginInstallationRow["lifecycle_state"];
   health_state: PluginInstallationRow["health_state"];
   signature_state: PluginInstallationRow["signature_state"];
+  signature?: Pick<
+    HrpSignatureFileV1,
+    "key_id" | "publisher" | "public_key_spki" | "payload_digest"
+  >;
   package_path: string;
   timestamp?: string;
 }): {
@@ -386,6 +630,49 @@ export function installExternalPluginPackage(input: {
         encodeJson(input.descriptor),
         timestamp,
       );
+    }
+    if (input.signature) {
+      const signature = input.signature;
+      validateHrpPublisherTrustEntry({
+        key_id: signature.key_id,
+        publisher: signature.publisher,
+        public_key_spki: signature.public_key_spki,
+        state: "trusted",
+      });
+      if (signature.payload_digest !== input.payload_digest) {
+        throw new Error("Plugin signature mapping payload digest mismatch");
+      }
+      const existingSignature = getDb().prepare(`
+        SELECT key_id, publisher, public_key_spki, payload_digest
+        FROM plugin_package_signatures WHERE plugin_id = ? AND plugin_version = ?
+      `).get(manifest.id, manifest.version) as {
+        key_id: string;
+        publisher: string;
+        public_key_spki: string;
+        payload_digest: string;
+      } | undefined;
+      if (existingSignature) {
+        if (
+          existingSignature.key_id !== signature.key_id
+          || existingSignature.publisher !== signature.publisher
+          || existingSignature.public_key_spki !== signature.public_key_spki
+          || existingSignature.payload_digest !== signature.payload_digest
+        ) throw new Error(`Plugin signature identity collision: ${manifest.id}@${manifest.version}`);
+      } else {
+        getDb().prepare(`
+          INSERT INTO plugin_package_signatures(
+            plugin_id, plugin_version, key_id, publisher, public_key_spki, payload_digest, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          manifest.id,
+          manifest.version,
+          signature.key_id,
+          signature.publisher,
+          signature.public_key_spki,
+          signature.payload_digest,
+          timestamp,
+        );
+      }
     }
     const previousInstallation = getDb().prepare(`
       SELECT plugin_id, plugin_version, archive_digest, payload_digest, channel,
@@ -430,16 +717,7 @@ export function installExternalPluginPackage(input: {
         input.package_path, timestamp, timestamp,
       );
     }
-    const grants = [...manifest.permissions.required.map((grant) => ({ required: true, grant })),
-      ...manifest.permissions.optional.map((grant) => ({ required: false, grant }))];
-    for (const grant of grants) {
-      getDb().prepare(`
-        INSERT INTO plugin_permission_grants(
-          plugin_id, plugin_version, permission, grant_json, status, revision, updated_at
-        ) VALUES (?, ?, ?, ?, 'pending', 1, ?)
-        ON CONFLICT(plugin_id, plugin_version, permission) DO NOTHING
-      `).run(manifest.id, manifest.version, grant.grant.permission, encodeJson(grant), timestamp);
-    }
+    syncDeclaredPermissionGrants(manifest, timestamp);
     let activation = getDb().prepare(`
       SELECT plugin_id, active_version, enabled, locked, revision, updated_at
       FROM plugin_activations WHERE plugin_id = ?
@@ -485,6 +763,217 @@ export function installExternalPluginPackage(input: {
       activation: decodedActivation,
       idempotent,
     };
+  }).immediate();
+}
+
+/**
+ * The only staged -> installed transition for executable HRPs. Callers must
+ * first verify the Node signature, immutable transport identity, image,
+ * measurement, binding, entrypoint, and exact grants through the M6 gate.
+ */
+export function promoteAttestedPluginRuntimeInstallation(input: {
+  plugin_id: string;
+  plugin_version: string;
+  package_digest: string;
+  payload_digest: string;
+  attestation: HomerailPluginRuntimeSandboxAttestationV1;
+  timestamp?: string;
+}): PluginInstallationRecord {
+  const timestamp = input.timestamp ?? nowIso();
+  return getDb().transaction(() => {
+    const row = getDb().prepare(`
+      SELECT i.plugin_id, i.plugin_version, i.archive_digest, i.payload_digest, i.channel,
+             i.lifecycle_state, i.health_state, i.signature_state, i.package_path,
+             i.installed_at, i.updated_at, i.removed_at,
+             p.package_digest, p.source, p.manifest_json
+      FROM plugin_installations i
+      JOIN plugin_packages p
+        ON p.plugin_id = i.plugin_id AND p.plugin_version = i.plugin_version
+      WHERE i.plugin_id = ? AND i.plugin_version = ?
+    `).get(input.plugin_id, input.plugin_version) as (PluginInstallationRow & {
+      package_digest: string;
+      source: PluginPackageSource;
+      manifest_json: string;
+    }) | undefined;
+    if (!row || row.source !== "installed") {
+      throw new Error(`Executable Plugin Runtime installation does not exist: ${input.plugin_id}@${input.plugin_version}`);
+    }
+    const current = decodeInstallation(row);
+    if (current.signature_state === "revoked" || current.payload_digest !== input.payload_digest
+      || row.package_digest !== input.package_digest) {
+      throw new Error("Executable Plugin Runtime package/publisher identity is stale");
+    }
+    const manifestValidation = validateHomerailPluginManifest(parseJsonRow(row.manifest_json));
+    if (!manifestValidation.valid || !manifestValidation.value
+      || manifestValidation.value.runtime.trust !== "sandboxed_runtime"
+      || !manifestValidation.value.runtime.entrypoint) {
+      throw new Error("Only an executable sandboxed_runtime HRP may be attestation-promoted");
+    }
+    const claims = input.attestation.claims;
+    if (claims.binding.plugin_id !== input.plugin_id
+      || claims.binding.plugin_version !== input.plugin_version
+      || claims.binding.package_digest !== input.package_digest
+      || JSON.stringify(claims.entrypoint) !== JSON.stringify(manifestValidation.value.runtime.entrypoint)) {
+      throw new Error("Executable Plugin Runtime attestation does not match the staged HRP");
+    }
+    if (current.lifecycle_state === "installed" && current.health_state === "healthy") return current;
+    if (current.lifecycle_state !== "staged" || current.health_state !== "unchecked" || current.removed_at !== null) {
+      throw new Error("Executable Plugin Runtime is not in the staged/unchecked state");
+    }
+    getDb().prepare(`
+      UPDATE plugin_installations
+      SET lifecycle_state = 'installed', health_state = 'healthy', updated_at = ?
+      WHERE plugin_id = ? AND plugin_version = ?
+        AND lifecycle_state = 'staged' AND health_state = 'unchecked'
+    `).run(timestamp, input.plugin_id, input.plugin_version);
+    const promoted = getDb().prepare(`
+      SELECT plugin_id, plugin_version, archive_digest, payload_digest, channel,
+             lifecycle_state, health_state, signature_state, package_path,
+             installed_at, updated_at, removed_at
+      FROM plugin_installations WHERE plugin_id = ? AND plugin_version = ?
+    `).get(input.plugin_id, input.plugin_version) as PluginInstallationRow;
+    return decodeInstallation(promoted);
+  }).immediate();
+}
+
+export function updatePluginInstallationSignatureState(input: {
+  plugin_id: string;
+  plugin_version: string;
+  signature_state: PluginInstallationRow["signature_state"];
+  timestamp?: string;
+}): { installation: PluginInstallationRecord; activation?: PluginActivationRecord; changed: boolean } {
+  const timestamp = input.timestamp ?? nowIso();
+  return getDb().transaction(() => {
+    const row = getDb().prepare(`
+      SELECT plugin_id, plugin_version, archive_digest, payload_digest, channel,
+             lifecycle_state, health_state, signature_state, package_path,
+             installed_at, updated_at, removed_at
+      FROM plugin_installations WHERE plugin_id = ? AND plugin_version = ?
+    `).get(input.plugin_id, input.plugin_version) as PluginInstallationRow | undefined;
+    if (!row) throw new Error(`Plugin installation does not exist: ${input.plugin_id}@${input.plugin_version}`);
+    const current = decodeInstallation(row);
+    if (current.signature_state === input.signature_state) {
+      return { installation: current, changed: false };
+    }
+    if (current.signature_state === "revoked" && input.signature_state !== "revoked") {
+      throw new Error("A revoked installed package cannot regain signature trust");
+    }
+    const revoked = input.signature_state === "revoked";
+    getDb().prepare(`
+      UPDATE plugin_installations
+      SET signature_state = ?, health_state = CASE WHEN ? THEN 'unhealthy' ELSE health_state END,
+          updated_at = ?
+      WHERE plugin_id = ? AND plugin_version = ?
+    `).run(
+      input.signature_state,
+      revoked ? 1 : 0,
+      timestamp,
+      input.plugin_id,
+      input.plugin_version,
+    );
+    let activation: PluginActivationRecord | undefined;
+    const activeRow = getDb().prepare(`
+      SELECT plugin_id, active_version, enabled, locked, revision, updated_at
+      FROM plugin_activations WHERE plugin_id = ?
+    `).get(input.plugin_id) as PluginActivationRow | undefined;
+    if (revoked && activeRow?.active_version === input.plugin_version && activeRow.enabled === 1) {
+      if (activeRow.locked === 1) {
+        throw new Error(`Cannot revoke a locked Core plugin package: ${input.plugin_id}`);
+      }
+      getDb().prepare(`
+        UPDATE plugin_activations
+        SET enabled = 0, revision = revision + 1, updated_at = ?
+        WHERE plugin_id = ? AND revision = ?
+      `).run(timestamp, input.plugin_id, activeRow.revision);
+      const updated = getDb().prepare(`
+        SELECT plugin_id, active_version, enabled, locked, revision, updated_at
+        FROM plugin_activations WHERE plugin_id = ?
+      `).get(input.plugin_id) as PluginActivationRow;
+      activation = decodeActivation(updated);
+      appendActivationEvent({
+        plugin_id: input.plugin_id,
+        event_type: "disable",
+        from_version: input.plugin_version,
+        to_version: input.plugin_version,
+        activation_revision: activation.revision,
+        timestamp,
+        data: { reason: "publisher_signature_revoked" },
+      });
+    }
+    const updatedInstallation = getDb().prepare(`
+      SELECT plugin_id, plugin_version, archive_digest, payload_digest, channel,
+             lifecycle_state, health_state, signature_state, package_path,
+             installed_at, updated_at, removed_at
+      FROM plugin_installations WHERE plugin_id = ? AND plugin_version = ?
+    `).get(input.plugin_id, input.plugin_version) as PluginInstallationRow;
+    return {
+      installation: decodeInstallation(updatedInstallation),
+      ...(activation ? { activation } : {}),
+      changed: true,
+    };
+  }).immediate();
+}
+
+export function revokeInstalledPluginPackagesByPublisherKey(
+  keyId: string,
+  timestamp: string = nowIso(),
+): Array<{ plugin_id: string; plugin_version: string; disabled: boolean }> {
+  return getDb().transaction(() => {
+    const trust = getDb().prepare(`
+      SELECT state FROM plugin_publisher_trust WHERE key_id = ?
+    `).get(keyId) as { state: "trusted" | "revoked" } | undefined;
+    if (trust?.state !== "revoked") throw new Error("Publisher key is not revoked");
+    const rows = getDb().prepare(`
+      SELECT i.plugin_id, i.plugin_version, i.signature_state,
+             a.active_version, a.enabled, a.locked, a.revision
+      FROM plugin_package_signatures s
+      JOIN plugin_installations i
+        ON i.plugin_id = s.plugin_id AND i.plugin_version = s.plugin_version
+      LEFT JOIN plugin_activations a ON a.plugin_id = i.plugin_id
+      WHERE s.key_id = ? AND i.lifecycle_state != 'removed'
+      ORDER BY i.plugin_id, i.plugin_version
+    `).all(keyId) as Array<{
+      plugin_id: string;
+      plugin_version: string;
+      signature_state: PluginInstallationRow["signature_state"];
+      active_version: string | null;
+      enabled: number | null;
+      locked: number | null;
+      revision: number | null;
+    }>;
+    return rows.map((row) => {
+      if (row.signature_state !== "revoked") {
+        getDb().prepare(`
+          UPDATE plugin_installations
+          SET signature_state = 'revoked', health_state = 'unhealthy', updated_at = ?
+          WHERE plugin_id = ? AND plugin_version = ?
+        `).run(timestamp, row.plugin_id, row.plugin_version);
+      }
+      const shouldDisable = row.active_version === row.plugin_version && row.enabled === 1;
+      if (shouldDisable) {
+        if (row.locked === 1) throw new Error(`Cannot revoke a locked Core plugin package: ${row.plugin_id}`);
+        const update = getDb().prepare(`
+          UPDATE plugin_activations
+          SET enabled = 0, revision = revision + 1, updated_at = ?
+          WHERE plugin_id = ? AND revision = ?
+        `).run(timestamp, row.plugin_id, row.revision);
+        if (update.changes !== 1) throw new Error("Plugin activation revision conflict during publisher revocation");
+        appendActivationEvent({
+          plugin_id: row.plugin_id,
+          event_type: "disable",
+          from_version: row.plugin_version,
+          to_version: row.plugin_version,
+          activation_revision: Number(row.revision) + 1,
+          timestamp,
+          data: { reason: "publisher_signature_revoked", key_id: keyId },
+        });
+      }
+      return {
+        plugin_id: row.plugin_id,
+        plugin_version: row.plugin_version,
+        disabled: shouldDisable,
+      };
+    });
   }).immediate();
 }
 
@@ -570,8 +1059,11 @@ export function setPluginGrantStatus(input: {
   permission: string;
   status: "granted" | "denied";
   expected_revision?: number;
+  actor_type?: PluginPermissionEventRecord["actor_type"];
+  actor_id?: string;
+  request_digest?: string;
   timestamp?: string;
-}): { permission: string; status: string; revision: number } {
+}): { permission: string; status: string; revision: number; permission_revision: number } {
   const timestamp = input.timestamp ?? nowIso();
   return getDb().transaction(() => {
     const current = getDb().prepare(`
@@ -582,7 +1074,13 @@ export function setPluginGrantStatus(input: {
     if (input.expected_revision !== undefined && current.revision !== input.expected_revision) {
       throw new Error("Plugin permission revision conflict");
     }
-    if (current.status === input.status) return { permission: input.permission, ...current };
+    if (current.status === input.status) {
+      return {
+        permission: input.permission,
+        ...current,
+        permission_revision: getPluginPermissionRevision(),
+      };
+    }
     const update = getDb().prepare(`
       UPDATE plugin_permission_grants
       SET status = ?, revision = revision + 1, updated_at = ?
@@ -593,7 +1091,24 @@ export function setPluginGrantStatus(input: {
       SELECT status, revision FROM plugin_permission_grants
       WHERE plugin_id = ? AND plugin_version = ? AND permission = ?
     `).get(input.plugin_id, input.plugin_version, input.permission) as { status: string; revision: number };
-    return { permission: input.permission, ...next };
+    appendPermissionEvent({
+      plugin_id: input.plugin_id,
+      plugin_version: input.plugin_version,
+      permission: input.permission,
+      event_type: input.status,
+      from_status: current.status as PluginPermissionEventRecord["to_status"],
+      to_status: input.status,
+      grant_revision: next.revision,
+      actor_type: input.actor_type ?? "operator",
+      actor_id: input.actor_id,
+      request_digest: input.request_digest,
+      created_at: timestamp,
+    });
+    return {
+      permission: input.permission,
+      ...next,
+      permission_revision: getPluginPermissionRevision(),
+    };
   }).immediate();
 }
 
@@ -664,6 +1179,45 @@ export function listPluginPermissionGrants(pluginId: string, version?: string): 
     status: row.status,
     revision: row.revision,
     updated_at: row.updated_at,
+  }));
+}
+
+export function listPluginPermissionEvents(input: {
+  plugin_id?: string;
+  plugin_version?: string;
+  after_seq?: number;
+  limit?: number;
+} = {}): PluginPermissionEventRecord[] {
+  const after = input.after_seq ?? 0;
+  const limit = input.limit ?? 100;
+  if (!Number.isSafeInteger(after) || after < 0) throw new Error("Plugin permission event cursor must be non-negative");
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+    throw new Error("Plugin permission event limit must be between 1 and 500");
+  }
+  if (input.plugin_version && !input.plugin_id) {
+    throw new Error("Plugin permission event version filter requires plugin_id");
+  }
+  const rows = getDb().prepare(`
+    SELECT seq, plugin_id, plugin_version, permission, event_type,
+           from_status, to_status, grant_revision, permission_revision,
+           actor_type, actor_id, request_digest, created_at, data_json
+    FROM plugin_permission_events
+    WHERE seq > ?
+      AND (? IS NULL OR plugin_id = ?)
+      AND (? IS NULL OR plugin_version = ?)
+    ORDER BY seq
+    LIMIT ?
+  `).all(
+    after,
+    input.plugin_id ?? null,
+    input.plugin_id ?? null,
+    input.plugin_version ?? null,
+    input.plugin_version ?? null,
+    limit,
+  ) as Array<Omit<PluginPermissionEventRecord, "data"> & { data_json: string }>;
+  return rows.map(({ data_json, ...row }) => ({
+    ...row,
+    data: parseJsonRow<Record<string, unknown>>(data_json),
   }));
 }
 

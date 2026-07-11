@@ -504,4 +504,51 @@ describe("HomeRail plugin wire contracts", () => {
       id: "com.example.notes:note-1", title: "Research notes", note: "Keep the ABI semantic.", questions: [],
     })).toThrow(/data-only execution policy/);
   });
+
+  it("keeps projection Action declarations non-authoritative until Manager resolves the manifest binding", () => {
+    const projection = {
+      projection_version: 1,
+      type: "direct_ui_node",
+      kind: "com.example.notes/note",
+      kind_version: 1,
+      node_id_pointer: "/id",
+      content_pointer: "/content",
+      omit_content_fields: [],
+      fallback: { title_pointer: "/content/title" },
+      defaults: { surface: "task", importance: "primary", density: "detail", persistence: "session" },
+      actions: [{
+        id: "complete",
+        label: "Complete",
+        style: "primary",
+        arguments_pointer: "/next",
+      }],
+    } as const;
+    const next = {
+      id: "com.example.notes:current",
+      content: { title: "Completed" },
+    };
+    const projected = applyHomerailDirectUiProjection({
+      projection,
+      plugin: { id: "com.example.notes", version: "1.0.0" },
+      arguments: {
+        id: "com.example.notes:current",
+        content: { title: "Ready" },
+        next,
+      },
+    });
+    // The pure projector has no Manifest Action/Tool policy authority and must
+    // never guess an intent from an id. Prefer mode materializes the exact
+    // Manifest binding in Manager; shadow/local projection stays read-only.
+    expect(projected.node.actions).toBeUndefined();
+    next.content.title = "mutated after projection";
+    expect(() => applyHomerailDirectUiProjection({
+      projection,
+      plugin: { id: "com.example.notes", version: "1.0.0" },
+      arguments: {
+        id: "com.example.notes:current",
+        content: { title: "Ready" },
+        next: "not-an-object",
+      },
+    })).not.toThrow();
+  });
 });

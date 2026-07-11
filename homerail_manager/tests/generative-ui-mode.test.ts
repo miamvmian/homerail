@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { GENERATIVE_UI_MODE_ENV } from "../src/generative-ui/mode.js";
+import { applyVoiceCanonicalProjectionPatch } from "../src/generative-ui/canonical-voice-service.js";
 import { closeDb } from "../src/persistence/db.js";
 import { createServer } from "../src/server/http.js";
 
@@ -135,13 +136,82 @@ describe("Generative UI mode Manager and Voice config wiring", () => {
     expect(sessionBody.data.generative_ui_mode).toBe("off");
   });
 
-  it("rejects reserved modes without changing persisted configuration", async () => {
+  it("enables prefer without making it the default and exposes only a non-empty canonical projection", async () => {
+    const port = await listen(server);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const saveResponse = await fetch(`${baseUrl}/api/manager-agent/config`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ generative_ui_mode: "prefer" }),
+    });
+    expect(await saveResponse.json()).toMatchObject({
+      data: {
+        generative_ui_mode: "prefer",
+        effective_generative_ui_mode: "prefer",
+      },
+    });
+    const sessionResponse = await fetch(`${baseUrl}/api/voice-agent/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const session = await sessionResponse.json() as {
+      data: { session_id: string; generative_ui_mode: string; widgets: unknown[] };
+    };
+    expect(session.data).toMatchObject({ generative_ui_mode: "prefer", widgets: [] });
+    const projectionUrl = `${baseUrl}/api/voice-agent/sessions/${session.data.session_id}/generative-ui`;
+    expect((await fetch(projectionUrl)).status).toBe(404);
+
+    applyVoiceCanonicalProjectionPatch({
+      session_id: session.data.session_id,
+      patch: {
+        base_revision: 0,
+        upsert: [{
+          ir_version: 1,
+          id: "prefer-topic",
+          kind: "com.homerail.topic-outline/outline",
+          kind_version: 1,
+          owner: { id: "com.homerail.topic-outline", version: "1.0.0" },
+          surface: "task",
+          importance: "primary",
+          content: { title: "Prefer is authoritative" },
+          lifecycle: { persistence: "session" },
+          fallback: { title: "Prefer is authoritative" },
+        }],
+        remove_ids: [],
+      },
+      created_at: "2026-07-12T02:00:00.000Z",
+    });
+    const projectionResponse = await fetch(projectionUrl);
+    expect(projectionResponse.status).toBe(200);
+    expect(await projectionResponse.json()).toMatchObject({
+      data: {
+        mode: "prefer",
+        authoritative: true,
+        purpose: "canonical",
+        document: { revision: 1, nodes: [{ id: "prefer-topic" }] },
+      },
+    });
+
+    const workspace = await (await fetch(
+      `${baseUrl}/api/voice-agent/sessions/${session.data.session_id}`,
+    )).json();
+    expect(workspace).toMatchObject({
+      data: { generative_ui_mode: "prefer", widgets: [] },
+    });
+
+    process.env[GENERATIVE_UI_MODE_ENV] = "strict";
+    expect((await fetch(projectionUrl)).status).toBe(404);
+    delete process.env[GENERATIVE_UI_MODE_ENV];
+  });
+
+  it("rejects reserved strict without changing persisted configuration", async () => {
     const port = await listen(server);
     const baseUrl = `http://127.0.0.1:${port}`;
     const response = await fetch(`${baseUrl}/api/voice-agent/config`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ generative_ui_mode: "prefer" }),
+      body: JSON.stringify({ generative_ui_mode: "strict" }),
     });
     const body = await response.json() as { error: string };
     expect(response.status).toBe(400);
@@ -155,7 +225,7 @@ describe("Generative UI mode Manager and Voice config wiring", () => {
   it("does not persist Manager or Voice config patches under an invalid environment override", async () => {
     const port = await listen(server);
     const baseUrl = `http://127.0.0.1:${port}`;
-    process.env[GENERATIVE_UI_MODE_ENV] = "prefer";
+    process.env[GENERATIVE_UI_MODE_ENV] = "strict";
 
     for (const endpoint of ["/api/manager-agent/config", "/api/voice-agent/config"]) {
       const response = await fetch(`${baseUrl}${endpoint}`, {

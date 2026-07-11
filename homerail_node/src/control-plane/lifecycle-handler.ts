@@ -2,6 +2,7 @@ import type { ExecutionProvider, ContainerConfig } from "../providers/types.js";
 import { createContainer, createWorkerContainer } from "../lifecycle/create.js";
 import { prepareWorkerWorkspace } from "../storage/workspace-prepare.js";
 import type { MountPolicyOptions } from "../storage/mount-policy.js";
+import type { PluginRuntimeService } from "../runtime/plugin-runtime-service.js";
 
 export interface LifecycleRequest {
   type: "lifecycle_request";
@@ -21,12 +22,13 @@ export interface LifecycleResponse {
 
 export type SendFn = (msg: LifecycleResponse) => void;
 
-const SUPPORTED_RESOURCE_TYPES = new Set(["container", "worker"]);
+const SUPPORTED_RESOURCE_TYPES = new Set(["container", "worker", "plugin_runtime"]);
 
 export async function handleLifecycleRequest(
   request: LifecycleRequest,
   provider: ExecutionProvider,
   send: SendFn,
+  options: { pluginRuntime?: PluginRuntimeService } = {},
 ): Promise<void> {
   const { request_id, resource_type, operation, spec } = request;
 
@@ -41,7 +43,7 @@ export async function handleLifecycleRequest(
   }
 
   try {
-    const result = await dispatchOperation(provider, resource_type, operation, spec);
+    const result = await dispatchOperation(provider, resource_type, operation, spec, options);
     send({
       type: "lifecycle_response",
       request_id,
@@ -49,13 +51,28 @@ export async function handleLifecycleRequest(
       resource_data: result,
     });
   } catch (err) {
+    const rawMessage = err instanceof Error ? err.message : String(err);
     send({
       type: "lifecycle_response",
       request_id,
       status: "error",
-      error: { message: err instanceof Error ? err.message : String(err) },
+      error: { message: redactLifecycleSecrets(rawMessage, spec) },
     });
   }
+}
+
+function redactLifecycleSecrets(message: string, spec: Record<string, unknown>): string {
+  const env = spec.env && typeof spec.env === "object" && !Array.isArray(spec.env)
+    ? spec.env as Record<string, unknown>
+    : {};
+  const secrets = [env.HOMERAIL_MANAGER_ADMIN_TOKEN, env.HOMERAIL_PLUGIN_CAPABILITY_SECRET]
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+  let redacted = secrets.reduce(
+    (value, secret) => value.split(secret).join("***REDACTED***"),
+    message,
+  );
+  redacted = redacted.replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1***REDACTED***");
+  return redacted;
 }
 
 async function dispatchOperation(
@@ -63,7 +80,30 @@ async function dispatchOperation(
   resource_type: string,
   operation: string,
   spec: Record<string, unknown>,
+  options: { pluginRuntime?: PluginRuntimeService },
 ): Promise<Record<string, unknown> | undefined> {
+  if (resource_type === "plugin_runtime") {
+    const runtime = options.pluginRuntime;
+    if (!runtime) throw new Error("Plugin Runtime service is not configured on this Node");
+    if (operation === "launch") {
+      return await runtime.launch(spec) as unknown as Record<string, unknown>;
+    }
+    const runtimeInstanceId = typeof spec.runtime_instance_id === "string" ? spec.runtime_instance_id : "";
+    if (!runtimeInstanceId) throw new Error("spec.runtime_instance_id is required");
+    if (operation === "rpc") {
+      const result = await runtime.rpc(runtimeInstanceId, spec.request);
+      if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("Plugin Runtime RPC result is invalid");
+      return result as Record<string, unknown>;
+    }
+    if (operation === "refresh_attestation") {
+      return await runtime.refreshAttestation(runtimeInstanceId) as unknown as Record<string, unknown>;
+    }
+    if (operation === "remove") {
+      await runtime.remove(runtimeInstanceId);
+      return undefined;
+    }
+    throw new Error(`unsupported Plugin Runtime operation: ${operation}`);
+  }
   switch (operation) {
     case "create": {
       if (resource_type === "worker") {
@@ -92,6 +132,7 @@ async function dispatchOperation(
       if (typeof config.image !== "string" || !config.image.trim()) {
         throw new Error("spec.image is required for container create");
       }
+      assertPluginRuntimeIsolation(config);
       const info = await createContainer({ config, provider, mountPolicy: mountPolicyFromSpec(spec) });
       return info as unknown as Record<string, unknown>;
     }
@@ -144,6 +185,35 @@ async function dispatchOperation(
     }
     default:
       throw new Error(`unsupported operation: ${operation}`);
+  }
+}
+
+function assertPluginRuntimeIsolation(config: ContainerConfig): void {
+  if (config.labels?.["homerail.resource_type"] !== "plugin-runtime") return;
+  const env = config.env ?? {};
+  for (const secret of ["HOMERAIL_MANAGER_ADMIN_TOKEN", "HOMERAIL_PLUGIN_CAPABILITY_SECRET"]) {
+    if (Object.prototype.hasOwnProperty.call(env, secret)) {
+      throw new Error(`Plugin Runtime environment must not contain ${secret}`);
+    }
+  }
+  const identity = config.user?.match(/^(\d+):(\d+)$/);
+  if (!identity || Number(identity[1]) < 1 || Number(identity[2]) < 1) {
+    throw new Error("Plugin Runtime requires an explicit non-root uid:gid");
+  }
+  if (
+    !config.readOnlyRootfs
+    || !config.noNewPrivileges
+    || config.capDrop?.length !== 1
+    || config.capDrop[0] !== "ALL"
+    || !config.securityOpts?.some((option) => option.startsWith("seccomp=") && !option.endsWith("unconfined"))
+  ) {
+    throw new Error("Plugin Runtime requires read-only rootfs, no-new-privileges, cap-drop ALL, and seccomp");
+  }
+  if (!config.network || (config.network !== "none" && !/^homerail-plugin-broker-[a-z0-9_.-]+$/.test(config.network))) {
+    throw new Error("Plugin Runtime requires no network or a dedicated broker network");
+  }
+  if (config.ports?.length || config.extraHosts?.length) {
+    throw new Error("Plugin Runtime cannot expose ports or host aliases");
   }
 }
 

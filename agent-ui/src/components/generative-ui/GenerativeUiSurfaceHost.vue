@@ -16,10 +16,12 @@ import {
   GenerativeUiRendererRegistry,
 } from '@/generative-ui/renderer-registry'
 import type {
+  GenerativeUiActionMode,
   GenerativeUiActionRequestV1,
   GenerativeUiPreviewRequestV1,
 } from '@/generative-ui/types'
 import GenerativeUiNodeHost from './GenerativeUiNodeHost.vue'
+import type { PluginActionResponse } from '@/api/agent'
 
 const props = withDefaults(defineProps<{
   document: GenerativeUiDocumentV1
@@ -29,14 +31,21 @@ const props = withDefaults(defineProps<{
   surface?: GenerativeUiSurface
   placement?: GenerativeUiPlacement | 'all'
   interactive?: boolean
+  actionMode?: GenerativeUiActionMode
 }>(), {
   surface: undefined,
   placement: 'all',
   interactive: true,
+  actionMode: 'emit',
 })
 
 const emit = defineEmits<{
   (event: 'action', payload: GenerativeUiActionRequestV1): void
+  (event: 'action-status', payload: {
+    node_id: string
+    action_id: string
+    response: PluginActionResponse
+  }): void
   (event: 'open-preview', payload: GenerativeUiPreviewRequestV1): void
   (event: 'renderer-error', payload: { node_id: string; message: string }): void
   (event: 'focus-node', payload: { node_id: string }): void
@@ -101,13 +110,17 @@ defineExpose({ focus, focusNode })
       v-for="entry in rendered"
       :key="`${entry.node.id}:${entry.node.revision}`"
       :document-id="document.document_id"
+      :document-revision="document.revision"
+      :document-scope="document.scope"
       :node="entry.node"
       :placement="entry.item"
       :context="composition.context"
       :registry="registry"
       :action-registry="actionRegistry"
       :interactive="interactive"
+      :action-mode="actionMode"
       @action="emit('action', $event)"
+      @action-status="emit('action-status', $event)"
       @open-preview="emit('open-preview', $event)"
       @renderer-error="emit('renderer-error', $event)"
     />

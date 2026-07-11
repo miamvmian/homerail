@@ -2,8 +2,15 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import { generateKeyPairSync } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { buildHrpArchive, scaffoldPluginProject, scanPluginSource, sourceFilesForPack } from "homerail-plugin-sdk";
+import {
+  buildHrpArchive,
+  buildSignedHrpArchive,
+  scaffoldPluginProject,
+  scanPluginSource,
+  sourceFilesForPack,
+} from "homerail-plugin-sdk";
 import { subscribe, type PluginRegistryChangedPayload } from "../src/events/bus.js";
 import { closeDb, getDb } from "../src/persistence/db.js";
 import { listPluginPackages } from "../src/persistence/plugins.js";
@@ -271,6 +278,8 @@ describe("plugin registry routes", () => {
           plugin_id: "com.example.release-notes",
           plugin_version: "1.0.0",
           data_only_eligible: true,
+          m5_projection_action_eligible: false,
+          m5_projection_action_eligibility_reasons: ["projection_action_required"],
           activation: { active_version: "1.0.0", enabled: false, revision: 1 },
           installation: { lifecycle_state: "installed", health_state: "healthy" },
         },
@@ -374,6 +383,281 @@ describe("plugin registry routes", () => {
         plugin_id: "com.example.release-notes",
         plugin_version: "1.0.0",
       }));
+    } finally {
+      fs.rmSync(source, { recursive: true, force: true });
+    }
+  });
+
+  it("trusts a publisher, installs a signed package, and revokes it fail-closed", async () => {
+    const source = fs.mkdtempSync(path.join(os.tmpdir(), "homerail-signed-registry-route-"));
+    try {
+      scaffoldPluginProject(source, "com.example.signed-registry", { version: "1.0.0" });
+      const { privateKey } = generateKeyPairSync("ed25519");
+      const signed = buildSignedHrpArchive(sourceFilesForPack(scanPluginSource(source)), {
+        publisher: "com.example",
+        private_key: privateKey,
+      });
+      const install = () => fetch(`${baseUrl}/api/plugins/install?channel=staging`, {
+        method: "POST",
+        headers: { "Content-Type": "application/vnd.homerail.plugin+zip" },
+        body: signed.archive,
+      });
+
+      const publishers = await fetch(`${baseUrl}/api/plugins/publishers`);
+      expect(publishers.status).toBe(200);
+      expect(await publishers.json()).toMatchObject({ data: { revision: 0, publishers: [], events: [] } });
+      const trusted = await fetch(
+        `${baseUrl}/api/plugins/publishers/${encodeURIComponent(signed.signature.key_id)}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            publisher: signed.signature.publisher,
+            public_key_spki: signed.signature.public_key_spki,
+            state: "trusted",
+            expected_revision: 0,
+          }),
+        },
+      );
+      expect(trusted.status).toBe(200);
+      expect(await trusted.json()).toMatchObject({
+        data: {
+          trust: { record: { state: "trusted", revision: 1 }, distribution_revision: 1 },
+          reconciliation: { checked: 0, failures: [] },
+        },
+      });
+
+      const installed = await install();
+      expect(installed.status).toBe(201);
+      const installedBody = await installed.json() as {
+        data: { activation: { revision: number; active_version: string } };
+      };
+      expect(installedBody).toMatchObject({
+        data: { installation: { channel: "staging", signature_state: "verified", health_state: "healthy" } },
+      });
+      expect((await fetch(`${baseUrl}/api/plugins/com.example.signed-registry/enabled`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          enabled: true,
+          expected_revision: installedBody.data.activation.revision,
+          expected_active_version: installedBody.data.activation.active_version,
+        }),
+      })).status).toBe(200);
+
+      const revoked = await fetch(
+        `${baseUrl}/api/plugins/publishers/${encodeURIComponent(signed.signature.key_id)}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            publisher: signed.signature.publisher,
+            public_key_spki: signed.signature.public_key_spki,
+            state: "revoked",
+            expected_revision: 1,
+            reason: "publisher key compromised",
+          }),
+        },
+      );
+      expect(revoked.status).toBe(200);
+      expect(await revoked.json()).toMatchObject({
+        data: {
+          revoked_packages: [{
+            plugin_id: "com.example.signed-registry",
+            plugin_version: "1.0.0",
+            disabled: true,
+          }],
+          reconciliation: { failures: [] },
+        },
+      });
+      const versions = await (await fetch(
+        `${baseUrl}/api/plugins/com.example.signed-registry/versions`,
+      )).json() as { data: { activation: { revision: number; active_version: string }; versions: unknown[] } };
+      expect(versions.data.versions).toEqual([
+        expect.objectContaining({
+          enabled: false,
+          installation: expect.objectContaining({ signature_state: "revoked", health_state: "unhealthy" }),
+        }),
+      ]);
+      expect((await fetch(`${baseUrl}/api/plugins/com.example.signed-registry/enabled`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          enabled: true,
+          expected_revision: versions.data.activation.revision,
+          expected_active_version: versions.data.activation.active_version,
+        }),
+      })).status).toBe(409);
+    } finally {
+      fs.rmSync(source, { recursive: true, force: true });
+    }
+  });
+
+  it("installs, enables, selects, and resolves an immutable Workflow HRP without executing plugin content", async () => {
+    const source = fs.mkdtempSync(path.join(os.tmpdir(), "homerail-workflow-route-source-"));
+    const pluginId = "com.example.workflow-http";
+    const version = "1.0.0";
+    const capabilityId = `${pluginId}:compose-card`;
+    const workflowUri = `plugin://${pluginId}/workflows/compose-card`;
+    const workflowFile = path.join(source, "workflows/compose-card.yaml");
+    const originalContent = "workflow_version: 1\nid: compose-card\nsteps:\n  - literal: never-execute-during-resolution\n";
+    try {
+      scaffoldPluginProject(source, pluginId, { name: "Workflow HTTP", version });
+      const manifestFile = path.join(source, "homerail.plugin.json");
+      const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8")) as {
+        capabilities: Array<{ tools: string[]; workflows: string[] }>;
+        tools: Array<Record<string, unknown>>;
+        workflows: Array<Record<string, unknown>>;
+      };
+      manifest.capabilities[0].tools = [];
+      manifest.capabilities[0].workflows = ["compose-card"];
+      manifest.tools = [];
+      manifest.workflows = [{
+        id: "compose-card",
+        uri: workflowUri,
+        file: "workflows/compose-card.yaml",
+        effect: "read",
+        permissions: [],
+        confirmation: "never",
+      }];
+      fs.mkdirSync(path.dirname(workflowFile), { recursive: true });
+      fs.writeFileSync(workflowFile, originalContent);
+      fs.rmSync(path.join(source, "ui/projectors/card.v1.json"));
+      fs.writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+      const snapshot = scanPluginSource(source);
+      expect(snapshot).toMatchObject({
+        valid: true,
+        m4_data_only_eligible: false,
+        m5_workflow_resolution_eligible: true,
+        m5_workflow_resolution_eligibility_reasons: [],
+      });
+      const archive = buildHrpArchive(sourceFilesForPack(snapshot)).archive;
+
+      const installedResponse = await fetch(`${baseUrl}/api/plugins/install?channel=staging`, {
+        method: "POST",
+        headers: { "Content-Type": "application/vnd.homerail.plugin+zip" },
+        body: archive,
+      });
+      expect(installedResponse.status).toBe(201);
+      const installedBody = await installedResponse.json() as {
+        data: { package_digest: string; installation: Record<string, unknown> };
+      };
+      expect(installedBody).toMatchObject({
+        data: {
+          plugin_id: pluginId,
+          plugin_version: version,
+          data_only_eligible: false,
+          m5_projection_action_eligible: false,
+          m5_workflow_resolution_eligible: true,
+          m5_workflow_resolution_eligibility_reasons: [],
+          installation: { lifecycle_state: "installed", health_state: "healthy" },
+          activation: { active_version: version, enabled: false, revision: 1 },
+        },
+      });
+      const descriptorBefore = getDb().prepare(`
+        SELECT resolved_descriptor_json FROM plugin_packages
+        WHERE plugin_id = ? AND plugin_version = ?
+      `).get(pluginId, version) as { resolved_descriptor_json: string };
+
+      fs.writeFileSync(workflowFile, "id: source-mutated-after-install\n");
+      const enabled = await fetch(`${baseUrl}/api/plugins/${pluginId}/enabled`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: true, expected_revision: 1, expected_active_version: version }),
+      });
+      expect(enabled.status).toBe(200);
+      const listed = await (await fetch(`${baseUrl}/api/plugins`)).json() as {
+        data: { registry_fingerprint: string; plugins: Array<{ id: string; workflows: string[] }> };
+      };
+      expect(listed.data.plugins.find((plugin) => plugin.id === pluginId)?.workflows)
+        .toEqual(["compose-card"]);
+
+      const selected = await fetch(`${baseUrl}/api/plugins/capabilities/select`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          utterance: "compose this workflow card",
+          modality: "text",
+          inputs: { title: "HTTP Workflow" },
+          explicit_plugin_id: pluginId,
+          explicit_capability_id: capabilityId,
+          top_k: 1,
+        }),
+      });
+      const selectedBody = await selected.json() as {
+        data: {
+          selected: Array<{ capability_id: string }>;
+          selected_context: { tools: unknown[]; actions: unknown[] };
+        };
+      };
+      expect(selected.status).toBe(200);
+      expect(selectedBody.data.selected).toEqual([expect.objectContaining({ capability_id: capabilityId })]);
+      expect(selectedBody.data.selected_context).toMatchObject({ tools: [], actions: [] });
+
+      const rejectedCallerContext = await fetch(`${baseUrl}/api/plugins/workflows/resolve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          uri: workflowUri,
+          capability_id: capabilityId,
+          selection: {
+            utterance: "compose this workflow card",
+            inputs: { title: "HTTP Workflow" },
+            selected_context: { caller_supplied: true },
+          },
+        }),
+      });
+      expect(rejectedCallerContext.status).toBe(400);
+
+      const resolved = await fetch(`${baseUrl}/api/plugins/workflows/resolve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          uri: workflowUri,
+          capability_id: capabilityId,
+          selection: {
+            utterance: "compose this workflow card",
+            modality: "text",
+            inputs: { title: "HTTP Workflow" },
+          },
+        }),
+      });
+      const resolvedBody = await resolved.json() as {
+        data: {
+          selection: { manager_owned: boolean; capability_id: string; selected_context_digest: string };
+          resolution: {
+            content: string;
+            content_digest: string;
+            package_digest: string;
+            activation_revision: number;
+          };
+        };
+      };
+      expect(resolved.status).toBe(200);
+      expect(resolvedBody.data.selection).toMatchObject({
+        manager_owned: true,
+        capability_id: capabilityId,
+        selected_context_digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+      });
+      expect(resolvedBody.data.selection).not.toHaveProperty("selected_context");
+      expect(resolvedBody.data.resolution).toMatchObject({
+        content: originalContent,
+        content_digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+        package_digest: installedBody.data.package_digest,
+        activation_revision: 2,
+      });
+      expect((await fetch(`${baseUrl}/api/plugins/${pluginId}/doctor`)).status).toBe(200);
+      const descriptorAfter = getDb().prepare(`
+        SELECT resolved_descriptor_json FROM plugin_packages
+        WHERE plugin_id = ? AND plugin_version = ?
+      `).get(pluginId, version) as { resolved_descriptor_json: string };
+      expect(descriptorAfter).toEqual(descriptorBefore);
+      const registryAfterResolution = await (await fetch(`${baseUrl}/api/plugins`)).json() as {
+        data: { registry_fingerprint: string };
+      };
+      expect(registryAfterResolution.data.registry_fingerprint).toBe(listed.data.registry_fingerprint);
+      expect(getDb().prepare("SELECT COUNT(*) AS count FROM dag_workflows").get()).toEqual({ count: 0 });
+      expect(getDb().prepare("SELECT COUNT(*) AS count FROM plugin_action_requests").get()).toEqual({ count: 0 });
     } finally {
       fs.rmSync(source, { recursive: true, force: true });
     }

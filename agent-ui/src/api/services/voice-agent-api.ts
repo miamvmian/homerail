@@ -100,7 +100,7 @@ export interface VoiceWorkspace {
   progress_brief: { status: string; short_text: string; updated_at: string }
   widgets: VoiceWidget[]
   ui_events: VoiceUiEvent[]
-  generative_ui_mode?: 'off' | 'shadow'
+  generative_ui_mode?: 'off' | 'shadow' | 'prefer'
   codex_monitor_status?: 'idle' | 'running' | 'done' | 'failed'
   codex_monitor_run_id?: string | null
   created_at: string

@@ -65,6 +65,7 @@ function manifest(): HomerailPluginManifestV1 {
     tools: [{
       id: "upsert_topic_outline",
       description: "Create or replace a semantic topic outline.",
+      exposure: ["agent"],
       input_schema: "topic-input-v1",
       output_schema: "outline-content-v1",
       effect: "write",
@@ -154,6 +155,33 @@ describe("HomeRail Plugin Manifest V1", () => {
     }));
   });
 
+  it("rejects duplicate workflow URI ownership before package installation", () => {
+    const value = manifest();
+    value.workflows = [
+      {
+        id: "publish-outline",
+        uri: "plugin://com.example.topic-outline/workflows/publish",
+        file: "workflows/publish.md",
+        effect: "write",
+        permissions: [],
+        confirmation: "policy",
+      },
+      {
+        id: "publish-outline-again",
+        uri: "plugin://com.example.topic-outline/workflows/publish",
+        file: "workflows/publish-again.md",
+        effect: "write",
+        permissions: [],
+        confirmation: "policy",
+      },
+    ];
+    expect(validateHomerailPluginManifest(value).errors).toContainEqual(expect.objectContaining({
+      path: "/workflows/1",
+      keyword: "uniqueDeclaration",
+      message: expect.stringContaining("plugin://com.example.topic-outline/workflows/publish"),
+    }));
+  });
+
   it("requires contiguous kind versions and adjacent migrations", () => {
     const input = manifest();
     input.kinds[0].current_version = 2;
@@ -204,6 +232,12 @@ describe("HomeRail Plugin Manifest V1", () => {
     expect(validateHomerailPluginManifest(runtime).errors).toContainEqual(expect.objectContaining({
       keyword: "runtimeTrust",
     }));
+
+    const trustedRuntime = manifest();
+    trustedRuntime.runtime.trust = "trusted_builtin";
+    trustedRuntime.tools[0].handler = { type: "runtime", method: "compose" };
+    expect(validateHomerailPluginManifest(trustedRuntime).errors)
+      .not.toContainEqual(expect.objectContaining({ keyword: "runtimeTrust" }));
   });
 
   it("rejects unsafe package paths and collects the complete deterministic file set", () => {

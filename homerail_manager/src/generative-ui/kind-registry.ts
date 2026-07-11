@@ -68,9 +68,16 @@ function resolvedRendererSource(
   descriptor: ReturnType<typeof listPluginPackages>[number]["descriptor"],
   source: HomerailPluginRendererV1["source"],
 ): HomerailPluginResolvedRendererSourceV1 {
-  if (source.type !== "declarative") return structuredClone(source);
+  if (source.type === "builtin") return structuredClone(source);
   const archived = descriptor.referenced_files.find((entry) => entry.path === source.file);
-  if (!archived) throw new Error(`Missing archived declarative Renderer: ${source.file}`);
+  if (!archived) throw new Error(`Missing archived ${source.type} Renderer: ${source.file}`);
+  if (source.type === "custom") {
+    return {
+      type: "custom",
+      file: source.file,
+      digest: archived.digest,
+    };
+  }
   let document: unknown;
   try {
     document = JSON.parse(Buffer.from(archived.content, "base64").toString("utf8"));

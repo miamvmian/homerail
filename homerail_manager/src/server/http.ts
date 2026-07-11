@@ -25,12 +25,18 @@ import { managerAgentReadinessRoutesHandler } from "./manager-agent-readiness.js
 import { setupEventWebSocket } from "./events-websocket.js";
 import { generativeUiRoutesHandler } from "./generative-ui.js";
 import { pluginRoutesHandler } from "./plugins.js";
+import { pluginArtifactRoutesHandler } from "./plugin-artifacts.js";
 import { ChangeOrchestrator } from "../orchestration/change-orchestrator.js";
 import { GraphExecutor } from "../orchestration/graph-executor.js";
 import { WsDispatchAdapter, type WsDispatchAdapterOptions } from "../orchestration/ws-dispatch-adapter.js";
 import type { DAGDispatcher } from "../orchestration/dag-dispatcher.js";
 import { emit } from "../events/bus.js";
 import { dispatchRecoveredRuns } from "../runtime/active-runs.js";
+import {
+  createPluginHttpTrustPolicy,
+  pluginHttpTrustHandler,
+} from "./plugin-http-trust.js";
+import { getManagerAgentTurnEnvelopeAuthority } from "./manager-agent-turn-envelope.js";
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -39,7 +45,7 @@ function json(res: http.ServerResponse, status: number, body: unknown) {
 
 function setCorsHeaders(res: http.ServerResponse): void {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, If-None-Match");
 }
 
@@ -122,6 +128,15 @@ export function createServer(
   managerAgentConfigOptions: ManagerAgentConfigRoutesOptions = {},
 ) {
   let server: http.Server;
+  const pluginHttpTrust = createPluginHttpTrustPolicy({
+    bindHost: process.env.HOMERAIL_MANAGER_HOST,
+    publicUrl: process.env.HOMERAIL_MANAGER_PUBLIC_URL,
+    adminToken: process.env.HOMERAIL_MANAGER_ADMIN_TOKEN,
+    allowedOrigins: process.env.HOMERAIL_MANAGER_ADMIN_ORIGINS,
+    turnAuthorizer: (credential, method, pathname) => (
+      getManagerAgentTurnEnvelopeAuthority().authorizeApiRequest({ credential, method, pathname })
+    ),
+  });
   const workerImage = process.env.HOMERAIL_WORKER_IMAGE || "homerail-worker:latest";
   const defaultProvisionerOptions: WsDispatchAdapterOptions = {
     provisioner: {
@@ -167,6 +182,14 @@ export function createServer(
 
   server = http.createServer((req, res) => {
     setCorsHeaders(res);
+
+    if (pluginArtifactRoutesHandler(req, res)) {
+      return;
+    }
+
+    if (pluginHttpTrustHandler(req, res, pluginHttpTrust)) {
+      return;
+    }
 
     if (req.method === "OPTIONS") {
       res.writeHead(204);

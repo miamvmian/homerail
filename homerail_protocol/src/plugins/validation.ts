@@ -1,19 +1,45 @@
 import AjvModule, { type ErrorObject, type ValidateFunction } from "ajv";
-import { analyzeGenerativeUiJsonValue } from "../generative-ui/json-value.js";
-import { validateGenerativeUiNode } from "../generative-ui/validation.js";
+import { isSafeGenerativeUiArtifactUri } from "../generative-ui/artifact-uri.js";
+import {
+  GENERATIVE_UI_MAX_TRANSACTION_BYTES,
+  analyzeGenerativeUiJsonValue,
+} from "../generative-ui/json-value.js";
+import {
+  isValidGenerativeUiTimestamp,
+  validateGenerativeUiNode,
+  validateGenerativeUiTransaction,
+} from "../generative-ui/validation.js";
 import { homerailPluginSchemas } from "./schemas.js";
 import {
+  HOMERAIL_ACTION_ARGUMENT_MAX_BYTES,
+  HOMERAIL_ACTION_CAPABILITY_MAX_TTL_MS,
+  HOMERAIL_ACTION_CONFIRMATION_MAX_TTL_MS,
+  HOMERAIL_ACTION_REQUEST_MAX_TTL_MS,
+  HOMERAIL_RUNTIME_DOMAIN_OUTPUT_MAX_BYTES,
   HomerailPluginRendererMode,
   HomerailPluginRuntimeTrust,
+  type HomerailPluginToolBindingV1,
+  type HomerailPluginToolCapabilityClaimsV1,
+  type HomerailPluginToolConfirmationChallengeV1,
+  type HomerailPluginToolConfirmationDecisionV1,
+  type HomerailPluginToolInvocationV1,
+  type HomerailPluginActionTargetV1,
+  type HomerailPluginToolValidationOptionsV1,
+  type HomerailPluginAuthorizedToolInvocationV1,
   type HomerailPluginCompatibilityTargetV1,
   type HomerailDeclarativeRendererV1,
   type HomerailDirectUiProjectionV1,
   type HomerailPluginHandlerV1,
   type HomerailPluginManifestV1,
+  type HomerailPluginEffectivePermissionGrantV1,
   type HomerailPluginPermission,
   type HomerailPluginTurnContextV1,
   type HomerailPluginToolExecutionEnvelopeV1,
   type HomerailPluginUiProjectionV1,
+  type HomerailPluginRuntimeArtifactV1,
+  type HomerailPluginRuntimeLogEntryV1,
+  type HomerailPluginRuntimeRpcRequestV1,
+  type HomerailPluginRuntimeRpcResponseV1,
   type HomerailResolvedPluginDescriptorV1,
   type HomerailPluginValidationError,
   type HomerailPluginValidationResult,
@@ -154,8 +180,12 @@ function handlerErrors(
   if (handler.type === "projection" && !isSafeHomerailPluginPackagePath(handler.file)) {
     errors.push(error(`${path}/file`, "must be a package-relative POSIX path", "packagePath"));
   }
-  if (handler.type === "runtime" && trust !== HomerailPluginRuntimeTrust.SANDBOXED_RUNTIME) {
-    errors.push(error(`${path}/type`, "runtime handlers require sandboxed_runtime", "runtimeTrust"));
+  if (
+    handler.type === "runtime"
+    && trust !== HomerailPluginRuntimeTrust.SANDBOXED_RUNTIME
+    && trust !== HomerailPluginRuntimeTrust.TRUSTED_BUILTIN
+  ) {
+    errors.push(error(`${path}/type`, "runtime handlers require sandboxed_runtime or trusted_builtin", "runtimeTrust"));
   }
   if (handler.type === "builtin" && trust !== HomerailPluginRuntimeTrust.TRUSTED_BUILTIN) {
     errors.push(error(`${path}/type`, "builtin handlers require trusted_builtin", "runtimeTrust"));
@@ -173,6 +203,7 @@ function semanticErrors(manifest: HomerailPluginManifestV1): HomerailPluginValid
     ...duplicateErrors(manifest.kinds, (value) => value.kind, "/kinds"),
     ...duplicateErrors(manifest.tools, (value) => value.id, "/tools"),
     ...duplicateErrors(manifest.workflows, (value) => value.id, "/workflows"),
+    ...duplicateErrors(manifest.workflows, (value) => value.uri, "/workflows"),
     ...duplicateErrors(manifest.renderers, (value) => value.id, "/renderers"),
     ...duplicateErrors(manifest.actions, (value) => value.id, "/actions"),
   );
@@ -248,7 +279,13 @@ function semanticErrors(manifest: HomerailPluginManifestV1): HomerailPluginValid
       errors.push(error(`/capabilities/${index}/skill`, `unknown skill: ${capability.skill}`, "skillReference"));
     }
     capability.tools.forEach((id, refIndex) => {
-      if (!tools.has(id)) errors.push(error(`/capabilities/${index}/tools/${refIndex}`, `unknown tool: ${id}`, "toolReference"));
+      const tool = manifest.tools.find((entry) => entry.id === id);
+      if (!tool) errors.push(error(`/capabilities/${index}/tools/${refIndex}`, `unknown tool: ${id}`, "toolReference"));
+      else if (!tool.exposure.includes("agent")) errors.push(error(
+        `/capabilities/${index}/tools/${refIndex}`,
+        `Action-only Tool cannot enter an Agent capability catalog: ${id}`,
+        "toolExposure",
+      ));
     });
     capability.workflows.forEach((id, refIndex) => {
       if (!workflows.has(id)) errors.push(error(`/capabilities/${index}/workflows/${refIndex}`, `unknown workflow: ${id}`, "workflowReference"));
@@ -259,6 +296,9 @@ function semanticErrors(manifest: HomerailPluginManifestV1): HomerailPluginValid
   });
 
   manifest.tools.forEach((tool, index) => {
+    if (tool.exposure.some((value, exposureIndex) => exposureIndex > 0 && value <= tool.exposure[exposureIndex - 1])) {
+      errors.push(error(`/tools/${index}/exposure`, "Tool exposure must be unique and canonical", "canonicalOrder"));
+    }
     if (!schemas.has(tool.input_schema)) {
       errors.push(error(`/tools/${index}/input_schema`, `unknown schema: ${tool.input_schema}`, "schemaReference"));
     }
@@ -400,6 +440,16 @@ function semanticErrors(manifest: HomerailPluginManifestV1): HomerailPluginValid
     if (renderer.source.type !== "builtin" && !isSafeHomerailPluginPackagePath(renderer.source.file)) {
       errors.push(error(`/renderers/${index}/source/file`, "must be a package-relative POSIX path", "packagePath"));
     }
+    if (
+      renderer.source.type === "custom"
+      && !/\.(?:mjs|js)$/.test(renderer.source.file)
+    ) {
+      errors.push(error(
+        `/renderers/${index}/source/file`,
+        "custom Renderer source must be an ES module ending in .js or .mjs",
+        "customRendererModule",
+      ));
+    }
     if (renderer.fallback.type === "core_projection" && !isSafeHomerailPluginPackagePath(renderer.fallback.file)) {
       errors.push(error(`/renderers/${index}/fallback/file`, "must be a package-relative POSIX path", "packagePath"));
     }
@@ -420,15 +470,14 @@ function semanticErrors(manifest: HomerailPluginManifestV1): HomerailPluginValid
     if (!action.intent.startsWith(`${manifest.id}.`) && !action.intent.startsWith(`${manifest.id}:`)) {
       errors.push(error(`/actions/${index}/intent`, "action intent must be owned by this plugin", "pluginNamespace"));
     }
-    if (!schemas.has(action.input_schema)) {
-      errors.push(error(`/actions/${index}/input_schema`, `unknown schema: ${action.input_schema}`, "schemaReference"));
-    }
-    errors.push(
-      ...referencedPermissionErrors(action.permissions, declaredPermissions, `/actions/${index}/permissions`),
-      ...handlerErrors(action.handler, manifest.runtime.trust, `/actions/${index}/handler`),
-    );
-    if (action.effect === "destructive" && action.confirmation === "never") {
-      errors.push(error(`/actions/${index}/confirmation`, "destructive effects require confirmation", "effectConfirmation"));
+    if (!tools.has(action.tool)) {
+      errors.push(error(`/actions/${index}/tool`, `unknown tool: ${action.tool}`, "toolReference"));
+    } else if (!manifest.tools.find((entry) => entry.id === action.tool)?.exposure.includes("action")) {
+      errors.push(error(
+        `/actions/${index}/tool`,
+        "delegated Tool must explicitly allow Action exposure",
+        "toolExposure",
+      ));
     }
   });
 
@@ -574,7 +623,6 @@ export function collectHomerailPluginFileReferences(
     if (renderer.source.type !== "builtin") references.add(renderer.source.file);
     if (renderer.fallback.type === "core_projection") references.add(renderer.fallback.file);
   });
-  manifest.actions.forEach((action) => addHandler(action.handler));
   if (manifest.runtime.entrypoint) references.add(manifest.runtime.entrypoint.file);
   manifest.state.migrations.forEach((migration) => references.add(migration.file));
   return [...references].sort();
@@ -674,19 +722,10 @@ export function validateHomerailPluginTurnContext(
     if (!enabled.has(`${entry.plugin_id}@${entry.plugin_version}`)) {
       errors.push(error(`/tools/${index}`, "Tool plugin is not enabled in this context", "enabledPluginReference"));
     }
-    if (
-      entry.handler.type !== "projection"
-      || entry.effect !== "write"
-      || entry.permissions.length !== 0
-      || entry.confirmation !== "never"
-      || !entry.output_schema
-    ) {
-      errors.push(error(
-        `/tools/${index}`,
-        "M3 Tool Context accepts only permissionless, unconfirmed write projections with output schemas",
-        "executableToolPolicy",
-      ));
-    } else {
+    if (entry.handler.type === "projection") {
+      if (!entry.output_schema) {
+        errors.push(error(`/tools/${index}/output_schema`, "projection Tools require an output schema", "projectionOutputSchema"));
+      }
       const projection = validateHomerailDirectUiProjection(entry.handler.document);
       if (!projection.valid) {
         errors.push(...projection.errors.map((entryError) => ({
@@ -800,6 +839,7 @@ export function validateHomerailDirectUiProjection(
   if (!validation.value) return validation;
   const projection = validation.value;
   const errors: HomerailPluginValidationError[] = [];
+  errors.push(...duplicateErrors(projection.actions ?? [], (action) => action.id, "/actions"));
   projection.fallback.item_projections?.forEach((item, index) => {
     if (item.mode === "records" && !item.title_pointer) {
       errors.push(error(
@@ -821,6 +861,9 @@ export function validateHomerailDirectUiProjection(
     }
   });
   if (projection.legacy_bridge) {
+    if (projection.actions?.length) {
+      errors.push(error("/actions", "legacy bridge projections cannot materialize Actions", "legacyActionBridge"));
+    }
     if (
       projection.node_id_pointer !== "/id"
       || projection.content_pointer !== ""
@@ -889,6 +932,1065 @@ export function validateHomerailPluginToolExecutionEnvelope(
   const widget = envelope.projection.legacy_widget;
   if (widget && widget.id !== envelope.projection.node.id) {
     errors.push(error("/projection/legacy_widget/id", "Legacy widget id must match projected node", "projectionIdentity"));
+  }
+  return errors.length ? { valid: false, errors } : validation;
+}
+
+const ACTION_BINDING_FIELDS: Array<keyof HomerailPluginToolBindingV1> = [
+  "plugin_id",
+  "plugin_version",
+  "manifest_digest",
+  "package_digest",
+  "context_digest",
+  "registry_revision",
+  "permission_revision",
+];
+
+const ACTION_TARGET_FIELDS: Array<keyof HomerailPluginActionTargetV1> = [
+  "document_id",
+  "document_revision",
+  "node_id",
+  "node_revision",
+  "action_id",
+  "action_intent",
+];
+
+function prefixedPluginErrors(
+  errors: HomerailPluginValidationError[],
+  prefix: string,
+): HomerailPluginValidationError[] {
+  return errors.map((entry) => ({ ...entry, path: `${prefix}${entry.path}` }));
+}
+
+function timestampMillis(value: string): number | null {
+  if (!isValidGenerativeUiTimestamp(value)) return null;
+  const millis = Date.parse(value);
+  return Number.isFinite(millis) ? millis : null;
+}
+
+function actionTimestampErrors(
+  value: string,
+  path: string,
+): HomerailPluginValidationError[] {
+  return timestampMillis(value) === null
+    ? [error(path, "must be a valid RFC 3339 timestamp", "date-time")]
+    : [];
+}
+
+function canonicalPermissionErrors(
+  permissions: HomerailPluginPermission[],
+  path: string,
+): HomerailPluginValidationError[] {
+  return permissions.some((permissionValue, index) => (
+    index > 0 && permissionValue <= permissions[index - 1]
+  ))
+    ? [error(path, "permissions must be unique and in ascending canonical order", "canonicalOrder")]
+    : [];
+}
+
+function equalPermissions(
+  left: HomerailPluginPermission[],
+  right: HomerailPluginPermission[],
+): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function isCanonicalPermissionPathScope(value: string): boolean {
+  if (value === "/") return true;
+  if (
+    value !== value.normalize("NFC")
+    || value.includes("\\")
+    || /[\u0000-\u001f\u007f]/.test(value)
+    || value === "."
+    || value === ".."
+    || (value.length > 1 && value.endsWith("/"))
+  ) return false;
+  const segments = value.split("/");
+  return segments.every((segment, index) => (
+    (index === 0 && segment === "" && value.startsWith("/"))
+    || (segment.length > 0 && segment !== "." && segment !== "..")
+  ));
+}
+
+function isCanonicalPermissionHostScope(value: string): boolean {
+  const match = /^([a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::([1-9][0-9]{0,4}))?$/.exec(value);
+  if (!match) return false;
+  const hostname = match[1];
+  const port = match[2];
+  if (
+    hostname.length > 253
+    || hostname.includes("..")
+    || hostname.split(".").some((label) => (
+      label.length < 1
+      || label.length > 63
+      || label.startsWith("-")
+      || label.endsWith("-")
+    ))
+  ) return false;
+  if (port !== undefined && (!Number.isSafeInteger(Number(port)) || Number(port) > 65_535)) {
+    return false;
+  }
+  if (/^[0-9.]+$/.test(hostname)) {
+    const octets = hostname.split(".");
+    if (
+      octets.length !== 4
+      || octets.some((octet) => (
+        !/^(?:0|[1-9][0-9]{0,2})$/.test(octet)
+        || Number(octet) > 255
+      ))
+    ) return false;
+  }
+  return true;
+}
+
+function canonicalStringListErrors(
+  values: string[] | undefined,
+  path: string,
+  isValid: (value: string) => boolean,
+  scopeLabel: string,
+): HomerailPluginValidationError[] {
+  if (!values) return [];
+  const errors: HomerailPluginValidationError[] = [];
+  values.forEach((value, index) => {
+    if (!isValid(value)) {
+      errors.push(error(`${path}/${index}`, `must be a canonical ${scopeLabel} scope`, "permissionScope"));
+    }
+    if (index > 0 && value <= values[index - 1]) {
+      errors.push(error(
+        path,
+        `${scopeLabel} scopes must be unique and in ascending canonical order`,
+        "canonicalOrder",
+      ));
+    }
+  });
+  return errors;
+}
+
+function effectivePermissionGrantErrors(
+  grants: HomerailPluginEffectivePermissionGrantV1[],
+  permissions: HomerailPluginPermission[],
+  path: string,
+): HomerailPluginValidationError[] {
+  const errors: HomerailPluginValidationError[] = [];
+  grants.forEach((grant, index) => {
+    if (index > 0 && grant.permission <= grants[index - 1].permission) {
+      errors.push(error(
+        path,
+        "effective grants must have unique permissions in ascending canonical order",
+        "canonicalOrder",
+      ));
+    }
+    errors.push(
+      ...canonicalStringListErrors(grant.paths, `${path}/${index}/paths`, isCanonicalPermissionPathScope, "path"),
+      ...canonicalStringListErrors(grant.hosts, `${path}/${index}/hosts`, isCanonicalPermissionHostScope, "host"),
+    );
+    if (grant.permission === "network.connect") {
+      if (!grant.hosts?.length) {
+        errors.push(error(
+          `${path}/${index}/hosts`,
+          "network.connect effective grants require a non-empty host allowlist",
+          "networkAllowlist",
+        ));
+      }
+    } else if (grant.hosts !== undefined) {
+      errors.push(error(
+        `${path}/${index}/hosts`,
+        "host scopes are only valid for network.connect",
+        "permissionScope",
+      ));
+    }
+  });
+  const grantPermissions = grants.map((grant) => grant.permission);
+  if (!equalPermissions(permissions, grantPermissions)) {
+    errors.push(error(
+      path,
+      "effective grants must exactly match the permissions index without widening or dropping authority",
+      "permissionEscalation",
+    ));
+  }
+  return errors;
+}
+
+function equalOptionalStrings(left?: string[], right?: string[]): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function equalEffectivePermissionGrants(
+  left: HomerailPluginEffectivePermissionGrantV1[],
+  right: HomerailPluginEffectivePermissionGrantV1[],
+): boolean {
+  return left.length === right.length && left.every((grant, index) => {
+    const expected = right[index];
+    return expected !== undefined
+      && grant.permission === expected.permission
+      && equalOptionalStrings(grant.paths, expected.paths)
+      && equalOptionalStrings(grant.hosts, expected.hosts);
+  });
+}
+
+function actionBindingErrors(
+  actual: HomerailPluginToolBindingV1,
+  expected: HomerailPluginToolBindingV1,
+  path: string,
+): HomerailPluginValidationError[] {
+  return ACTION_BINDING_FIELDS.flatMap((field) => actual[field] === expected[field]
+    ? []
+    : [error(`${path}/${field}`, `does not match the exact resolved ${field}`, "bindingMismatch")]);
+}
+
+function actionTargetErrors(
+  actual: HomerailPluginActionTargetV1,
+  expected: HomerailPluginActionTargetV1,
+  path: string,
+): HomerailPluginValidationError[] {
+  return ACTION_TARGET_FIELDS.flatMap((field) => actual[field] === expected[field]
+    ? []
+    : [error(`${path}/${field}`, `does not match the live ${field}`, "staleTarget")]);
+}
+
+function toolIdentityErrors(
+  actual: HomerailPluginToolInvocationV1["tool"],
+  expected: HomerailPluginToolInvocationV1["tool"],
+  path: string,
+): HomerailPluginValidationError[] {
+  const errors: HomerailPluginValidationError[] = [];
+  for (const field of ["local_id", "qualified_id", "wire_id"] as const) {
+    if (actual[field] !== expected[field]) {
+      errors.push(error(`${path}/${field}`, `does not match the exact resolved Tool ${field}`, "toolIdentity"));
+    }
+  }
+  if (actual.handler.type !== expected.handler.type) {
+    errors.push(error(`${path}/handler/type`, "does not match the exact resolved Tool handler", "handlerIdentity"));
+  } else if (
+    (actual.handler.type === "projection" && expected.handler.type === "projection" && actual.handler.digest !== expected.handler.digest)
+    || (actual.handler.type === "runtime" && expected.handler.type === "runtime" && actual.handler.method !== expected.handler.method)
+    || (actual.handler.type === "builtin" && expected.handler.type === "builtin" && actual.handler.id !== expected.handler.id)
+  ) {
+    errors.push(error(`${path}/handler`, "does not match the exact resolved Tool handler identity", "handlerIdentity"));
+  }
+  return errors;
+}
+
+function toolSourceErrors(
+  actual: HomerailPluginToolInvocationV1["source"],
+  expected: HomerailPluginToolInvocationV1["source"],
+  path: string,
+): HomerailPluginValidationError[] {
+  if (actual.type !== expected.type) {
+    return [error(`${path}/type`, "does not match the Manager-resolved invocation source", "sourceIdentity")];
+  }
+  if (actual.type === "ui_action" && expected.type === "ui_action") {
+    const errors = actionTargetErrors(actual.target, expected.target, `${path}/target`);
+    if (actual.action.local_id !== expected.action.local_id) {
+      errors.push(error(`${path}/action/local_id`, "does not match the resolved Action", "actionIdentity"));
+    }
+    if (actual.action.qualified_id !== expected.action.qualified_id) {
+      errors.push(error(`${path}/action/qualified_id`, "does not match the resolved Action", "actionIdentity"));
+    }
+    if (actual.input_digest !== expected.input_digest) {
+      errors.push(error(`${path}/input_digest`, "does not match the exact user Action input", "requestDigest"));
+    }
+    return errors;
+  }
+  if (actual.type === "agent" && expected.type === "agent") {
+    const errors: HomerailPluginValidationError[] = [];
+    if (actual.call_id !== expected.call_id) errors.push(error(`${path}/call_id`, "does not match the Agent Tool call", "sourceIdentity"));
+    if (actual.modality !== expected.modality) errors.push(error(`${path}/modality`, "does not match the routed modality", "sourceIdentity"));
+    if (actual.scope.type !== expected.scope.type || actual.scope.id !== expected.scope.id) {
+      errors.push(error(`${path}/scope`, "does not match the Manager-resolved scope", "scopeIdentity"));
+    }
+    if (
+      actual.target.document_id !== expected.target.document_id
+      || actual.target.base_revision !== expected.target.base_revision
+    ) errors.push(error(`${path}/target`, "does not match the Manager-resolved canonical document", "staleTarget"));
+    return errors;
+  }
+  return [];
+}
+
+/** Canonical digest input. Hashing/signing is deliberately owned by Manager. */
+export function homerailPluginToolInvocationDigestInput(
+  value: HomerailPluginToolInvocationV1,
+): Omit<HomerailPluginToolInvocationV1, "request_digest"> {
+  const { request_digest: _digest, ...input } = structuredClone(value);
+  return input;
+}
+
+export function validateHomerailPluginToolInvocation(
+  value: unknown,
+  options: HomerailPluginToolValidationOptionsV1 = {},
+): HomerailPluginValidationResult<HomerailPluginToolInvocationV1> {
+  const validation = validatePluginWireValue<HomerailPluginToolInvocationV1>(
+    "homerail-plugin-tool-invocation-v1",
+    value,
+  );
+  if (!validation.value) return validation;
+  const invocation = validation.value;
+  const errors: HomerailPluginValidationError[] = [
+    ...actionTimestampErrors(invocation.invoked_at, "/invoked_at"),
+    ...actionTimestampErrors(invocation.deadline_at, "/deadline_at"),
+    ...canonicalPermissionErrors(invocation.policy.permissions, "/policy/permissions"),
+    ...effectivePermissionGrantErrors(
+      invocation.policy.effective_grants,
+      invocation.policy.permissions,
+      "/policy/effective_grants",
+    ),
+  ];
+
+  if (invocation.tool.qualified_id !== `${invocation.binding.plugin_id}:${invocation.tool.local_id}`) {
+    errors.push(error(
+      "/tool/qualified_id",
+      "qualified Tool identity does not match the exact plugin and local id",
+      "qualifiedIdentity",
+    ));
+  }
+  if (invocation.source.type === "ui_action") {
+    if (invocation.source.action.qualified_id !== `${invocation.binding.plugin_id}:${invocation.source.action.local_id}`) {
+      errors.push(error(
+        "/source/action/qualified_id",
+        "qualified Action identity does not match the exact plugin and local id",
+        "qualifiedIdentity",
+      ));
+    }
+    if (invocation.source.target.action_id !== invocation.source.action.local_id) {
+      errors.push(error(
+        "/source/target/action_id",
+        "node Action id does not match the resolved plugin Action local id",
+        "actionIdentity",
+      ));
+    }
+    if (
+      !invocation.source.target.action_intent.startsWith(`${invocation.binding.plugin_id}:`)
+      && !invocation.source.target.action_intent.startsWith(`${invocation.binding.plugin_id}.`)
+    ) {
+      errors.push(error(
+        "/source/target/action_intent",
+        "symbolic Action intent must be owned by the bound plugin",
+        "pluginNamespace",
+      ));
+    }
+  }
+  if (
+    (invocation.policy.confirmation === "always" && !invocation.policy.confirmation_required)
+    || (invocation.policy.confirmation === "never" && invocation.policy.confirmation_required)
+    || (invocation.policy.effect === "destructive" && !invocation.policy.confirmation_required)
+  ) {
+    errors.push(error(
+      "/policy/confirmation_required",
+      "resolved confirmation requirement conflicts with the declared effect/confirmation policy",
+      "confirmationPolicy",
+    ));
+  }
+
+  const invokedAt = timestampMillis(invocation.invoked_at);
+  const deadlineAt = timestampMillis(invocation.deadline_at);
+  if (invokedAt !== null && deadlineAt !== null) {
+    const lifetime = deadlineAt - invokedAt;
+    if (lifetime <= 0 || lifetime > HOMERAIL_ACTION_REQUEST_MAX_TTL_MS) {
+      errors.push(error(
+        "/deadline_at",
+        `Tool deadline must be after invocation and within ${HOMERAIL_ACTION_REQUEST_MAX_TTL_MS} ms`,
+        "requestLifetime",
+      ));
+    }
+    if (options.now_ms !== undefined && options.now_ms > deadlineAt) {
+      errors.push(error("/deadline_at", "Tool request deadline has expired", "staleRequest"));
+    }
+    if (options.now_ms !== undefined && invokedAt > options.now_ms + 30_000) {
+      errors.push(error("/invoked_at", "Tool invocation is unacceptably far in the future", "futureTimestamp"));
+    }
+  }
+
+  const argumentAnalysis = analyzeGenerativeUiJsonValue(invocation.arguments, {
+    path: "/arguments",
+    limits: {
+      max_bytes: HOMERAIL_ACTION_ARGUMENT_MAX_BYTES,
+      max_values: 4_096,
+      max_depth: 32,
+    },
+  });
+  if (!argumentAnalysis.valid) {
+    errors.push(argumentAnalysis.error ?? error(
+      "/arguments",
+      `Tool arguments exceed ${HOMERAIL_ACTION_ARGUMENT_MAX_BYTES} bytes`,
+      "maxPayloadBytes",
+    ));
+  }
+
+  if (options.expected) {
+    errors.push(
+      ...(options.expected.tool ? toolIdentityErrors(invocation.tool, options.expected.tool, "/tool") : []),
+      ...actionBindingErrors(invocation.binding, options.expected.binding, "/binding"),
+      ...(options.expected.source ? toolSourceErrors(invocation.source, options.expected.source, "/source") : []),
+    );
+    if (options.expected.request_id && invocation.request_id !== options.expected.request_id) {
+      errors.push(error("/request_id", "request id does not match expected execution", "requestIdentity"));
+    }
+    if (options.expected.request_digest && invocation.request_digest !== options.expected.request_digest) {
+      errors.push(error("/request_digest", "request digest does not match expected execution", "requestDigest"));
+    }
+    if (options.expected.policy) {
+      const expectedPolicy = options.expected.policy;
+      if (invocation.policy.effect !== expectedPolicy.effect) {
+        errors.push(error("/policy/effect", "Tool effect differs from the resolved manifest policy", "effectEscalation"));
+      }
+      if (!equalPermissions(invocation.policy.permissions, expectedPolicy.permissions)) {
+        errors.push(error(
+          "/policy/permissions",
+          "Tool permissions differ from the resolved manifest/grant policy",
+          "permissionEscalation",
+        ));
+      }
+      if (!equalEffectivePermissionGrants(
+        invocation.policy.effective_grants,
+        expectedPolicy.effective_grants,
+      )) {
+        errors.push(error(
+          "/policy/effective_grants",
+          "Tool effective grants differ from the exact resolved manifest/grant scope",
+          "permissionEscalation",
+        ));
+      }
+      if (
+        invocation.policy.confirmation !== expectedPolicy.confirmation
+        || invocation.policy.confirmation_required !== expectedPolicy.confirmation_required
+      ) {
+        errors.push(error(
+          "/policy/confirmation_required",
+          "Tool confirmation differs from the resolved host policy",
+          "confirmationPolicy",
+        ));
+      }
+    }
+  }
+  const previous = options.idempotency_records?.get(invocation.idempotency_key);
+  if (previous && (
+    previous.request_id !== invocation.request_id
+    || previous.request_digest !== invocation.request_digest
+  )) {
+    errors.push(error(
+      "/idempotency_key",
+      "idempotency key is already bound to a different request",
+      "idempotencyCollision",
+    ));
+  }
+  return errors.length ? { valid: false, errors } : validation;
+}
+
+export function validateHomerailPluginToolCapabilityClaims(
+  value: unknown,
+  invocation?: HomerailPluginToolInvocationV1,
+  options: HomerailPluginToolValidationOptionsV1 = {},
+): HomerailPluginValidationResult<HomerailPluginToolCapabilityClaimsV1> {
+  const validation = validatePluginWireValue<HomerailPluginToolCapabilityClaimsV1>(
+    "homerail-plugin-tool-capability-claims-v1",
+    value,
+  );
+  if (!validation.value) return validation;
+  const claims = validation.value;
+  const errors: HomerailPluginValidationError[] = [
+    ...actionTimestampErrors(claims.issued_at, "/issued_at"),
+    ...actionTimestampErrors(claims.expires_at, "/expires_at"),
+    ...canonicalPermissionErrors(claims.permissions, "/permissions"),
+    ...effectivePermissionGrantErrors(claims.effective_grants, claims.permissions, "/effective_grants"),
+  ];
+  const issuedAt = timestampMillis(claims.issued_at);
+  const expiresAt = timestampMillis(claims.expires_at);
+  if (issuedAt !== null && expiresAt !== null) {
+    const lifetime = expiresAt - issuedAt;
+    if (lifetime <= 0 || lifetime > HOMERAIL_ACTION_CAPABILITY_MAX_TTL_MS) {
+      errors.push(error(
+        "/expires_at",
+        `capability must expire after issuance and within ${HOMERAIL_ACTION_CAPABILITY_MAX_TTL_MS} ms`,
+        "capabilityLifetime",
+      ));
+    }
+    if (options.now_ms !== undefined && options.now_ms < issuedAt) {
+      errors.push(error("/issued_at", "capability is not active yet", "capabilityNotActive"));
+    }
+    if (options.now_ms !== undefined && options.now_ms >= expiresAt) {
+      errors.push(error("/expires_at", "capability has expired", "capabilityExpired"));
+    }
+  }
+  if (options.consumed_capability_nonces?.has(claims.nonce)) {
+    errors.push(error("/nonce", "single-use capability nonce has already been consumed", "capabilityReplay"));
+  }
+  if (invocation) {
+    if (claims.request_id !== invocation.request_id) {
+      errors.push(error("/request_id", "capability is bound to a different request", "requestIdentity"));
+    }
+    if (claims.request_digest !== invocation.request_digest) {
+      errors.push(error("/request_digest", "capability is bound to a different request digest", "requestDigest"));
+    }
+    errors.push(...actionBindingErrors(claims.binding, invocation.binding, "/binding"));
+    if (claims.effect !== invocation.policy.effect) {
+      errors.push(error("/effect", "capability effect does not exactly match requested effect", "effectEscalation"));
+    }
+    if (!equalPermissions(claims.permissions, invocation.policy.permissions)) {
+      errors.push(error(
+        "/permissions",
+        "capability permissions must exactly match the requested permission set",
+        "permissionEscalation",
+      ));
+    }
+    if (!equalEffectivePermissionGrants(claims.effective_grants, invocation.policy.effective_grants)) {
+      errors.push(error(
+        "/effective_grants",
+        "capability effective grants must exactly match the requested permission scopes",
+        "permissionEscalation",
+      ));
+    }
+    if (issuedAt !== null) {
+      const invokedAt = timestampMillis(invocation.invoked_at);
+      if (invokedAt !== null && issuedAt < invokedAt) {
+        errors.push(error("/issued_at", "capability cannot predate its request", "capabilityBinding"));
+      }
+    }
+    if (expiresAt !== null) {
+      const deadlineAt = timestampMillis(invocation.deadline_at);
+      if (deadlineAt !== null && expiresAt > deadlineAt) {
+        errors.push(error("/expires_at", "capability cannot outlive its request", "capabilityBinding"));
+      }
+    }
+  }
+  return errors.length ? { valid: false, errors } : validation;
+}
+
+export function validateHomerailPluginToolConfirmationChallenge(
+  value: unknown,
+  invocation?: HomerailPluginToolInvocationV1,
+  options: HomerailPluginToolValidationOptionsV1 = {},
+): HomerailPluginValidationResult<HomerailPluginToolConfirmationChallengeV1> {
+  const validation = validatePluginWireValue<HomerailPluginToolConfirmationChallengeV1>(
+    "homerail-plugin-tool-confirmation-challenge-v1",
+    value,
+  );
+  if (!validation.value) return validation;
+  const challenge = validation.value;
+  const errors: HomerailPluginValidationError[] = [
+    ...actionTimestampErrors(challenge.issued_at, "/issued_at"),
+    ...actionTimestampErrors(challenge.expires_at, "/expires_at"),
+    ...canonicalPermissionErrors(challenge.permissions, "/permissions"),
+    ...effectivePermissionGrantErrors(
+      challenge.effective_grants,
+      challenge.permissions,
+      "/effective_grants",
+    ),
+  ];
+  const issuedAt = timestampMillis(challenge.issued_at);
+  const expiresAt = timestampMillis(challenge.expires_at);
+  if (issuedAt !== null && expiresAt !== null) {
+    const lifetime = expiresAt - issuedAt;
+    if (lifetime <= 0 || lifetime > HOMERAIL_ACTION_CONFIRMATION_MAX_TTL_MS) {
+      errors.push(error(
+        "/expires_at",
+        `confirmation challenge must expire within ${HOMERAIL_ACTION_CONFIRMATION_MAX_TTL_MS} ms`,
+        "confirmationLifetime",
+      ));
+    }
+    if (options.now_ms !== undefined && options.now_ms >= expiresAt) {
+      errors.push(error("/expires_at", "confirmation challenge has expired", "confirmationExpired"));
+    }
+  }
+  if (invocation) {
+    if (challenge.request_id !== invocation.request_id) {
+      errors.push(error("/request_id", "challenge is bound to a different request", "requestIdentity"));
+    }
+    if (challenge.request_digest !== invocation.request_digest) {
+      errors.push(error("/request_digest", "challenge is bound to a different request digest", "requestDigest"));
+    }
+    if (challenge.effect !== invocation.policy.effect) {
+      errors.push(error("/effect", "challenge effect does not match request policy", "effectEscalation"));
+    }
+    if (!equalPermissions(challenge.permissions, invocation.policy.permissions)) {
+      errors.push(error("/permissions", "challenge permissions do not match request policy", "permissionEscalation"));
+    }
+    if (!equalEffectivePermissionGrants(challenge.effective_grants, invocation.policy.effective_grants)) {
+      errors.push(error(
+        "/effective_grants",
+        "challenge effective grants do not match request policy scopes",
+        "permissionEscalation",
+      ));
+    }
+    if (issuedAt !== null) {
+      const invokedAt = timestampMillis(invocation.invoked_at);
+      if (invokedAt !== null && issuedAt < invokedAt) {
+        errors.push(error("/issued_at", "confirmation cannot predate its request", "confirmationBinding"));
+      }
+    }
+    if (expiresAt !== null) {
+      const deadlineAt = timestampMillis(invocation.deadline_at);
+      if (deadlineAt !== null && expiresAt > deadlineAt) {
+        errors.push(error("/expires_at", "confirmation cannot outlive its request", "confirmationBinding"));
+      }
+    }
+  }
+  return errors.length ? { valid: false, errors } : validation;
+}
+
+export function validateHomerailPluginToolConfirmationDecision(
+  value: unknown,
+  invocation?: HomerailPluginToolInvocationV1,
+  challenge?: HomerailPluginToolConfirmationChallengeV1,
+): HomerailPluginValidationResult<HomerailPluginToolConfirmationDecisionV1> {
+  const validation = validatePluginWireValue<HomerailPluginToolConfirmationDecisionV1>(
+    "homerail-plugin-tool-confirmation-decision-v1",
+    value,
+  );
+  if (!validation.value) return validation;
+  const decision = validation.value;
+  const errors: HomerailPluginValidationError[] = [
+    ...actionTimestampErrors(decision.decided_at, "/decided_at"),
+  ];
+  if (invocation) {
+    if (decision.request_id !== invocation.request_id) {
+      errors.push(error("/request_id", "decision is bound to a different request", "requestIdentity"));
+    }
+    if (decision.request_digest !== invocation.request_digest) {
+      errors.push(error("/request_digest", "decision is bound to a different request digest", "requestDigest"));
+    }
+  }
+  if (challenge) {
+    if (decision.challenge_id !== challenge.challenge_id) {
+      errors.push(error("/challenge_id", "decision does not answer this challenge", "challengeIdentity"));
+    }
+    if (
+      decision.request_id !== challenge.request_id
+      || decision.request_digest !== challenge.request_digest
+    ) {
+      errors.push(error("/request_digest", "decision and challenge request bindings differ", "confirmationBinding"));
+    }
+    const decidedAt = timestampMillis(decision.decided_at);
+    const issuedAt = timestampMillis(challenge.issued_at);
+    const expiresAt = timestampMillis(challenge.expires_at);
+    if (
+      decidedAt !== null
+      && issuedAt !== null
+      && expiresAt !== null
+      && (decidedAt < issuedAt || decidedAt >= expiresAt)
+    ) {
+      errors.push(error(
+        "/decided_at",
+        "decision must occur while the exact challenge is active",
+        "confirmationExpired",
+      ));
+    }
+  }
+  return errors.length ? { valid: false, errors } : validation;
+}
+
+export function validateHomerailPluginAuthorizedToolInvocation(
+  value: unknown,
+  options: HomerailPluginToolValidationOptionsV1 = {},
+): HomerailPluginValidationResult<HomerailPluginAuthorizedToolInvocationV1> {
+  const validation = validatePluginWireValue<HomerailPluginAuthorizedToolInvocationV1>(
+    "homerail-plugin-authorized-tool-invocation-v1",
+    value,
+  );
+  if (!validation.value) return validation;
+  const authorization = validation.value;
+  const invocation = validateHomerailPluginToolInvocation(authorization.invocation, options);
+  const capability = validateHomerailPluginToolCapabilityClaims(
+    authorization.capability,
+    authorization.invocation,
+    options,
+  );
+  const errors: HomerailPluginValidationError[] = [
+    ...prefixedPluginErrors(invocation.errors, "/invocation"),
+    ...prefixedPluginErrors(capability.errors, "/capability"),
+  ];
+  const confirmation = authorization.confirmation;
+  if (authorization.invocation.policy.confirmation_required && !confirmation) {
+    errors.push(error(
+      "/confirmation",
+      "resolved Action policy requires an exact approved confirmation",
+      "confirmationRequired",
+    ));
+  }
+  if (!authorization.invocation.policy.confirmation_required && confirmation) {
+    errors.push(error(
+      "/confirmation",
+      "confirmation is forbidden when the resolved Action policy does not require it",
+      "confirmationPolicy",
+    ));
+  }
+  if (confirmation) {
+    const challenge = validateHomerailPluginToolConfirmationChallenge(
+      confirmation.challenge,
+      authorization.invocation,
+      options,
+    );
+    const decision = validateHomerailPluginToolConfirmationDecision(
+      confirmation.decision,
+      authorization.invocation,
+      confirmation.challenge,
+    );
+    errors.push(
+      ...prefixedPluginErrors(challenge.errors, "/confirmation/challenge"),
+      ...prefixedPluginErrors(decision.errors, "/confirmation/decision"),
+    );
+    if (confirmation.decision.decision !== "approved") {
+      errors.push(error(
+        "/confirmation/decision/decision",
+        "denied confirmation cannot authorize execution",
+        "confirmationDenied",
+      ));
+    }
+    const decisionAt = timestampMillis(confirmation.decision.decided_at);
+    const capabilityAt = timestampMillis(authorization.capability.issued_at);
+    if (decisionAt !== null && capabilityAt !== null && capabilityAt < decisionAt) {
+      errors.push(error(
+        "/capability/issued_at",
+        "execution capability cannot predate required confirmation",
+        "capabilityBinding",
+      ));
+    }
+  }
+  return errors.length ? { valid: false, errors } : validation;
+}
+
+function runtimeLogAndArtifactErrors(
+  logs: HomerailPluginRuntimeLogEntryV1[],
+  artifacts: HomerailPluginRuntimeArtifactV1[],
+  completedAt: string,
+): HomerailPluginValidationError[] {
+  const errors: HomerailPluginValidationError[] = [];
+  const completedAtMs = timestampMillis(completedAt);
+  logs.forEach((entry, index) => {
+    if (entry.sequence !== index) {
+      errors.push(error(
+        `/logs/${index}/sequence`,
+        "log sequence must be contiguous and start at zero",
+        "canonicalOrder",
+      ));
+    }
+    errors.push(...actionTimestampErrors(entry.timestamp, `/logs/${index}/timestamp`));
+    const logAt = timestampMillis(entry.timestamp);
+    if (completedAtMs !== null && logAt !== null && logAt > completedAtMs) {
+      errors.push(error(
+        `/logs/${index}/timestamp`,
+        "log timestamp cannot be after response completion",
+        "timestampOrder",
+      ));
+    }
+  });
+  let previousArtifactId: string | undefined;
+  artifacts.forEach((artifact, index) => {
+    if (previousArtifactId !== undefined && artifact.id <= previousArtifactId) {
+      errors.push(error(
+        `/artifacts/${index}/id`,
+        "artifact ids must be unique and in ascending canonical order",
+        "canonicalOrder",
+      ));
+    }
+    previousArtifactId = artifact.id;
+    if (!isSafeGenerativeUiArtifactUri(artifact.uri)) {
+      errors.push(error(
+        `/artifacts/${index}/uri`,
+        "must be a passive http(s), artifact, drive, or local path reference",
+        "artifactUri",
+      ));
+    }
+  });
+  return errors;
+}
+
+export function validateHomerailPluginRuntimeRpcRequest(
+  value: unknown,
+  options: HomerailPluginToolValidationOptionsV1 = {},
+): HomerailPluginValidationResult<HomerailPluginRuntimeRpcRequestV1> {
+  const validation = validatePluginWireValue<HomerailPluginRuntimeRpcRequestV1>(
+    "homerail-plugin-runtime-rpc-request-v1",
+    value,
+  );
+  if (!validation.value) return validation;
+  const request = validation.value;
+  const errors: HomerailPluginValidationError[] = [
+    ...actionTimestampErrors(request.sent_at, "/sent_at"),
+  ];
+  if (request.method === "execute" || request.method === "prepare") {
+    const authorization = validateHomerailPluginAuthorizedToolInvocation(
+      request.params.authorization,
+      options,
+    );
+    errors.push(...prefixedPluginErrors(authorization.errors, "/params/authorization"));
+    const sentAt = timestampMillis(request.sent_at);
+    const invocation = request.params.authorization.invocation;
+    const invokedAt = timestampMillis(invocation.invoked_at);
+    const deadlineAt = timestampMillis(invocation.deadline_at);
+    const capabilityAt = timestampMillis(request.params.authorization.capability.issued_at);
+    const capabilityExpiresAt = timestampMillis(request.params.authorization.capability.expires_at);
+    const confirmationExpiresAt = request.params.authorization.confirmation
+      ? timestampMillis(request.params.authorization.confirmation.challenge.expires_at)
+      : null;
+    if (
+      sentAt !== null
+      && ((invokedAt !== null && sentAt < invokedAt)
+        || (deadlineAt !== null && sentAt >= deadlineAt)
+        || (capabilityAt !== null && sentAt < capabilityAt)
+        || (capabilityExpiresAt !== null && sentAt >= capabilityExpiresAt)
+        || (confirmationExpiresAt !== null && sentAt >= confirmationExpiresAt))
+    ) {
+      errors.push(error(
+        "/sent_at",
+        `${request.method} RPC must be sent while the request, capability, and confirmation are active`,
+        "timestampOrder",
+      ));
+    }
+    if (request.method === "execute" && request.params.artifact_uploads) {
+      const uploads = request.params.artifact_uploads;
+      if (!request.params.authorization.invocation.policy.permissions.includes("artifact.write")) {
+        errors.push(error("/params/artifact_uploads", "artifact uploads require artifact.write authority", "permissionEscalation"));
+      }
+      uploads.forEach((upload, index) => {
+        if (index > 0 && upload.id <= uploads[index - 1]!.id) {
+          errors.push(error("/params/artifact_uploads", "artifact upload ids must be unique and canonical", "canonicalOrder"));
+        }
+        try {
+          const target = new URL(upload.upload_url);
+          if ((target.protocol !== "http:" && target.protocol !== "https:")
+            || target.username || target.password || target.hash) {
+            errors.push(error(`/params/artifact_uploads/${index}/upload_url`, "upload URL is not an exact broker endpoint", "artifactBroker"));
+          }
+        } catch {
+          errors.push(error(`/params/artifact_uploads/${index}/upload_url`, "upload URL is invalid", "artifactBroker"));
+        }
+      });
+    }
+  } else if (request.method === "cancel" || request.method === "reconcile") {
+    if (options.expected?.request_id && request.params.request_id !== options.expected.request_id) {
+      errors.push(error("/params/request_id", `${request.method} targets a different request`, "requestIdentity"));
+    }
+    if (
+      options.expected?.request_digest
+      && request.params.request_digest !== options.expected.request_digest
+    ) {
+      errors.push(error("/params/request_digest", `${request.method} targets a different digest`, "requestDigest"));
+    }
+  } else if (options.expected) {
+    errors.push(...actionBindingErrors(request.params.binding, options.expected.binding, "/params/binding"));
+  }
+  return errors.length ? { valid: false, errors } : validation;
+}
+
+export function validateHomerailPluginRuntimeRpcResponse(
+  value: unknown,
+  options: HomerailPluginToolValidationOptionsV1 = {},
+): HomerailPluginValidationResult<HomerailPluginRuntimeRpcResponseV1> {
+  const validation = validatePluginWireValue<HomerailPluginRuntimeRpcResponseV1>(
+    "homerail-plugin-runtime-rpc-response-v1",
+    value,
+  );
+  if (!validation.value) return validation;
+  const response = validation.value;
+  const errors: HomerailPluginValidationError[] = [
+    ...actionTimestampErrors(response.completed_at, "/completed_at"),
+    ...runtimeLogAndArtifactErrors(response.logs, response.artifacts, response.completed_at),
+  ];
+
+  if (response.message_type === "error") {
+    const hasRequestId = response.request_id !== undefined;
+    const hasRequestDigest = response.request_digest !== undefined;
+    if (hasRequestId !== hasRequestDigest) {
+      errors.push(error(
+        "/request_digest",
+        "error correlation must include both request id and request digest or neither",
+        "requestIdentity",
+      ));
+    }
+    if ((response.method === "prepare" || response.method === "execute" || response.method === "cancel" || response.method === "reconcile") && !hasRequestId) {
+      errors.push(error(
+        "/request_id",
+        "prepare/execute/cancel/reconcile errors require exact Action request correlation",
+        "requestIdentity",
+      ));
+    }
+    if (response.method === "health" && hasRequestId) {
+      errors.push(error(
+        "/request_id",
+        "health errors cannot claim Action request correlation",
+        "requestIdentity",
+      ));
+    }
+    if (response.method === "health" && !response.binding) {
+      errors.push(error(
+        "/binding",
+        "health errors require the exact runtime package/context binding",
+        "bindingMismatch",
+      ));
+    }
+    if (response.method !== "health" && response.binding) {
+      errors.push(error(
+        "/binding",
+        "prepare/execute/cancel/reconcile errors are bound by request digest and cannot replace it with a runtime binding",
+        "bindingMismatch",
+      ));
+    }
+    if (response.method === "health" && response.binding && options.expected) {
+      errors.push(...actionBindingErrors(response.binding, options.expected.binding, "/binding"));
+    }
+    if (
+      response.method !== "health"
+      && options.expected?.request_id
+      && response.request_id !== options.expected.request_id
+    ) {
+      errors.push(error("/request_id", "response belongs to a different request", "requestIdentity"));
+    }
+    if (
+      response.method !== "health"
+      && options.expected?.request_digest
+      && response.request_digest !== options.expected.request_digest
+    ) {
+      errors.push(error("/request_digest", "response belongs to a different digest", "requestDigest"));
+    }
+    return errors.length ? { valid: false, errors } : validation;
+  }
+
+  if (response.method === "prepare") {
+    if (options.expected?.request_id && response.request_id !== options.expected.request_id) {
+      errors.push(error("/request_id", "prepare result belongs to a different request", "requestIdentity"));
+    }
+    if (options.expected?.request_digest && response.request_digest !== options.expected.request_digest) {
+      errors.push(error("/request_digest", "prepare result belongs to a different digest", "requestDigest"));
+    }
+    if (options.expected) errors.push(...actionBindingErrors(response.binding, options.expected.binding, "/binding"));
+    if (response.artifacts.length !== 0) {
+      errors.push(error("/artifacts", "prepare is pure and cannot publish passive artifacts", "preparePurity"));
+    }
+    response.artifact_declarations.forEach((declaration, index, declarations) => {
+      if (index > 0 && declaration.id <= declarations[index - 1]!.id) {
+        errors.push(error("/artifact_declarations", "artifact declaration ids must be unique and canonical", "canonicalOrder"));
+      }
+    });
+  } else if (response.method === "execute") {
+    if (options.expected?.request_id && response.request_id !== options.expected.request_id) {
+      errors.push(error("/request_id", "response belongs to a different request", "requestIdentity"));
+    }
+    if (
+      options.expected?.request_digest
+      && response.request_digest !== options.expected.request_digest
+    ) {
+      errors.push(error("/request_digest", "response belongs to a different digest", "requestDigest"));
+    }
+    if (options.expected) {
+      errors.push(...actionBindingErrors(response.binding, options.expected.binding, "/binding"));
+    }
+    if (response.output.type === "domain_output") {
+      const output = analyzeGenerativeUiJsonValue(response.output.output, {
+        path: "/output/output",
+        limits: {
+          max_bytes: HOMERAIL_RUNTIME_DOMAIN_OUTPUT_MAX_BYTES,
+          max_values: 20_000,
+          max_depth: 32,
+        },
+      });
+      if (!output.valid) {
+        errors.push(output.error ?? error(
+          "/output/output",
+          `domain output exceeds ${HOMERAIL_RUNTIME_DOMAIN_OUTPUT_MAX_BYTES} bytes`,
+          "maxPayloadBytes",
+        ));
+      }
+    } else {
+      const transactionAnalysis = analyzeGenerativeUiJsonValue(response.output.transaction, {
+        path: "/output/transaction",
+        limits: { max_bytes: GENERATIVE_UI_MAX_TRANSACTION_BYTES },
+      });
+      if (!transactionAnalysis.valid) {
+        errors.push(transactionAnalysis.error ?? error(
+          "/output/transaction",
+          `UI transaction exceeds ${GENERATIVE_UI_MAX_TRANSACTION_BYTES} bytes`,
+          "maxPayloadBytes",
+        ));
+      } else {
+        const transaction = validateGenerativeUiTransaction(response.output.transaction);
+        errors.push(...prefixedPluginErrors(transaction.errors, "/output/transaction"));
+        if (transaction.value) {
+          if (transaction.value.transaction_id !== response.request_id) {
+            errors.push(error(
+              "/output/transaction/transaction_id",
+              "UI transaction id must equal the idempotent Action request id",
+              "requestIdentity",
+            ));
+          }
+          if (
+            transaction.value.actor.type !== "plugin"
+            || (options.expected?.tool !== undefined
+              && transaction.value.actor.id !== options.expected.tool.qualified_id)
+            || transaction.value.actor.plugin?.id !== response.binding.plugin_id
+            || transaction.value.actor.plugin?.version !== response.binding.plugin_version
+          ) {
+            errors.push(error(
+              "/output/transaction/actor",
+              "UI transaction actor must be the exact bound Tool and plugin version",
+              "bindingMismatch",
+            ));
+          }
+          const expectedTarget = options.expected?.source?.type === "ui_action"
+            ? {
+              document_id: options.expected.source.target.document_id,
+              base_revision: options.expected.source.target.document_revision,
+            }
+            : options.expected?.source?.type === "agent"
+              ? options.expected.source.target
+              : undefined;
+          if (expectedTarget && (
+            transaction.value.document_id !== expectedTarget.document_id
+            || transaction.value.base_revision !== expectedTarget.base_revision
+          )) {
+            errors.push(error(
+              "/output/transaction/base_revision",
+              "UI transaction does not target the exact source document revision",
+              "staleTarget",
+            ));
+          }
+        }
+      }
+    }
+  } else if (response.method === "cancel") {
+    if (options.expected?.request_id && response.request_id !== options.expected.request_id) {
+      errors.push(error("/request_id", "cancel result belongs to a different request", "requestIdentity"));
+    }
+    if (
+      options.expected?.request_digest
+      && response.request_digest !== options.expected.request_digest
+    ) {
+      errors.push(error("/request_digest", "cancel result belongs to a different digest", "requestDigest"));
+    }
+  } else if (response.method === "reconcile") {
+    if (options.expected?.request_id && response.request_id !== options.expected.request_id) {
+      errors.push(error("/request_id", "reconciliation belongs to a different request", "requestIdentity"));
+    }
+    if (options.expected?.request_digest && response.request_digest !== options.expected.request_digest) {
+      errors.push(error("/request_digest", "reconciliation belongs to a different digest", "requestDigest"));
+    }
+    if (options.expected) errors.push(...actionBindingErrors(response.binding, options.expected.binding, "/binding"));
+    const hasOutput = response.output !== undefined || response.output_digest !== undefined;
+    if (response.status === "completed") {
+      if (!response.output || !response.output_digest) {
+        errors.push(error("/output", "completed reconciliation requires exact output and digest", "reconcileOutput"));
+      }
+      if (response.error) errors.push(error("/error", "completed reconciliation cannot include an error", "reconcileOutput"));
+    } else if (hasOutput) {
+      errors.push(error("/output", "non-completed reconciliation cannot claim output", "reconcileOutput"));
+    }
+    if (response.status === "failed" && !response.error) {
+      errors.push(error("/error", "failed reconciliation requires an error", "reconcileError"));
+    }
+    if (response.status !== "failed" && response.error) {
+      errors.push(error("/error", "only failed reconciliation may include an error", "reconcileError"));
+    }
+  } else {
+    if (options.expected) {
+      errors.push(...actionBindingErrors(response.binding, options.expected.binding, "/binding"));
+    }
+    const startedAt = timestampMillis(response.started_at);
+    const completedAt = timestampMillis(response.completed_at);
+    errors.push(...actionTimestampErrors(response.started_at, "/started_at"));
+    if (startedAt !== null && completedAt !== null && startedAt > completedAt) {
+      errors.push(error("/started_at", "runtime cannot start after health completion", "timestampOrder"));
+    }
   }
   return errors.length ? { valid: false, errors } : validation;
 }

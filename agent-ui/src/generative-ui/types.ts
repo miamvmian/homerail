@@ -6,20 +6,37 @@ import type {
   GenerativeUiSurfaceContextV1,
   GenerativeUiTransactionV1,
   GenerativeUiUserOverrideV1,
+  HomerailPluginToolConfirmationChallengeV1,
   HomerailPluginUiProjectionV1,
 } from 'homerail-protocol'
 
-export interface GenerativeUiProjectionV1 {
+export type GenerativeUiActionMode = 'emit' | 'manager' | 'disabled'
+
+interface GenerativeUiProjectionBaseV1 {
   stream_version: 1
-  mode: 'shadow'
-  authoritative: false
-  purpose: 'legacy_widget_shadow'
   document: GenerativeUiDocumentV1
   cursor: number
   overrides: GenerativeUiUserOverrideV1[]
   composition: GenerativeUiCompositionV1
   ui_registry: HomerailPluginUiProjectionV1
 }
+
+export interface GenerativeUiShadowProjectionV1 extends GenerativeUiProjectionBaseV1 {
+  mode: 'shadow'
+  authoritative: false
+  purpose: 'legacy_widget_shadow'
+}
+
+export interface GenerativeUiCanonicalProjectionV1 extends GenerativeUiProjectionBaseV1 {
+  mode: 'prefer'
+  authoritative: true
+  purpose: 'canonical'
+  pending_tool_confirmations: PendingAgentToolConfirmationV1[]
+}
+
+export type GenerativeUiProjectionV1 =
+  | GenerativeUiShadowProjectionV1
+  | GenerativeUiCanonicalProjectionV1
 
 export interface GenerativeUiSnapshotStreamEventV1 {
   type: 'generative_ui'
@@ -72,4 +89,46 @@ export interface GenerativeUiPreviewRequestV1 {
   kind?: 'html' | 'image' | 'gallery'
   layout?: 'fluid' | 'portrait'
   images?: string[]
+}
+
+export interface AgentToolReferenceV1 {
+  local_id: string
+  qualified_id: string
+  wire_id: string
+}
+
+export type AgentToolStatusV1 =
+  | 'needs_grant'
+  | 'awaiting_confirmation'
+  | 'authorized'
+  | 'running'
+  | 'committed'
+  | 'denied'
+  | 'failed'
+  | 'cancelled'
+
+export interface AgentToolResponseV1 {
+  request_id: string
+  request_digest: string
+  status: AgentToolStatusV1
+  idempotent: boolean
+  tool: AgentToolReferenceV1
+  source: 'agent'
+  missing_permissions?: string[]
+  denied_permissions?: string[]
+  challenge?: HomerailPluginToolConfirmationChallengeV1
+  result?: Record<string, unknown>
+  error_code?: string
+  error_message?: string
+}
+
+export interface PendingAgentToolConfirmationV1 extends AgentToolResponseV1 {
+  status: 'awaiting_confirmation'
+  idempotent: true
+  challenge: HomerailPluginToolConfirmationChallengeV1
+  missing_permissions?: never
+  denied_permissions?: never
+  result?: never
+  error_code?: never
+  error_message?: never
 }

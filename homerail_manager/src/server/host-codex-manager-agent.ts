@@ -45,7 +45,32 @@ interface ToolDefinition {
   name: string;
   description: string;
   input_schema: Record<string, unknown>;
-  handler: (args: Record<string, unknown>) => Promise<ToolHandlerResult>;
+  handler: (args: Record<string, unknown>, context?: { tool_call_id?: string }) => Promise<ToolHandlerResult>;
+}
+
+function stablePluginModelCallIdentifiers(input: {
+  turn_token: string;
+  tool_wire_id: string;
+  arguments: Record<string, unknown>;
+  model_tool_call_id?: string;
+}): { request_id: string; call_id: string } {
+  const rawCallId = input.model_tool_call_id?.trim();
+  if (rawCallId && (
+    Buffer.byteLength(rawCallId, "utf8") > 1024
+    || /[\u0000-\u001f\u007f]/.test(rawCallId)
+  )) throw new Error("Model Tool call id is invalid");
+  const digest = pluginJsonDigest({
+    identity_version: 1,
+    turn_token_digest: createHash("sha256").update(input.turn_token).digest("hex"),
+    tool_wire_id: input.tool_wire_id,
+    ...(rawCallId
+      ? { model_tool_call_id: rawCallId }
+      : { semantic_arguments_digest: pluginJsonDigest(input.arguments) }),
+  });
+  return {
+    request_id: `tool_${digest}`,
+    call_id: `call_${createHash("sha256").update(rawCallId ?? digest).digest("hex")}`,
+  };
 }
 
 interface VoiceSurfaceState {
@@ -137,6 +162,8 @@ export interface HostCodexManagerAgentInput {
   voice_ui_rules?: VoiceUiRules;
   manager_skills?: ManagerAgentPromptSkill[];
   plugin_context?: HomerailPluginTurnContextV1;
+  /** Opaque Manager-issued credential kept only in Tool handler closures. */
+  plugin_tool_turn_token?: string;
 }
 
 export type HostCodexManagerAgentRunner = (
@@ -437,24 +464,65 @@ function safeCwd(root: string, raw?: unknown): string {
 
 async function requestManager(restUrl: string, pathname: string, init?: RequestInit): Promise<unknown> {
   const url = `${restUrl}${pathname.startsWith("/") ? pathname : `/${pathname}`}`;
-  const res = await fetch(url, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
-  });
-  const text = await res.text();
-  let body: unknown = text;
+  const token = process.env.HOMERAIL_MANAGER_ADMIN_TOKEN || undefined;
+  const headers = managerRequestHeaders(url, init, token);
   try {
-    body = text ? JSON.parse(text) : {};
-  } catch {
-    body = { raw: text };
+    const res = await fetch(url, { ...init, headers });
+    const text = await res.text();
+    let body: unknown = text;
+    try {
+      body = text ? JSON.parse(text) : {};
+    } catch {
+      body = { raw: text };
+    }
+    if (!res.ok) {
+      throw new Error(`Manager API ${res.status}: ${short(body, 800)}`);
+    }
+    return body;
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    const error = new Error(redactManagerAdminToken(message, token));
+    if (cause instanceof Error) error.name = cause.name;
+    throw error;
   }
-  if (!res.ok) {
-    throw new Error(`Manager API ${res.status}: ${short(body, 800)}`);
-  }
-  return body;
+}
+
+export function _requestManagerForTest(
+  restUrl: string,
+  pathname: string,
+  init?: RequestInit,
+): Promise<unknown> {
+  return requestManager(restUrl, pathname, init);
+}
+
+function managerRequestHeaders(url: string, init: RequestInit | undefined, token: string | undefined): Headers {
+  const headers = new Headers(init?.headers);
+  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  headers.delete("Authorization");
+  const method = (init?.method || "GET").toUpperCase();
+  const pathname = new URL(url).pathname;
+  if (
+    token
+    && ["POST", "PUT", "PATCH", "DELETE"].includes(method)
+    && (pathname === "/api" || pathname.startsWith("/api/"))
+  ) headers.set("Authorization", `Bearer ${token}`);
+  return headers;
+}
+
+function redactManagerAdminToken(message: string, token: string | undefined): string {
+  let redacted = token ? message.split(token).join("***REDACTED***") : message;
+  redacted = redacted.replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1***REDACTED***");
+  return redacted;
+}
+
+/** Manager Agent subprocesses must never inherit Manager-wide signing/write authority. */
+export function managerAgentChildEnv(
+  source: NodeJS.ProcessEnv = process.env,
+): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...source };
+  delete env.HOMERAIL_MANAGER_ADMIN_TOKEN;
+  delete env.HOMERAIL_PLUGIN_CAPABILITY_SECRET;
+  return env;
 }
 
 function execReadonly(
@@ -467,7 +535,7 @@ function execReadonly(
       timeout: 20_000,
       maxBuffer: 1024 * 1024,
       encoding: "utf-8",
-      env: process.env,
+      env: managerAgentChildEnv(),
     }, (err, stdout, stderr) => {
       const code = typeof (err as NodeJS.ErrnoException | null)?.code === "number"
         ? Number((err as NodeJS.ErrnoException).code)
@@ -499,7 +567,7 @@ export function createManagerTools(state: {
   finalNotes: string[];
   objectiveToolCalls: Array<{ name: string; success: boolean; error?: string }>;
   voiceSurface: VoiceSurfaceState;
-}, responseMode: "chat" | "voice", pluginContext?: HomerailPluginTurnContextV1): ToolDefinition[] {
+}, responseMode: "chat" | "voice", pluginContext?: HomerailPluginTurnContextV1, pluginToolTurnToken?: string): ToolDefinition[] {
   if (pluginContext && (
     !validateHomerailPluginTurnContext(pluginContext).valid
     || pluginJsonDigest(homerailPluginTurnContextDigestInput(pluginContext)) !== pluginContext.context_digest
@@ -892,10 +960,30 @@ export function createManagerTools(state: {
       name: descriptor.wire_id,
       description: descriptor.description,
       input_schema: structuredClone(descriptor.input_schema),
-      async handler(args) {
-        const envelope = executeHomerailPluginTool(descriptor, args);
-        state.voiceSurface.pluginProjections.push(envelope);
-        return { content: [{ type: "text", text: JSON.stringify(envelope) }] };
+      async handler(args, context) {
+        if (!pluginToolTurnToken) {
+          const envelope = executeHomerailPluginTool(descriptor, args);
+          state.voiceSurface.pluginProjections.push(envelope);
+          return { content: [{ type: "text", text: JSON.stringify(envelope) }] };
+        }
+        const identity = stablePluginModelCallIdentifiers({
+          turn_token: pluginToolTurnToken,
+          tool_wire_id: descriptor.wire_id,
+          arguments: args,
+          ...(context?.tool_call_id ? { model_tool_call_id: context.tool_call_id } : {}),
+        });
+        const result = await requestManager(state.restUrl, "/plugins/tools/invoke", {
+          method: "POST",
+          body: JSON.stringify({
+            request_id: identity.request_id,
+            idempotency_key: identity.request_id,
+            turn_token: pluginToolTurnToken,
+            tool_wire_id: descriptor.wire_id,
+            call_id: identity.call_id,
+            arguments: args,
+          }),
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
       },
     });
   }
@@ -1263,7 +1351,7 @@ async function* runHostCodexManagerAgentTurnEvents(
   try {
     for await (const event of adapter.run(
       buildPrompt(input.history, message, input.continue_chat !== false),
-      createManagerTools(state, responseMode, input.plugin_context),
+      createManagerTools(state, responseMode, input.plugin_context, input.plugin_tool_turn_token),
       {
         systemPrompt: systemPrompt(config, responseMode, voiceUiRules, voiceSystemContract, input.manager_skills),
         provider: config.provider_name || undefined,
@@ -1484,7 +1572,7 @@ class HostCodexAppServerAdapter {
               let content: string;
               let isError = false;
               try {
-                const result = await def.handler(event.input);
+                const result = await def.handler(event.input, { tool_call_id: event.id });
                 content = result.content.map((b) => b.text ?? "").join("") || JSON.stringify(result);
                 isError = result.is_error === true;
               } catch (toolErr) {
@@ -1533,7 +1621,7 @@ class HostCodexAppServerAdapter {
   }
 
   private buildEnv(context: AgentRunContext): Record<string, string | undefined> {
-    const env: Record<string, string | undefined> = { ...process.env };
+    const env = managerAgentChildEnv();
     if (context.apiKey) env.OPENAI_API_KEY = context.apiKey;
     if (context.baseUrl) env.OPENAI_BASE_URL = context.baseUrl;
     return env;
