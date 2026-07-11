@@ -17,6 +17,7 @@ import {
   stopVoiceMonitor,
   updateVoiceAgentConfig,
   type CodexModel,
+  type GenerativeUiStreamEventV1,
   type VoiceAgentConfig,
   type VoiceConversationMessage,
   type VoiceDebugEvent,
@@ -30,6 +31,7 @@ import VoiceSessionProjectSidebar from '@/components/agent/VoiceSessionProjectSi
 import AgentModeTopBar from '@/components/agent/AgentModeTopBar.vue'
 import DagResourceStatusPill from '@/components/agent/DagResourceStatusPill.vue'
 import VoiceDynamicWidget from '@/components/agent/VoiceDynamicWidget.vue'
+import GenerativeUiShadowPreview from '@/components/generative-ui/GenerativeUiShadowPreview.vue'
 import {
   isCodexModelUnavailable,
   resolveCodexModelOptions,
@@ -132,6 +134,8 @@ const modelConfigButtonLabel = computed(() =>
 )
 const devOnboardingEntryVisible =
   import.meta.env.DEV && flagEnabled(import.meta.env.VITE_HOMERAIL_DEV_ONBOARDING_ENTRY)
+const generativeUiShadowPreviewRequested =
+  import.meta.env.DEV && flagEnabled(import.meta.env.VITE_HOMERAIL_GENERATIVE_UI_SHADOW_PREVIEW)
 const props = withDefaults(
   defineProps<{
     voiceOnly?: boolean
@@ -164,8 +168,15 @@ type VoiceSessionSidebarGamepadControls = {
   ensureGamepadFocus: () => void
   refresh: () => Promise<void>
 }
+type GenerativeUiShadowPreviewControls = {
+  acceptStreamEvent: (event: GenerativeUiStreamEventV1) => Promise<void>
+  refresh: () => Promise<void>
+}
 
 const workspace = ref<VoiceWorkspace | null>(null)
+const generativeUiShadowPreviewActive = computed(() => (
+  generativeUiShadowPreviewRequested && workspace.value?.generative_ui_mode === 'shadow'
+))
 const loading = ref(false)
 const speaking = ref(false)
 const listening = ref(false)
@@ -234,6 +245,7 @@ const cockpitRoot = ref<HTMLElement | null>(null)
 const modelMenuRef = ref<HTMLElement | null>(null)
 const voiceSidebarRef = ref<VoiceSessionSidebarGamepadControls | null>(null)
 const voiceCardGridRef = ref<HTMLElement | null>(null)
+const generativeUiShadowPreviewRef = ref<GenerativeUiShadowPreviewControls | null>(null)
 const conversationThreadRef = ref<HTMLElement | null>(null)
 const noSleepVideo = ref<HTMLVideoElement | null>(null)
 const ttsAudioElement = ref<HTMLAudioElement | null>(null)
@@ -2665,6 +2677,10 @@ async function handleVoiceStreamEvent(
   event: VoiceStreamEvent,
   optimisticId?: string
 ): Promise<'confirm' | null> {
+  if (event.type === 'generative_ui') {
+    await generativeUiShadowPreviewRef.value?.acceptStreamEvent(event as GenerativeUiStreamEventV1)
+    return null
+  }
   if (event.type === 'workspace') {
     applyStreamWorkspace((event as { workspace?: VoiceWorkspace }).workspace, optimisticId)
     return null
@@ -4731,7 +4747,7 @@ function summarizeTask(value: string): string {
           >
             {{ processingText }}
           </div>
-          <div v-if="minimizedWidgets.length" class="voice-widget-shelf">
+          <div v-if="minimizedWidgets.length && !generativeUiShadowPreviewActive" class="voice-widget-shelf">
             <div
               v-for="widget in minimizedWidgets"
               :key="widget.id"
@@ -4744,7 +4760,16 @@ function summarizeTask(value: string): string {
           </div>
 
           <div class="voice-stage__content min-h-0 flex-1">
+            <GenerativeUiShadowPreview
+              v-if="generativeUiShadowPreviewActive && workspace"
+              ref="generativeUiShadowPreviewRef"
+              :session-id="workspace.session_id"
+              :refresh-token="workspace.updated_at"
+              :active-run-id="workspace.manager_run_id"
+              @open-preview="openWidgetPreview"
+            />
             <div
+              v-else
               ref="voiceCardGridRef"
               class="voice-card-grid"
               :class="{
