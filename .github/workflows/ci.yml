@@ -18,6 +18,10 @@ on:
         description: Wake the Qwen model host when it is offline
         type: boolean
         default: true
+      patterns:
+        description: Optional comma-separated pattern IDs (empty runs the full catalog)
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -167,6 +171,7 @@ jobs:
       HOMERAIL_PATTERN_MODEL_BASE_URL: http://192.168.100.10:5000
       HOMERAIL_PATTERN_MODEL: qwen3.6
       HOMERAIL_WAKE_MODEL: ${{ inputs.wake_model && '1' || '0' }}
+      HOMERAIL_LIVE_PATTERNS: ${{ inputs.patterns }}
       HOMERAIL_LIVE_RUN_KEY: ${{ github.run_id }}-${{ github.run_attempt }}
       HOMERAIL_LIVE_REPORT_PATH: ${{ github.workspace }}/artifacts/dag-patterns-live.json
     steps:

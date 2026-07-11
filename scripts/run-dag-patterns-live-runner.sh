@@ -124,12 +124,24 @@ docker build \
 node "$REPO_ROOT/homerail_cli/dist/cli.js" start --host 0.0.0.0 --no-build-worker-image
 SETTING_ID="$(node "$REPO_ROOT/scripts/configure-live-pattern-model.mjs")"
 
-node "$REPO_ROOT/scripts/validate-dag-patterns-live.mjs" \
-  --base-url "$HOMERAIL_MANAGER_URL" \
-  --setting-id "$SETTING_ID" \
-  --expected-model "$MODEL_NAME" \
-  --timeout-ms 360000 \
+validation_args=(
+  --base-url "$HOMERAIL_MANAGER_URL"
+  --setting-id "$SETTING_ID"
+  --expected-model "$MODEL_NAME"
+  --timeout-ms 360000
   --output "$REPORT_PATH"
+)
+if [ -n "${HOMERAIL_LIVE_PATTERNS:-}" ]; then
+  IFS=',' read -ra requested_patterns <<<"$HOMERAIL_LIVE_PATTERNS"
+  for pattern in "${requested_patterns[@]}"; do
+    pattern="${pattern//[[:space:]]/}"
+    if [ -n "$pattern" ]; then
+      validation_args+=(--pattern "$pattern")
+    fi
+  done
+fi
+
+node "$REPO_ROOT/scripts/validate-dag-patterns-live.mjs" "${validation_args[@]}"
 
 cp "$REPORT_PATH" "$UPLOAD_REPORT_PATH"
 echo "Live DAG pattern report: $REPORT_PATH"

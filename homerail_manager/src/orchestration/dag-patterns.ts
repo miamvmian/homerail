@@ -142,7 +142,7 @@ const heartbeat: DAGPatternDefinition = {
 
 const orchestratorWorkers: DAGPatternDefinition = {
   id: "orchestrator-workers",
-  version: "1.0.0",
+  version: "1.0.1",
   name: "Orchestrator and Workers",
   summary: "Separate planning from parallel execution, then aggregate and verify all worker results.",
   intent: "Give one planner ownership of decomposition while independent workers execute bounded parts in parallel.",
@@ -162,8 +162,8 @@ const orchestratorWorkers: DAGPatternDefinition = {
     description: "Planner-led fan-out, deterministic all-result aggregation, and fresh verification.",
     workspace: { mode: "isolated" },
     agents: {
-      orchestrator: { system: "Produce three non-overlapping work orders with explicit acceptance criteria." },
-      worker: { system: "Execute the assigned work order only. Return JSON with status success or failure and evidence." },
+      orchestrator: { system: "Produce exactly three non-overlapping work orders with explicit acceptance criteria. Return one JSON object whose top-level work_orders object is keyed worker_one, worker_two, and worker_three; each value must be one self-contained work order. Finish with one handoff on planned so the same indexed plan can fan out to all workers." },
+      worker: { system: "Input order is the shared indexed plan and may arrive as a JSON string. Parse it, identify the current DAG node id, and execute only work_orders[current_node_id]. Do not execute another worker's order or inspect unrelated workspace state. Finish by calling the handoff tool on result with one JSON object containing top-level status success or failure and top-level evidence." },
       verifier: { system: "Verify the combined worker evidence against the original objective." },
       reporter: { system: "Summarize the verified aggregate or the failed worker set." },
     },
@@ -541,7 +541,7 @@ const ratchet: DAGPatternDefinition = {
 
 const compost: DAGPatternDefinition = {
   id: "compost",
-  version: "1.0.0",
+  version: "1.0.1",
   name: "Compost",
   summary: "Turn repeated failures into a small set of proposed laws, skill changes, or standing goals.",
   intent: "Let operational evidence improve the system while keeping policy changes behind explicit review.",
@@ -573,7 +573,7 @@ const compost: DAGPatternDefinition = {
     agents: {
       collector: { system: "Collect recent failures, trust demotions, violated goals, and rejected changes with evidence." },
       proposer: { system: "Produce at most {{max_proposals}} proposals. Each must be a law, skill change, or standing goal grounded in incidents. Return exactly one JSON object with top-level status (proposed or no_change) and top-level proposals array. A status nested inside an individual proposal does not satisfy the contract." },
-      reviewer: { system: "Present proposals for explicit human acceptance. Return JSON with top-level status awaiting_human_review and the proposals. Never approve, reject, sign, apply, or simulate a human decision." },
+      reviewer: { system: "You are a review boundary, not the human decision maker. Present proposals for explicit human acceptance, then finish by calling the handoff tool on done with exactly one JSON object containing top-level status awaiting_human_review and the proposals. Never approve, reject, sign, apply, or simulate a human decision." },
     },
     nodes: {
       collect: { agent: "collector", outputs: { evidence: { to: "propose.in:evidence" } } },

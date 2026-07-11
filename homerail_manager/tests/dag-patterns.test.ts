@@ -82,6 +82,33 @@ describe("built-in DAG patterns", () => {
     expect(verdictGate?.gateway_config?.field).toBe("verdict");
   });
 
+  it("fans out one indexed plan while requiring each worker to select only its own work order", () => {
+    const pattern = instantiateDAGPattern("orchestrator-workers");
+    const planEdges = pattern.parsed.graph.edges.filter(
+      (edge) => edge.from_node === "plan" && edge.from_port === "planned" && edge.label !== "after_dep",
+    );
+
+    expect(planEdges.map((edge) => [edge.from_port, edge.to_node, edge.to_port])).toEqual([
+      ["planned", "worker_one", "order"],
+      ["planned", "worker_two", "order"],
+      ["planned", "worker_three", "order"],
+    ]);
+    expect(pattern.parsed.meta.agents.orchestrator?.system).toContain("work_orders object is keyed");
+    expect(pattern.parsed.meta.agents.worker?.system).toContain("may arrive as a JSON string");
+    expect(pattern.parsed.meta.agents.worker?.system).toContain("work_orders[current_node_id]");
+    expect(pattern.parsed.meta.agents.worker?.system).toContain("handoff tool on result");
+    expect(pattern.parsed.meta.agents.worker?.system).toContain("top-level status");
+  });
+
+  it("keeps compost proposals behind an explicit human-review handoff", () => {
+    const pattern = instantiateDAGPattern("compost");
+    const reviewer = pattern.parsed.meta.agents.reviewer;
+
+    expect(reviewer?.system).toContain("not the human decision maker");
+    expect(reviewer?.system).toContain("handoff tool on done");
+    expect(reviewer?.system).toContain("top-level status awaiting_human_review");
+  });
+
   it("rejects unknown, incorrectly typed, and out-of-range parameters", () => {
     expect(() => instantiateDAGPattern("missing")).toThrow("DAG pattern not found");
     expect(() => instantiateDAGPattern("quorum", { surprise: true })).toThrow("Unknown pattern parameter");
