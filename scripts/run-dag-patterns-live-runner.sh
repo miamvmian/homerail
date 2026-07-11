@@ -24,12 +24,14 @@ REPORT_PATH="$PERSISTENT_ARTIFACT_DIR/dag-patterns-live.json"
 UPLOAD_REPORT_PATH="${HOMERAIL_LIVE_REPORT_PATH:-$REPO_ROOT/artifacts/dag-patterns-live.json}"
 LOCK_FILE="$RUNNER_BASE/dag-patterns-live.lock"
 
-mkdir -p "$HOMERAIL_HOME" "$PERSISTENT_ARTIFACT_DIR" "$(dirname "$UPLOAD_REPORT_PATH")"
+mkdir -p "$RUNNER_BASE" "$HOME_BASE" "$PERSISTENT_ARTIFACT_DIR" "$(dirname "$UPLOAD_REPORT_PATH")"
 exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
+if ! flock -w 60 9; then
   echo "Another HomeRail live validation is already running on this runner." >&2
   exit 1
 fi
+HOMERAIL_CLEANUP_LOCK_HELD=1 "$REPO_ROOT/scripts/cleanup-dag-patterns-live-runner.sh"
+mkdir -p "$HOMERAIL_HOME"
 
 cleanup() {
   local exit_code=$?
@@ -37,11 +39,14 @@ cleanup() {
   if [ -x "$REPO_ROOT/homerail_cli/dist/cli.js" ] || [ -f "$REPO_ROOT/homerail_cli/dist/cli.js" ]; then
     node "$REPO_ROOT/homerail_cli/dist/cli.js" runtime stop >/dev/null 2>&1
   fi
-  mapfile -t containers < <(docker ps -aq --filter "ancestor=$HOMERAIL_WORKER_IMAGE" 2>/dev/null)
+  mapfile -t containers < <(docker ps -aq --filter "label=org.homerail.live_run=$RUN_KEY" 2>/dev/null)
   if [ "${#containers[@]}" -gt 0 ]; then
     docker rm -f "${containers[@]}" >/dev/null 2>&1
   fi
-  docker image rm -f "$HOMERAIL_WORKER_IMAGE" >/dev/null 2>&1
+  mapfile -t images < <(docker images --filter "label=org.homerail.live_run=$RUN_KEY" --format "{{.ID}}" | sort -u)
+  if [ "${#images[@]}" -gt 0 ]; then
+    docker image rm -f "${images[@]}" >/dev/null 2>&1
+  fi
   if [ -d "$HOMERAIL_HOME/logs" ]; then
     tar -czf "$PERSISTENT_ARTIFACT_DIR/homerail-logs.tgz" -C "$HOMERAIL_HOME" logs >/dev/null 2>&1
   fi
@@ -116,7 +121,7 @@ docker build \
   -f "$REPO_ROOT/homerail_worker/Dockerfile" \
   "$REPO_ROOT"
 
-node "$REPO_ROOT/homerail_cli/dist/cli.js" start --no-build-worker-image
+node "$REPO_ROOT/homerail_cli/dist/cli.js" start --host 0.0.0.0 --no-build-worker-image
 SETTING_ID="$(node "$REPO_ROOT/scripts/configure-live-pattern-model.mjs")"
 
 node "$REPO_ROOT/scripts/validate-dag-patterns-live.mjs" \
