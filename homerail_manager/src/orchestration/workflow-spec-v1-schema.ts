@@ -60,6 +60,7 @@ const ContractSchema = Type.Recursive((This) => Type.Object({
   additionalProperties: Type.Optional(Type.Boolean()),
   properties: Type.Optional(Type.Record(JsonPropertyName, This, { maxProperties: 128 })),
   items: Type.Optional(This),
+  oneOf: Type.Optional(Type.Array(This, { minItems: 2, maxItems: 8 })),
   minItems: Type.Optional(Type.Integer({ minimum: 0, maximum: 10_000 })),
   maxItems: Type.Optional(Type.Integer({ minimum: 0, maximum: 10_000 })),
   minLength: Type.Optional(Type.Integer({ minimum: 0, maximum: 1_000_000 })),

@@ -891,10 +891,17 @@ export function autoHandoffAfterCorrectionExhausted(
   const run = store.get(runId);
   if (!run || run.status !== "active" || !run.dagRun.nodeStates.has(nodeId)) return undefined;
   const port = _defaultSuccessPort(run, nodeId);
-  const next = handoffActiveRun(runId, nodeId, port, {
-    auto_handoff: true,
-    reason,
-  });
+  let next: ActiveRun | undefined;
+  try {
+    next = handoffActiveRun(runId, nodeId, port, {
+      auto_handoff: true,
+      reason,
+    });
+  } catch (error) {
+    const failedRun = store.get(runId);
+    if (failedRun?.status === "failed") return failedRun;
+    throw error;
+  }
   if (next) {
     emit("dag:node_auto_handoff", { runId, nodeId, port, reason });
   }

@@ -203,9 +203,15 @@ describe("WorkflowSpec v1 runtime projection", () => {
     );
 
     expect(executor.tick("v1-example-fanout")).toBe(1);
-    handoffActiveRun("v1-example-fanout", "plan", "plan", "Check build and tests");
+    handoffActiveRun("v1-example-fanout", "plan", "plan", {
+      objective: "Check build and tests",
+      steps: [
+        "build",
+        { id: "2", description: "test" },
+      ],
+    });
     expect(executor.tick("v1-example-fanout")).toBe(2);
-    handoffActiveRun("v1-example-fanout", "worker_one", "result", { status: "done", evidence: "build passed" });
+    handoffActiveRun("v1-example-fanout", "worker_one", "result", { status: "success", evidence: "build passed" });
     handoffActiveRun("v1-example-fanout", "worker_two", "result", { status: "done", evidence: "tests passed" });
     expect(executor.tick("v1-example-fanout")).toBe(1);
 

@@ -124,6 +124,8 @@ contracts:
 V1 requires the source and target ports of an edge to reference the same named
 contract. Manager validates run input and model handoffs at runtime. A contract
 violation fails the node and cannot continue through a success edge.
+The bounded contract subset supports `oneOf` with two to eight branches when a
+payload field legitimately has a small set of disjoint JSON shapes.
 
 ## Sync and Revisions
 

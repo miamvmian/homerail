@@ -12,12 +12,24 @@ spec:
     Text:
       type: string
       maxLength: 20000
+    WorkOrder:
+      type: object
+      required: [objective]
+      properties:
+        objective: { type: string, maxLength: 4000 }
+        steps:
+          type: array
+          maxItems: 20
+          items:
+            oneOf:
+              - { type: string, maxLength: 4000 }
+              - { type: object }
     Verdict:
       type: object
       additionalProperties: false
       required: [status, evidence]
       properties:
-        status: { type: string, enum: [done, blocked] }
+        status: { type: string, enum: [done, success, blocked] }
         evidence: { type: string, maxLength: 20000 }
     JoinResult:
       type: object
@@ -27,9 +39,19 @@ spec:
 
   agents:
     planner:
-      system: Turn the task into one concise work order and hand it off on plan.
+      system: |
+        Turn the task into a WorkOrder object, then hand it off on plan.
+        The handoff content must have top-level objective and steps fields.
+        Never wrap those fields inside work_order, plan, data, or another object.
+        Use at most three concise steps. Do not require filesystem, shell,
+        network, deployment, or artifact work unless the user explicitly asks.
     worker:
-      system: Execute the work order and hand off a Verdict object on result.
+      system: |
+        Execute the work order and hand off a Verdict object on result.
+        The handoff content must have top-level status and evidence fields.
+        Never wrap those fields inside verdict, result, data, or another object.
+        Do not inspect or modify the workspace and do not call external tools
+        unless the user task explicitly requires that work.
 
   nodes:
     plan:
@@ -38,13 +60,13 @@ spec:
       inputs:
         task: { contract: Text }
       outputs:
-        plan: { contract: Text }
+        plan: { contract: WorkOrder }
 
     worker_one:
       kind: agent
       agent: worker
       inputs:
-        task: { contract: Text }
+        task: { contract: WorkOrder }
       outputs:
         result: { contract: Verdict }
 
@@ -52,7 +74,7 @@ spec:
       kind: agent
       agent: worker
       inputs:
-        task: { contract: Text }
+        task: { contract: WorkOrder }
       outputs:
         result: { contract: Verdict }
 
@@ -67,7 +89,7 @@ spec:
       config:
         mode: all
         field: status
-        success_values: [done]
+        success_values: [done, success]
         passed_port: passed
         failed_port: failed
 

@@ -37,13 +37,17 @@ Implemented on the Draft PR branch:
   same runtime projection used for normal DAG creation;
 - every public legacy orchestration asset is covered by legacy-to-v1 runtime
   graph parity, with executable quorum, condition, and bounded-ratchet
-  transition tests.
+  transition tests;
+- local Claude SDK plus Kimi model-backed runs complete the minimal, condition,
+  and fan-out/join v1 examples with persisted handoffs and passing scorecards;
+- contract-invalid correction exhaustion fails only its run instead of
+  terminating Manager.
 
 Still pending before the Draft can be considered ready:
 
 - decide which remaining public legacy assets should stay as compatibility
   fixtures until runtime profiles and scorecards have independent v1 documents;
-- complete Windows and model-backed validation;
+- complete Windows validation and the isolated remote-runner model matrix;
 - finalize migration policy and authoring documentation.
 
 ## Phase 0: Freeze Existing Behavior
