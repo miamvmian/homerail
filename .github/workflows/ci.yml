@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
     branches: [main]
   workflow_dispatch:
@@ -33,7 +34,9 @@ concurrency:
 jobs:
   core-linux:
     name: Core (Linux, Node ${{ matrix.node-version }})
-    if: github.event_name != 'workflow_dispatch' || !inputs.live_patterns
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (github.event_name != 'workflow_dispatch' || !inputs.live_patterns)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -69,7 +72,9 @@ jobs:
 
   core-windows:
     name: Core (Windows, Node 24)
-    if: github.event_name != 'workflow_dispatch' || !inputs.live_patterns
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (github.event_name != 'workflow_dispatch' || !inputs.live_patterns)
     runs-on: windows-latest
     timeout-minutes: 25
     steps:
@@ -101,7 +106,9 @@ jobs:
 
   agent-ui-coverage:
     name: Agent UI coverage
-    if: github.event_name != 'workflow_dispatch' || !inputs.live_patterns
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (github.event_name != 'workflow_dispatch' || !inputs.live_patterns)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -129,7 +136,9 @@ jobs:
 
   docker-smoke:
     name: Docker smoke
-    if: github.event_name != 'workflow_dispatch' || !inputs.live_patterns
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (github.event_name != 'workflow_dispatch' || !inputs.live_patterns)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -163,6 +172,7 @@ jobs:
        inputs.live_patterns &&
        github.actor == 'xiaotianfotos') ||
       (github.event_name == 'pull_request' &&
+       github.event.pull_request.draft == false &&
        github.actor == 'xiaotianfotos' &&
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, Linux, X64, homerail-live-112]
