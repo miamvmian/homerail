@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { DAGDispatcher, DispatchEnvelope, DispatchResult } from "../src/orchestration/dag-dispatcher.js";
+import { parseWorkflowSource } from "../src/orchestration/workflow-spec-v1.js";
 import { parseDAGYaml } from "../src/orchestration/yaml-loader.js";
 import { _clearListeners } from "../src/events/bus.js";
 import { closeDb } from "../src/persistence/db.js";
@@ -103,6 +104,53 @@ describe("DAG correction and dispatch retry", () => {
     const run = autoHandoffAfterCorrectionExhausted("run-auto-handoff", "start", "missing handoff again");
     expect(run?.status).toBe("completed");
     expect(run?.dagRun.nodeStates.get("start")).toBe("COMPLETED");
+  });
+
+  it("fails the run without throwing when an exhausted auto-handoff violates a v1 contract", () => {
+    const parsed = parseWorkflowSource(`
+api_version: homerail.ai/v1
+kind: Workflow
+metadata: { id: correction-contract, name: Correction Contract }
+spec:
+  contracts:
+    Text: { type: string }
+  agents:
+    worker: { system: Return text. }
+  nodes:
+    start:
+      kind: agent
+      agent: worker
+      outputs:
+        done: { contract: Text }
+    terminal:
+      kind: terminal
+      outcome: success
+      inputs:
+        result: { contract: Text }
+  edges:
+    - { from: start.done, to: terminal.result }
+  policies:
+    max_corrections_per_node: 0
+`);
+    parsed.meta.agents!.worker!.agent_type = "deterministic";
+    createActiveRun("run-auto-handoff-contract", parsed);
+    dispatchReadyNodes(
+      "run-auto-handoff-contract",
+      new FlakyDispatcher({ status: "dispatched", targetType: "fake", targetId: "first" }),
+    );
+
+    expect(requestNodeCorrection(
+      "run-auto-handoff-contract",
+      "start",
+      "missing handoff",
+    ).status).toBe("exhausted");
+    expect(() => autoHandoffAfterCorrectionExhausted(
+      "run-auto-handoff-contract",
+      "start",
+      "missing handoff",
+    )).not.toThrow();
+    expect(getActiveRun("run-auto-handoff-contract")?.status).toBe("failed");
+    expect(getActiveRun("run-auto-handoff-contract")?.dagRun.nodeStates.get("start")).toBe("FAILED");
   });
 
   it("retries retryable dispatch failures once before marking the node running", () => {

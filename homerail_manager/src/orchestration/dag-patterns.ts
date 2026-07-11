@@ -2,6 +2,12 @@ import YAML from "yaml";
 
 import { assertGraphValid, validateGraph, type GraphValidationResult } from "./graph-validator.js";
 import type { ParsedDAG } from "./graph.js";
+import { assertRuntimeGraphParity } from "./runtime-graph-parity.js";
+import {
+  canonicalWorkflowToV1Document,
+  compileWorkflowSource,
+  projectCanonicalWorkflowToParsedDAG,
+} from "./workflow-spec-v1.js";
 import { parseDAGYaml } from "./yaml-loader.js";
 
 export const DAG_PATTERN_SOURCE = {
@@ -616,7 +622,11 @@ function clone<T>(value: T): T {
 }
 
 function publicDefinition(definition: DAGPatternDefinition): DAGPatternDefinition {
-  return clone(definition);
+  const parameters = resolveParameters(definition, {});
+  return {
+    ...clone(definition),
+    workflow_template: buildPatternWorkflow(definition, parameters).workflow,
+  };
 }
 
 export function listDAGPatterns(): DAGPatternSummary[] {
@@ -712,6 +722,18 @@ export function instantiateDAGPattern(
   const definition = definitionById.get(id);
   if (!definition) throw new Error(`DAG pattern not found: ${id}`);
   const parameters = resolveParameters(definition, supplied);
+  const built = buildPatternWorkflow(definition, parameters);
+  return {
+    pattern: publicDefinition(definition),
+    parameters,
+    ...built,
+  };
+}
+
+function buildPatternWorkflow(
+  definition: DAGPatternDefinition,
+  parameters: Record<string, string | number | boolean>,
+): Omit<InstantiatedDAGPattern, "pattern" | "parameters"> {
   const workflow = interpolate(definition.workflow_template, parameters) as Record<string, unknown>;
   workflow.pattern = {
     id: definition.id,
@@ -719,14 +741,24 @@ export function instantiateDAGPattern(
     source: definition.source.url,
     parameters,
   };
-  const yamlText = YAML.stringify(workflow, { lineWidth: 0 });
-  const parsed = parseDAGYaml(yamlText);
+  const legacyYaml = YAML.stringify(workflow, { lineWidth: 0 });
+  const legacyParsed = parseDAGYaml(legacyYaml);
+  const legacyCompilation = compileWorkflowSource(legacyYaml);
+  if (!legacyCompilation.valid || !legacyCompilation.canonical) {
+    throw new Error(`Built-in DAG pattern '${definition.id}' failed legacy compilation: ${legacyCompilation.diagnostics.map((entry) => entry.message).join("; ")}`);
+  }
+  const v1Workflow = canonicalWorkflowToV1Document(legacyCompilation.canonical);
+  const yamlText = YAML.stringify(v1Workflow, { lineWidth: 0 });
+  const compilation = compileWorkflowSource(yamlText);
+  if (!compilation.valid || !compilation.canonical) {
+    throw new Error(`Built-in DAG pattern '${definition.id}' failed WorkflowSpec v1 compilation: ${compilation.diagnostics.map((entry) => `${entry.code} ${entry.path}: ${entry.message}`).join("; ")}`);
+  }
+  const parsed = projectCanonicalWorkflowToParsedDAG(compilation.canonical);
+  assertRuntimeGraphParity(`Built-in DAG pattern '${definition.id}'`, legacyParsed, parsed);
   const validation = validateGraph(parsed.graph);
   assertGraphValid(parsed.graph);
   return {
-    pattern: publicDefinition(definition),
-    parameters,
-    workflow,
+    workflow: v1Workflow,
     yaml_text: yamlText,
     parsed,
     validation,

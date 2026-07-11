@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { GraphExecutor } from "./graph-executor.js";
 import type { DAGAgentConfig, DAGGraphNode, DAGOutputRoute, ParsedDAG } from "./graph.js";
-import { parseDAGYamlFile } from "./yaml-loader.js";
+import { parseWorkflowSourceFile } from "./workflow-spec-v1.js";
 import { assertProviderPolicy } from "./provider-policy.js";
 import { assertNoYamlProviderRuntime } from "./runtime-selection.js";
 import {
@@ -35,6 +35,10 @@ export interface CreateRunResponse {
   runId: string;
   workflowId?: string;
   workflowName?: string;
+  workflowRevision?: number;
+  canonicalHash?: string;
+  compilerVersion?: string;
+  sourceApiVersion?: string;
   nodeCount: number;
   status: string;
   createdAt: number;
@@ -119,6 +123,10 @@ export interface CreateAndRunResponse {
   runId: string;
   workflowId?: string;
   workflowName?: string;
+  workflowRevision?: number;
+  canonicalHash?: string;
+  compilerVersion?: string;
+  sourceApiVersion?: string;
   nodeCount: number;
   status: string;
   createdAt: number;
@@ -222,7 +230,7 @@ function _loadDagForRequest(request: CreateRunRequest): ParsedDAG {
     throw new Error("Missing required field: yamlPath or workflow_id");
   }
   const resolvedPath = _resolveYamlPath(request.yamlPath);
-  return parseDAGYamlFile(resolvedPath);
+  return parseWorkflowSourceFile(resolvedPath);
 }
 
 function _applyRuntimeProfile(parsed: ParsedDAG, request: CreateRunRequest): ParsedDAG {
@@ -258,6 +266,10 @@ export class ChangeOrchestrator {
       runId: run.runId,
       workflowId: run.workflowId,
       workflowName: run.workflowName,
+      workflowRevision: run.workflowRevision,
+      canonicalHash: run.canonicalHash,
+      compilerVersion: run.compilerVersion,
+      sourceApiVersion: run.sourceApiVersion,
       nodeCount: run.nodeCount ?? dagWithRuntime.graph.nodes.length,
       status: run.status,
       createdAt: run.createdAt,
@@ -281,6 +293,10 @@ export class ChangeOrchestrator {
       runId: createResult.runId,
       workflowId: createResult.workflowId,
       workflowName: createResult.workflowName,
+      workflowRevision: createResult.workflowRevision,
+      canonicalHash: createResult.canonicalHash,
+      compilerVersion: createResult.compilerVersion,
+      sourceApiVersion: createResult.sourceApiVersion,
       nodeCount: createResult.nodeCount,
       status: createResult.status,
       createdAt: createResult.createdAt,
