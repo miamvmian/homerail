@@ -3,6 +3,10 @@
 Status: Draft for design review. No runtime behavior is implemented by this
 document.
 
+For a complete Chinese overview of the proposed DSL, its rationale, execution
+model, compatibility strategy, and future extension boundary, see
+[`dag-workflow-spec-v1-overview.zh-CN.md`](dag-workflow-spec-v1-overview.zh-CN.md).
+
 ## Context
 
 HomeRail currently uses YAML as both the authoring format and the persisted

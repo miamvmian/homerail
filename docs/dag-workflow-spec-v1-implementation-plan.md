@@ -3,6 +3,10 @@
 Status: Draft task design. This plan depends on approval of
 `dag-workflow-spec-v1-design.md` and does not authorize implementation yet.
 
+Review the overall DSL model and the Why/How rationale in
+[`dag-workflow-spec-v1-overview.zh-CN.md`](dag-workflow-spec-v1-overview.zh-CN.md)
+before resolving implementation tasks.
+
 ## Delivery Boundary
 
 The first delivery includes strict WorkflowSpec v1 validation, canonical IR,
