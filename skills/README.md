@@ -90,3 +90,5 @@ Direct invocation examples:
 
 - Codex: `$homerail-install-ops`
 - Claude Code: `/homerail-install-ops`
+- DAG pattern selection in Codex: `$homerail-dag-patterns`
+- DAG pattern selection in Claude Code: `/homerail-dag-patterns`

@@ -143,6 +143,7 @@ function _skipUntakenSatisfiedBranches(run: DAGRun, nodeId: string): void {
   });
   if (hasUntakenRequiredInput) {
     run.nodeStates.set(nodeId, "SKIPPED");
+    _skipDependentNodes(run, nodeId);
   }
 }
 
@@ -209,7 +210,8 @@ function _wakeLoopSource(run: DAGRun, nodeId: string): void {
 }
 
 function _isLoopGateway(run: DAGRun, nodeId: string): boolean {
-  return run.graph.nodes.find((node) => node.node_id === nodeId)?.node_type === "loop_gateway";
+  const nodeType = run.graph.nodes.find((node) => node.node_id === nodeId)?.node_type;
+  return nodeType === "loop_gateway" || nodeType === "while_gateway";
 }
 
 function _wakeLoopGatewayReceiver(run: DAGRun, fromNode: string, nodeId: string): void {

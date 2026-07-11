@@ -184,6 +184,16 @@ hr run assets/orchestrations/public-two-node.yaml.template \
   --prompt "Draft a short checklist for a backend release"
 ```
 
+HomeRail also ships a Manager-backed [DAG pattern library](docs/dag-patterns.md)
+for reusable control-flow designs such as quorum, bounded ratchets, standing
+goal verification, and planner/worker fan-out:
+
+```bash
+hr patterns list
+hr patterns show quorum
+hr patterns instantiate quorum --set workflow_id=release-quorum --set threshold=2
+```
+
 ## Drive the CLI from a coding agent
 
 There is a second way to use HomeRail, beyond speaking to the Manager Agent or

@@ -20,7 +20,10 @@ function _isTerminalEdge(edge: DAGEdge): boolean {
 
 function _isLoopFeedbackEdge(graph: DAGGraphData, edge: DAGEdge): boolean {
   if (_isTerminalEdge(edge)) return false;
-  return graph.nodes.find((node) => node.node_id === edge.to_node)?.node_type === "loop_gateway";
+  const target = graph.nodes.find((node) => node.node_id === edge.to_node);
+  if (target?.node_type !== "loop_gateway" && target?.node_type !== "while_gateway") return false;
+  const source = graph.nodes.find((node) => node.node_id === edge.from_node);
+  return source?.after.includes(target.node_id) ?? false;
 }
 
 function _nodeIds(graph: DAGGraphData): string[] {
@@ -131,17 +134,58 @@ function _maxRetries(edge: DAGEdge): number | undefined {
   return typeof raw === "number" && Number.isFinite(raw) ? raw : undefined;
 }
 
+const JOIN_MODES = new Set(["all", "any", "n_of_m"]);
+const WHILE_OPERATORS = new Set(["eq", "ne", "gt", "gte", "lt", "lte", "truthy", "falsy"]);
+
+function _validateGatewayConfigs(graph: DAGGraphData, errors: string[]): void {
+  for (const node of graph.nodes) {
+    const config = node.gateway_config;
+    if (node.node_type === "join_gateway") {
+      const mode = config?.mode ?? "all";
+      if (!JOIN_MODES.has(mode)) {
+        errors.push(`Join gateway ${node.node_id} has unsupported mode: ${mode}`);
+      }
+      if (mode === "n_of_m") {
+        const threshold = config?.threshold;
+        if (!Number.isInteger(threshold) || (threshold ?? 0) < 1) {
+          errors.push(`Join gateway ${node.node_id} requires a positive integer threshold for n_of_m mode`);
+        }
+      }
+    }
+    if (node.node_type === "while_gateway") {
+      const operator = config?.operator ?? "eq";
+      if (!WHILE_OPERATORS.has(operator)) {
+        errors.push(`While gateway ${node.node_id} has unsupported operator: ${operator}`);
+      }
+      const maxIterations = config?.max_iterations ?? 3;
+      if (!Number.isInteger(maxIterations) || maxIterations < 1) {
+        errors.push(`While gateway ${node.node_id} requires max_iterations to be a positive integer`);
+      }
+    }
+  }
+}
+
 export function validateGraph(graph: DAGGraphData): GraphValidationResult {
   const errors: string[] = [];
   const warnings: string[] = [];
   const ids = _nodeIds(graph);
   const idSet = new Set(ids);
 
+  _validateGatewayConfigs(graph, errors);
+
   if (ids.length === 0) {
     errors.push("Graph has no nodes");
   }
 
   for (const edge of graph.edges) {
+    if (
+      edge.retry_policy?.max_retries !== undefined &&
+      (!Number.isInteger(edge.retry_policy.max_retries) || edge.retry_policy.max_retries < 0)
+    ) {
+      errors.push(
+        `Edge ${edge.from_node}.${edge.from_port} -> ${edge.to_node}.${edge.to_port} requires max_retries to be a non-negative integer`,
+      );
+    }
     if (!idSet.has(edge.from_node)) {
       errors.push(`Edge references unknown from_node: ${edge.from_node}`);
     }

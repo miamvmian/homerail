@@ -183,4 +183,77 @@ nodes:
       "Feedback-loop risk: on_failure edge second.error -> first.retry has max_retries 11",
     );
   });
+
+  it("allows a bounded feedback cycle that targets a while gateway", () => {
+    const parsed = parseDAGYaml(`
+name: valid-while-cycle
+nodes:
+  work:
+    agent: worker
+    after: [gate]
+    outputs:
+      measured:
+        to: gate.in:measurement
+        retry_policy:
+          max_retries: 2
+  gate:
+    type: while_gateway
+    gateway_config:
+      operator: eq
+      value: done
+      max_iterations: 2
+    outputs:
+      continue:
+        to: work.in:task
+      done:
+        to: ""
+      exhausted:
+        to: ""
+`);
+
+    const result = validateGraph(parsed.graph);
+    expect(result.valid).toBe(true);
+    expect(result.entry_nodes).toEqual(["gate"]);
+    expect(parsed.loop_sources).toContain("gate");
+  });
+
+  it("rejects invalid join, while, and retry configurations before runtime", () => {
+    expect(() => parseDAGYaml(`
+name: invalid-join
+nodes:
+  join:
+    type: join_gateway
+    gateway_config:
+      mode: n_of_m
+      threshold: 0
+    outputs:
+      passed:
+        to: ""
+`)).toThrow(/positive integer threshold/);
+
+    expect(() => parseDAGYaml(`
+name: invalid-while
+nodes:
+  gate:
+    type: while_gateway
+    gateway_config:
+      operator: approximately
+      max_iterations: 0
+    outputs:
+      done:
+        to: ""
+`)).toThrow(/unsupported operator/);
+
+    expect(() => parseDAGYaml(`
+name: invalid-retry
+nodes:
+  start:
+    agent: worker
+    outputs:
+      done:
+        to: ""
+        retry_policy:
+          max_retries: -1
+`)).toThrow(/non-negative integer/);
+  });
 });

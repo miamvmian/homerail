@@ -250,6 +250,7 @@ skills/
   homerail-install-ops/  # Local-source install, service startup, maintenance, smoke
   homerail-cli/          # CLI command reference
   homerail-dag-ops/      # DAG run, monitor, inspect, and author operations
+  homerail-dag-patterns/ # DAG pattern selection, composition, and instantiation
 
 assets/
   orchestrations/    # Public example DAG template YAML files
