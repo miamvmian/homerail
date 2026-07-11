@@ -6,6 +6,9 @@
 export const GENERATIVE_UI_IR_VERSION = 1 as const;
 export type GenerativeUiIrVersion = typeof GENERATIVE_UI_IR_VERSION;
 
+export const GENERATIVE_UI_COMPOSITION_VERSION = 1 as const;
+export type GenerativeUiCompositionVersion = typeof GENERATIVE_UI_COMPOSITION_VERSION;
+
 export const GenerativeUiSurface = {
   TASK: "task",
   EXECUTION: "execution",
@@ -47,6 +50,41 @@ export const GenerativeUiVisibility = {
   HIDDEN: "hidden",
 } as const;
 export type GenerativeUiVisibility = (typeof GenerativeUiVisibility)[keyof typeof GenerativeUiVisibility];
+
+export const GenerativeUiDevice = {
+  PHONE: "phone",
+  DESKTOP: "desktop",
+  TV: "tv",
+} as const;
+export type GenerativeUiDevice = (typeof GenerativeUiDevice)[keyof typeof GenerativeUiDevice];
+
+export const GenerativeUiInputModality = {
+  TOUCH: "touch",
+  MOUSE: "mouse",
+  GAMEPAD: "gamepad",
+  VOICE: "voice",
+} as const;
+export type GenerativeUiInputModality =
+  (typeof GenerativeUiInputModality)[keyof typeof GenerativeUiInputModality];
+
+export const GenerativeUiViewport = {
+  COMPACT: "compact",
+  REGULAR: "regular",
+  WIDE: "wide",
+} as const;
+export type GenerativeUiViewport = (typeof GenerativeUiViewport)[keyof typeof GenerativeUiViewport];
+
+export const GenerativeUiAttention = {
+  GLANCE: "glance",
+  FOCUSED: "focused",
+} as const;
+export type GenerativeUiAttention = (typeof GenerativeUiAttention)[keyof typeof GenerativeUiAttention];
+
+export const GenerativeUiPlacement = {
+  PRIMARY: "primary",
+  OVERFLOW: "overflow",
+} as const;
+export type GenerativeUiPlacement = (typeof GenerativeUiPlacement)[keyof typeof GenerativeUiPlacement];
 
 export const GenerativeUiPersistence = {
   TURN: "turn",
@@ -282,6 +320,39 @@ export interface GenerativeUiUserOverrideV1 {
   pinned?: boolean;
   preferred_surface?: GenerativeUiSurface;
   updated_at: string;
+}
+
+export interface GenerativeUiSurfaceContextV1 {
+  device: GenerativeUiDevice;
+  input: GenerativeUiInputModality;
+  viewport: GenerativeUiViewport;
+  attention: GenerativeUiAttention;
+  active_run_id?: string;
+  active_session_id?: string;
+  /** Optional host capacity, still bounded and interpreted by the Core Composer. */
+  surface_capacities?: Partial<Record<GenerativeUiSurface, number>>;
+}
+
+export interface GenerativeUiCompositionItemV1 {
+  node_id: string;
+  node_revision: number;
+  surface: GenerativeUiSurface;
+  variant: GenerativeUiDensity;
+  rank: number;
+  placement: GenerativeUiPlacement;
+  pinned: boolean;
+  visibility: Exclude<GenerativeUiVisibility, "hidden">;
+}
+
+export interface GenerativeUiCompositionV1 {
+  composition_version: GenerativeUiCompositionVersion;
+  document_id: string;
+  document_revision: number;
+  context: GenerativeUiSurfaceContextV1;
+  /** Items are emitted in rank order; rank is one-based and contiguous. */
+  items: GenerativeUiCompositionItemV1[];
+  /** Hidden nodes remain explicit so all projections share the same suppression decision. */
+  hidden_node_ids: string[];
 }
 
 export interface GenerativeUiInteractionEventV1 {

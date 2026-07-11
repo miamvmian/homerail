@@ -18,11 +18,13 @@ import {
   type GenerativeUiJsonValueLimits,
 } from "./json-value.js";
 import type {
+  GenerativeUiCompositionV1,
   GenerativeUiDocumentV1,
   GenerativeUiInteractionEventV1,
   GenerativeUiNodeV1,
   GenerativeUiStoredNodeV1,
   GenerativeUiTransactionV1,
+  GenerativeUiSurfaceContextV1,
   GenerativeUiUserOverrideV1,
   GenerativeUiValidationError,
 } from "./types.js";
@@ -339,6 +341,50 @@ export function validateGenerativeUiUserOverride(
     validation,
     validation.value ? timestampError("/updated_at", validation.value.updated_at) : [],
   );
+}
+
+export function validateGenerativeUiCompositionContext(
+  value: unknown,
+): GenerativeUiValidationResult<GenerativeUiSurfaceContextV1> {
+  return validate<GenerativeUiSurfaceContextV1>("generative-ui-composition-context", value);
+}
+
+export function validateGenerativeUiComposition(
+  value: unknown,
+): GenerativeUiValidationResult<GenerativeUiCompositionV1> {
+  const validation = validate<GenerativeUiCompositionV1>("generative-ui-composition", value);
+  if (!validation.value) return validation;
+  const errors: GenerativeUiValidationError[] = [];
+  const itemIds = new Set<string>();
+  validation.value.items.forEach((item, index) => {
+    if (item.rank !== index + 1) {
+      errors.push({
+        path: `/items/${index}/rank`,
+        message: `rank must be contiguous and equal ${index + 1}`,
+        keyword: "compositionRank",
+      });
+    }
+    if (itemIds.has(item.node_id)) {
+      errors.push({
+        path: `/items/${index}/node_id`,
+        message: `duplicate composed node id: ${item.node_id}`,
+        keyword: "uniqueNodeId",
+      });
+    }
+    itemIds.add(item.node_id);
+  });
+  const hiddenIds = new Set<string>();
+  validation.value.hidden_node_ids.forEach((nodeId, index) => {
+    if (hiddenIds.has(nodeId) || itemIds.has(nodeId)) {
+      errors.push({
+        path: `/hidden_node_ids/${index}`,
+        message: `node id must occur in exactly one composition partition: ${nodeId}`,
+        keyword: "compositionPartition",
+      });
+    }
+    hiddenIds.add(nodeId);
+  });
+  return withSemanticErrors(validation, errors);
 }
 
 export function validateGenerativeUiInteractionEvent(

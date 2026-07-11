@@ -4,16 +4,22 @@
  */
 
 import {
+  GENERATIVE_UI_COMPOSITION_VERSION,
   GENERATIVE_UI_IR_VERSION,
   GenerativeUiActionStyle,
+  GenerativeUiAttention,
   GenerativeUiActorType,
   GenerativeUiDensity,
+  GenerativeUiDevice,
   GenerativeUiDocumentScopeType,
   GenerativeUiImportance,
+  GenerativeUiInputModality,
+  GenerativeUiPlacement,
   GenerativeUiPersistence,
   GenerativeUiPhase,
   GenerativeUiPatchUnsetField,
   GenerativeUiSurface,
+  GenerativeUiViewport,
   GenerativeUiVisibility,
 } from "./types.js";
 
@@ -357,6 +363,81 @@ export const generativeUiUserOverrideSchema = {
   additionalProperties: false,
 } as const;
 
+const surfaceCapacitiesSchema = {
+  type: "object",
+  properties: Object.fromEntries(
+    Object.values(GenerativeUiSurface).map((name) => [name, { type: "integer", minimum: 0, maximum: 128 }]),
+  ),
+  minProperties: 1,
+  additionalProperties: false,
+} as const;
+
+export const generativeUiCompositionContextSchema = {
+  $id: "generative-ui-composition-context",
+  type: "object",
+  properties: {
+    device: { type: "string", enum: Object.values(GenerativeUiDevice) },
+    input: { type: "string", enum: Object.values(GenerativeUiInputModality) },
+    viewport: { type: "string", enum: Object.values(GenerativeUiViewport) },
+    attention: { type: "string", enum: Object.values(GenerativeUiAttention) },
+    active_run_id: identifier,
+    active_session_id: opaqueId,
+    surface_capacities: surfaceCapacitiesSchema,
+  },
+  required: ["device", "input", "viewport", "attention"],
+  additionalProperties: false,
+} as const;
+
+const compositionItemSchema = {
+  type: "object",
+  properties: {
+    node_id: opaqueId,
+    node_revision: { type: "integer", minimum: 1 },
+    surface,
+    variant: { type: "string", enum: Object.values(GenerativeUiDensity) },
+    rank: { type: "integer", minimum: 1, maximum: 128 },
+    placement: { type: "string", enum: Object.values(GenerativeUiPlacement) },
+    pinned: { type: "boolean" },
+    visibility: {
+      type: "string",
+      enum: [GenerativeUiVisibility.VISIBLE, GenerativeUiVisibility.MINIMIZED],
+    },
+  },
+  required: [
+    "node_id",
+    "node_revision",
+    "surface",
+    "variant",
+    "rank",
+    "placement",
+    "pinned",
+    "visibility",
+  ],
+  additionalProperties: false,
+} as const;
+
+export const generativeUiCompositionSchema = {
+  $id: "generative-ui-composition",
+  type: "object",
+  properties: {
+    composition_version: { const: GENERATIVE_UI_COMPOSITION_VERSION },
+    document_id: opaqueId,
+    document_revision: { type: "integer", minimum: 0 },
+    context: { $ref: "generative-ui-composition-context" },
+    items: { type: "array", maxItems: 128, items: compositionItemSchema },
+    hidden_node_ids: { type: "array", maxItems: 128, items: opaqueId },
+  },
+  required: [
+    "composition_version",
+    "document_id",
+    "document_revision",
+    "context",
+    "items",
+    "hidden_node_ids",
+  ],
+  additionalProperties: false,
+} as const;
+
 export const generativeUiInteractionEventSchema = {
   $id: "generative-ui-interaction-event",
   type: "object",
@@ -390,5 +471,7 @@ export const generativeUiSchemas: Record<string, Record<string, unknown>> = {
   "generative-ui-document": generativeUiDocumentSchema as Record<string, unknown>,
   "generative-ui-transaction": generativeUiTransactionSchema as Record<string, unknown>,
   "generative-ui-user-override": generativeUiUserOverrideSchema as Record<string, unknown>,
+  "generative-ui-composition-context": generativeUiCompositionContextSchema as Record<string, unknown>,
+  "generative-ui-composition": generativeUiCompositionSchema as Record<string, unknown>,
   "generative-ui-interaction-event": generativeUiInteractionEventSchema as Record<string, unknown>,
 };

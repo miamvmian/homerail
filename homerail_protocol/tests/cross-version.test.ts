@@ -52,6 +52,7 @@ describe("Protocol version consistency", () => {
     const requiredSchemas = [
       "generative-ui-node", "generative-ui-stored-node", "generative-ui-document",
       "generative-ui-transaction", "generative-ui-user-override",
+      "generative-ui-composition-context", "generative-ui-composition",
       "generative-ui-interaction-event",
       "handoff-request", "handoff-response",
       "tool-call", "tool-result",
