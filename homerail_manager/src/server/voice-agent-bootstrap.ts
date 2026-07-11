@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getDataRoot } from "../config/env.js";
 import { encodeJson, getDb, parseJsonRow } from "../persistence/db.js";
+import { readManagerAgentConfig } from "../persistence/manager-agent-config.js";
 import { getProject } from "../persistence/projects-changes.js";
 import { normalizeStatus } from "../persistence/status.js";
 import {
@@ -42,6 +43,16 @@ import {
   registerTurn,
   withSessionLock,
 } from "./voice-session-registry.js";
+import {
+  resolveConfiguredGenerativeUiMode,
+  resolveConfiguredGenerativeUiModeDetails,
+  resolveSessionGenerativeUiMode,
+  type GenerativeUiMode,
+} from "../generative-ui/mode.js";
+import {
+  generativeUiShadowService,
+  type GenerativeUiShadowSnapshotV1,
+} from "../generative-ui/shadow-service.js";
 
 interface BaseResponse {
   success: boolean;
@@ -90,6 +101,8 @@ interface VoiceUiRulesSnapshot {
 interface VoiceWorkspace {
   session_id: string;
   mode: "voice";
+  generative_ui_mode?: GenerativeUiMode;
+  generative_ui_shadow_released?: boolean;
   project_id?: string | null;
   project_workspace_path?: string | null;
   voice_assets_dir?: string | null;
@@ -349,7 +362,13 @@ async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, u
 }
 
 function voiceCompatConfig(config: Record<string, unknown>): Record<string, unknown> {
-  return { ...DEFAULT_VOICE_AGENT_CONFIG, ...config };
+  const result: Record<string, unknown> = { ...DEFAULT_VOICE_AGENT_CONFIG, ...config };
+  const mode = resolveConfiguredGenerativeUiModeDetails(result.generative_ui_mode);
+  return {
+    ...result,
+    effective_generative_ui_mode: mode.effective_mode,
+    generative_ui_mode_source: mode.source,
+  };
 }
 
 async function readConfig(options: ManagerAgentConfigRoutesOptions = {}): Promise<Record<string, unknown>> {
@@ -532,9 +551,13 @@ function newWorkspace(projectId?: string | null): VoiceWorkspace {
   const timestamp = now();
   const sessionId = generateId("voice-");
   const assetsDir = voiceAssetsDir(projectId);
+  const generativeUiMode = resolveConfiguredGenerativeUiMode(
+    readManagerAgentConfig().generative_ui_mode,
+  );
   return {
     session_id: sessionId,
     mode: "voice",
+    generative_ui_mode: generativeUiMode,
     project_id: projectId ?? null,
     project_workspace_path: projectWorkspacePath(projectId),
     voice_assets_dir: assetsDir,
@@ -655,9 +678,7 @@ function syncVoiceWorkspaceTables(workspace: VoiceWorkspace): void {
   });
 }
 
-function saveWorkspace(workspace: VoiceWorkspace): VoiceWorkspace {
-  workspace.updated_at = now();
-  sanitizeLegacyProgrammaticWidgets(workspace);
+function persistWorkspace(workspace: VoiceWorkspace): void {
   const db = getDb();
   db.transaction(() => {
     // Canonical voice workspace body storage: the voice UI reads this JSON blob.
@@ -673,6 +694,27 @@ function saveWorkspace(workspace: VoiceWorkspace): VoiceWorkspace {
       .run(workspace.session_id, workspace.project_id ?? null, workspace.updated_at, encodeJson(workspace));
     syncVoiceWorkspaceTables(workspace);
   })();
+}
+
+function saveWorkspace(workspace: VoiceWorkspace): VoiceWorkspace {
+  workspace.updated_at = now();
+  sanitizeLegacyProgrammaticWidgets(workspace);
+
+  // Legacy remains authoritative: commit it before any non-authoritative
+  // shadow state can advance. A failed legacy write therefore cannot create a
+  // phantom Generative UI revision.
+  persistWorkspace(workspace);
+  const previousDebugId = workspace.debug_events.at(-1)?.id;
+  reconcileGenerativeUiShadow(workspace);
+  if (workspace.debug_events.at(-1)?.id !== previousDebugId) {
+    try {
+      // Best-effort persistence for shadow diagnostics only. The authoritative
+      // workspace is already committed, so this failure must not fail the turn.
+      persistWorkspace(workspace);
+    } catch {
+      // Keep the diagnostic in the current response; a later save may persist it.
+    }
+  }
   return workspace;
 }
 
@@ -956,6 +998,83 @@ function appendDebugEvent(
   workspace.debug_events = workspace.debug_events.slice(-80);
 }
 
+function appendShadowDebugEvent(
+  workspace: VoiceWorkspace,
+  code: string,
+  message: string,
+  level: "debug" | "warning",
+): void {
+  const duplicate = workspace.debug_events
+    .slice(-10)
+    .some((event) => event.code === code && event.message === shortText(message, 500));
+  if (!duplicate) appendDebugEvent(workspace, code, message, level);
+}
+
+function recordShadowSnapshot(workspace: VoiceWorkspace, snapshot: GenerativeUiShadowSnapshotV1): void {
+  if (snapshot.status === "error") {
+    appendShadowDebugEvent(
+      workspace,
+      "generative_ui_shadow_error",
+      `status=error revision=${snapshot.document_revision} widgets=${snapshot.legacy_widget_count} code=${snapshot.error_code} fingerprint=${snapshot.error_hash}`,
+      "warning",
+    );
+    return;
+  }
+  const differences = snapshot.expected_report.summary.difference_count +
+    snapshot.repeat_report.summary.difference_count;
+  const summary = [
+    `matched=${snapshot.matched}`,
+    `revision=${snapshot.document_revision}`,
+    `widgets=${snapshot.legacy_widget_count}`,
+    `differences=${differences}`,
+  ].join(" ");
+  appendShadowDebugEvent(
+    workspace,
+    snapshot.matched ? "generative_ui_shadow_matched" : "generative_ui_shadow_mismatch",
+    summary,
+    snapshot.matched ? "debug" : "warning",
+  );
+}
+
+function reactivateGenerativeUiShadowIfReleased(workspace: VoiceWorkspace): void {
+  // DELETE closes and releases the current shadow incarnation, but the legacy
+  // API historically permits later Agent work on the same Voice session.
+  // Every Agent entrypoint treats that work as an explicit new incarnation.
+  if (workspace.generative_ui_mode === "shadow" && workspace.generative_ui_shadow_released) {
+    delete workspace.generative_ui_shadow_released;
+  }
+}
+
+function reconcileGenerativeUiShadow(workspace: VoiceWorkspace): void {
+  // Existing and explicitly-off sessions take the exact legacy path without
+  // reading config or touching the in-memory Document Service.
+  if (workspace.generative_ui_mode !== "shadow" || workspace.generative_ui_shadow_released) return;
+  try {
+    const globalMode = resolveConfiguredGenerativeUiMode(
+      readManagerAgentConfig().generative_ui_mode,
+    );
+    if (resolveSessionGenerativeUiMode(workspace.generative_ui_mode, globalMode) !== "shadow") return;
+    const snapshot = generativeUiShadowService.reconcile({
+      sessionId: workspace.session_id,
+      widgets: workspace.widgets,
+      checkedAt: workspace.updated_at,
+    });
+    if (snapshot) recordShadowSnapshot(workspace, snapshot);
+  } catch (cause) {
+    const snapshot = generativeUiShadowService.recordFailure({
+      sessionId: workspace.session_id,
+      widgets: workspace.widgets,
+      checkedAt: workspace.updated_at,
+    }, cause);
+    appendShadowDebugEvent(
+      workspace,
+      "generative_ui_shadow_error",
+      `status=error revision=${snapshot.document_revision} widgets=${snapshot.legacy_widget_count} code=${snapshot.error_code} fingerprint=${snapshot.error_hash}`,
+      "warning",
+    );
+  }
+}
+
 function confirmedTaskMessage(workspace: VoiceWorkspace, fallbackText = ""): string {
   const draft = workspace.task_draft;
   if (!draft) return fallbackText || workspace.session_slate || workspace.active_objective || "用户已确认执行当前任务。";
@@ -1190,6 +1309,14 @@ export function _clearStoredConfig(): void {
     db.prepare("DELETE FROM sessions WHERE session_type = 'voice_agent'").run();
     db.prepare("DELETE FROM voice_agent_sessions").run();
   })();
+  generativeUiShadowService.clear();
+}
+
+export function _getGenerativeUiShadowForTest(sessionId: string): Record<string, unknown> {
+  return {
+    snapshot: generativeUiShadowService.getSnapshot(sessionId) ?? null,
+    document: generativeUiShadowService.getDocument(sessionId) ?? null,
+  };
 }
 
 export function voiceAgentBootstrapHandler(
@@ -1352,7 +1479,9 @@ export function voiceAgentBootstrapHandler(
       return true;
     }
     workspace.progress_brief = { status: "done", short_text: "会话已关闭。", updated_at: now() };
+    if (workspace.generative_ui_mode === "shadow") workspace.generative_ui_shadow_released = true;
     saveWorkspace(workspace);
+    if (workspace.generative_ui_shadow_released) generativeUiShadowService.deleteSession(sessionId);
     ok(res, "Voice session closed", { session_id: sessionId });
     return true;
   }
@@ -1393,6 +1522,7 @@ export function voiceAgentBootstrapHandler(
         const result = await withSessionLock(sessionId, async () => {
           const workspace = loadWorkspace(sessionId);
           if (!workspace) throw new HttpNotFoundError("Voice workspace not found");
+          reactivateGenerativeUiShadowIfReleased(workspace);
           if (projectIdPatch && !workspace.project_id) workspace.project_id = projectIdPatch;
           registerTurn(sessionId, "running");
           try {
@@ -1444,6 +1574,7 @@ export function voiceAgentBootstrapHandler(
             res.end();
             return null;
           }
+          reactivateGenerativeUiShadowIfReleased(workspace);
           if (projectIdPatch && !workspace.project_id) workspace.project_id = projectIdPatch;
           workspace.progress_brief = {
             status: "running",
@@ -1510,6 +1641,7 @@ export function voiceAgentBootstrapHandler(
         const result = await withSessionLock(sessionId, async () => {
           const workspace = loadWorkspace(sessionId);
           if (!workspace) throw new HttpNotFoundError("Voice workspace not found");
+          reactivateGenerativeUiShadowIfReleased(workspace);
           const expected = workspace.pending_confirmations[0]?.id;
           if (requested && expected && requested !== expected) {
             throw new HttpBadRequestError("Confirmation id mismatch");
@@ -1561,6 +1693,7 @@ export function voiceAgentBootstrapHandler(
             res.end();
             return null;
           }
+          reactivateGenerativeUiShadowIfReleased(workspace);
           workspace.progress_brief = {
             status: "submitted",
             short_text: "已确认，正在交给主 Agent。",
