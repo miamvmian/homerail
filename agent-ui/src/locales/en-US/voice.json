@@ -223,6 +223,15 @@
     "devTitle": "Development mode: open onboarding",
     "button": "Onboarding"
   },
+  "generativeUi": {
+    "fallback": "Portable fallback",
+    "unavailable": "Renderer unavailable",
+    "untitled": "Untitled content",
+    "shadowPreview": "Generative UI shadow preview",
+    "nonInteractive": "Read-only / non-authoritative",
+    "loading": "Loading Generative UI…",
+    "previewUnavailable": "Generative UI preview unavailable"
+  },
   "errors": {
     "sessionStart": "Failed to start voice session",
     "sessionCreate": "Failed to create a new session",

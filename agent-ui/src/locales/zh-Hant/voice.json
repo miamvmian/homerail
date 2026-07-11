@@ -223,6 +223,15 @@
     "devTitle": "開發模式：打開新手引導",
     "button": "新手引導"
   },
+  "generativeUi": {
+    "fallback": "兼容視圖",
+    "unavailable": "渲染器不可用",
+    "untitled": "未命名內容",
+    "shadowPreview": "生成式 UI 影子預覽",
+    "nonInteractive": "只讀 / 非權威",
+    "loading": "正在讀取生成式 UI…",
+    "previewUnavailable": "生成式 UI 預覽不可用"
+  },
   "errors": {
     "sessionStart": "語音會話啓動失敗",
     "sessionCreate": "新會話創建失敗",
