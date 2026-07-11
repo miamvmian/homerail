@@ -6,6 +6,7 @@ import type {
   GenerativeUiSurfaceContextV1,
   GenerativeUiTransactionV1,
   GenerativeUiUserOverrideV1,
+  HomerailPluginUiProjectionV1,
 } from 'homerail-protocol'
 
 export interface GenerativeUiProjectionV1 {
@@ -17,6 +18,7 @@ export interface GenerativeUiProjectionV1 {
   cursor: number
   overrides: GenerativeUiUserOverrideV1[]
   composition: GenerativeUiCompositionV1
+  ui_registry: HomerailPluginUiProjectionV1
 }
 
 export interface GenerativeUiSnapshotStreamEventV1 {
@@ -29,6 +31,7 @@ export interface GenerativeUiSnapshotStreamEventV1 {
   cursor: number
   overrides: GenerativeUiUserOverrideV1[]
   composition: GenerativeUiCompositionV1
+  ui_registry: HomerailPluginUiProjectionV1
 }
 
 export interface GenerativeUiTransactionStreamEventV1 {

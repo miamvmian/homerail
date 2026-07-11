@@ -1,8 +1,8 @@
 import { defineComponent, h, reactive } from 'vue'
 import { describe, expect, it } from 'vitest'
-import type { GenerativeUiStoredNodeV1 } from 'homerail-protocol'
-import { coreGenerativeUiRendererRegistry } from './core-renderer-registry'
+import type { GenerativeUiStoredNodeV1, HomerailPluginUiProjectionV1 } from 'homerail-protocol'
 import { legacyWidgetFromGenerativeUiNode } from './legacy-widget-adapter'
+import { buildProjectedGenerativeUiRegistry } from './projected-registry'
 import {
   GenerativeUiRendererRegistry,
   type GenerativeUiRendererRegistrationV1,
@@ -34,6 +34,9 @@ function registration(
 ): GenerativeUiRendererRegistrationV1 {
   return {
     renderer_api_version: 1,
+    plugin_id: 'com.example.plugin',
+    plugin_version: '1.0.0',
+    renderer_id: 'card-main',
     kind: 'com.example.plugin/card',
     kind_version: 1,
     surface: 'task',
@@ -62,6 +65,8 @@ describe('GenerativeUiRendererRegistry', () => {
     expect(registry.resolve(node({ kind_version: 2 }), 'task', 'desktop').mode).toBe('fallback')
     expect(registry.resolve(node(), 'result', 'desktop').mode).toBe('fallback')
     expect(registry.resolve(node(), 'task', 'phone').mode).toBe('fallback')
+    expect(registry.resolve(node({ owner: { id: 'com.example.plugin', version: '2.0.0' } }), 'task', 'desktop').mode)
+      .toBe('fallback')
   })
 
   it('returns the portable fallback for unknown kinds and an explicit diagnostic for corrupt fallback', () => {
@@ -83,17 +88,87 @@ describe('GenerativeUiRendererRegistry', () => {
     ])).toThrow('Duplicate specialized renderer')
   })
 
-  it.each(['phone', 'desktop', 'tv'] as const)('statically registers the topic-outline renderer for %s', device => {
+  it.each(['phone', 'desktop', 'tv'] as const)('projects the enabled topic-outline renderer for %s', device => {
+    const runtime = buildProjectedGenerativeUiRegistry(topicProjection(true))
     const topic = node({
+      kind: 'com.homerail.topic-outline/outline',
+      owner: { id: 'com.homerail.topic-outline', version: '1.0.0' },
+      content: { title: 'Topic outline', outline: [] },
+    })
+    expect(runtime.renderers.resolve(topic, 'task', device).mode).toBe('specialized')
+    expect(runtime.renderers.resolve({ ...topic, kind_version: 2 }, 'task', device).mode)
+      .toBe('fallback')
+  })
+
+  it('removes disabled and unknown built-in renderers without dynamic loading', () => {
+    const topic = node({
+      kind: 'com.homerail.topic-outline/outline',
+      owner: { id: 'com.homerail.topic-outline', version: '1.0.0' },
+      content: { title: 'Topic outline' },
+    })
+    expect(buildProjectedGenerativeUiRegistry(topicProjection(false)).renderers.resolve(topic, 'task', 'desktop').mode)
+      .toBe('fallback')
+    const unknown = topicProjection(true)
+    if (unknown.renderers[0].source.type === 'builtin') unknown.renderers[0].source.id = 'not-compiled'
+    const runtime = buildProjectedGenerativeUiRegistry(unknown)
+    expect(runtime.renderers.resolve(topic, 'task', 'desktop').mode).toBe('fallback')
+    expect(runtime.unresolved_renderer_ids).toEqual(['com.homerail.topic-outline:topic-outline-main'])
+  })
+
+  it('keeps the old topic kind inside the isolated legacy compatibility path', () => {
+    const runtime = buildProjectedGenerativeUiRegistry(topicProjection(true))
+    const legacyTopic = node({
       kind: 'com.homerail.content/topic_outline',
       owner: { id: 'com.homerail.content', version: '0.1.0' },
       content: { legacy_widget: legacyWidget() },
     })
-    expect(coreGenerativeUiRendererRegistry.resolve(topic, 'task', device).mode).toBe('specialized')
-    expect(coreGenerativeUiRendererRegistry.resolve({ ...topic, kind_version: 2 }, 'task', device).mode)
-      .toBe('fallback')
+    expect(runtime.renderers.resolve(legacyTopic, 'task', 'desktop').mode).toBe('specialized')
+  })
+
+  it('accepts Vue-reactive projection envelopes without cloning proxies', () => {
+    const runtime = buildProjectedGenerativeUiRegistry(reactive(topicProjection(true)))
+    expect(runtime.renderers.registrations.length).toBeGreaterThan(0)
   })
 })
+
+function topicProjection(enabled: boolean): HomerailPluginUiProjectionV1 {
+  const manifestDigest = 'a'.repeat(64)
+  return {
+    registry_revision: 2,
+    registry_fingerprint: 'b'.repeat(64),
+    kinds: [{
+      plugin_id: 'com.homerail.topic-outline',
+      plugin_version: '1.0.0',
+      manifest_digest: manifestDigest,
+      enabled,
+      schema_id: 'topic-outline-content-v1',
+      kind: 'com.homerail.topic-outline/outline',
+      kind_version: 1,
+      schema: { type: 'object' },
+      allowed_surfaces: ['task'],
+      max_payload_bytes: 32768,
+      fallback_required: true,
+      preferred_visuals: ['outline'],
+      action_ids: [],
+    }],
+    renderers: [{
+      plugin_id: 'com.homerail.topic-outline',
+      plugin_version: '1.0.0',
+      manifest_digest: manifestDigest,
+      enabled,
+      renderer_id: 'topic-outline-main',
+      kind: 'com.homerail.topic-outline/outline',
+      kind_version: 1,
+      renderer_api: 1,
+      mode: 'builtin',
+      surfaces: ['task'],
+      devices: ['phone', 'desktop', 'tv'],
+      source: { type: 'builtin', id: 'topic-outline' },
+      fallback: { type: 'portable' },
+    }],
+    actions: [],
+  }
+}
 
 function legacyWidget(): Record<string, unknown> {
   return {

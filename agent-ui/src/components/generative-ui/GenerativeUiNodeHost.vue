@@ -5,8 +5,14 @@ import type {
   GenerativeUiStoredNodeV1,
   GenerativeUiSurfaceContextV1,
 } from 'homerail-protocol'
-import { coreGenerativeUiRendererRegistry } from '@/generative-ui/core-renderer-registry'
-import { GenerativeUiRendererRegistry } from '@/generative-ui/renderer-registry'
+import {
+  emptyGenerativeUiActionRegistry,
+  GenerativeUiActionRegistry,
+} from '@/generative-ui/action-registry'
+import {
+  emptyGenerativeUiRendererRegistry,
+  GenerativeUiRendererRegistry,
+} from '@/generative-ui/renderer-registry'
 import type {
   GenerativeUiActionRequestV1,
   GenerativeUiPreviewRequestV1,
@@ -20,6 +26,7 @@ const props = withDefaults(defineProps<{
   placement: GenerativeUiCompositionItemV1
   context: GenerativeUiSurfaceContextV1
   registry?: GenerativeUiRendererRegistry
+  actionRegistry?: GenerativeUiActionRegistry
   interactive?: boolean
 }>(), {
   interactive: true,
@@ -31,7 +38,9 @@ const emit = defineEmits<{
   (event: 'renderer-error', payload: { node_id: string; message: string }): void
 }>()
 
-const registry = computed(() => props.registry ?? coreGenerativeUiRendererRegistry)
+const registry = computed(() => props.registry ?? emptyGenerativeUiRendererRegistry)
+const actionRegistry = computed(() => props.actionRegistry ?? emptyGenerativeUiActionRegistry)
+const availableActions = computed(() => actionRegistry.value.availableFor(props.node))
 const resolution = computed(() => registry.value.resolve(
   props.node,
   props.placement.surface,
@@ -98,9 +107,9 @@ function reportRendererError(payload: { message: string }): void {
       :reason="fallbackReason"
     />
 
-    <nav v-if="interactive !== false && node.actions?.length" class="generative-ui-node-host__actions" aria-label="Actions">
+    <nav v-if="interactive !== false && availableActions.length" class="generative-ui-node-host__actions" aria-label="Actions">
       <button
-        v-for="action in node.actions"
+        v-for="action in availableActions"
         :key="action.id"
         type="button"
         :data-style="action.style || 'secondary'"

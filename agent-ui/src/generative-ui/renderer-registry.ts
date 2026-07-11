@@ -9,6 +9,9 @@ export type GenerativeUiRendererMode = 'specialized' | 'core_projection'
 
 export interface GenerativeUiRendererRegistrationV1 {
   renderer_api_version: 1
+  plugin_id: string
+  plugin_version: string
+  renderer_id: string
   kind: string
   kind_version: number
   surface: GenerativeUiSurface
@@ -27,12 +30,14 @@ const SURFACES = new Set<GenerativeUiSurface>(['task', 'execution', 'result', 'a
 const DEVICES = new Set<GenerativeUiDevice>(['phone', 'desktop', 'tv'])
 
 function key(
+  pluginId: string,
+  pluginVersion: string,
   kind: string,
   kindVersion: number,
   surface: GenerativeUiSurface,
   device: GenerativeUiDevice,
 ): string {
-  return `${kind}\u0000${kindVersion}\u0000${surface}\u0000${device}`
+  return `${pluginId}\u0000${pluginVersion}\u0000${kind}\u0000${kindVersion}\u0000${surface}\u0000${device}`
 }
 
 function portableFallbackValid(node: GenerativeUiStoredNodeV1): boolean {
@@ -83,6 +88,8 @@ export class GenerativeUiRendererRegistry {
       }
       if (!registration.component) throw new Error(`Renderer component is required: ${registration.kind}`)
       const registrationKey = key(
+        registration.plugin_id,
+        registration.plugin_version,
         registration.kind,
         registration.kind_version,
         registration.surface,
@@ -111,7 +118,14 @@ export class GenerativeUiRendererRegistry {
     surface: GenerativeUiSurface,
     device: GenerativeUiDevice,
   ): GenerativeUiRendererResolutionV1 {
-    const registrationKey = key(node.kind, node.kind_version, surface, device)
+    const registrationKey = key(
+      node.owner.id,
+      node.owner.version,
+      node.kind,
+      node.kind_version,
+      surface,
+      device,
+    )
     const specialized = this.#specialized.get(registrationKey)
     if (specialized) return { mode: 'specialized', component: specialized.component, registration: specialized }
     const coreProjection = this.#coreProjections.get(registrationKey)
@@ -123,3 +137,5 @@ export class GenerativeUiRendererRegistry {
       : { mode: 'unavailable', reason: 'portable_fallback_invalid' }
   }
 }
+
+export const emptyGenerativeUiRendererRegistry = new GenerativeUiRendererRegistry([])

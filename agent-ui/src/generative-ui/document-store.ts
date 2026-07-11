@@ -2,6 +2,7 @@ import {
   validateGenerativeUiDocument,
   validateGenerativeUiTransaction,
   validateGenerativeUiUserOverride,
+  validateHomerailPluginUiProjection,
   type GenerativeUiCompositionV1,
   type GenerativeUiDocumentV1,
 } from 'homerail-protocol'
@@ -83,6 +84,8 @@ function assertProjection(projection: GenerativeUiProjectionV1): GenerativeUiPro
       throw new Error(`Invalid Generative UI projection override: ${override.node_id}`)
     }
   }
+  const uiRegistryValidation = validateHomerailPluginUiProjection(projection.ui_registry)
+  if (!uiRegistryValidation.valid) throw new Error('Invalid Generative UI plugin registry projection')
   assertComposition(projection.document, projection.composition)
   return structuredClone(projection)
 }
@@ -97,6 +100,7 @@ function projectionFromSnapshot(event: GenerativeUiSnapshotStreamEventV1): Gener
     cursor: event.cursor,
     overrides: event.overrides,
     composition: event.composition,
+    ui_registry: event.ui_registry,
   }
 }
 

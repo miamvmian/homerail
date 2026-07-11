@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
   getVoiceGenerativeUiProjection,
@@ -9,6 +9,7 @@ import {
 } from '@/api/agent'
 import { resolveGenerativeUiDeviceContext } from '@/generative-ui/device-context'
 import { GenerativeUiProjectionCache } from '@/generative-ui/document-store'
+import { buildProjectedGenerativeUiRegistry } from '@/generative-ui/projected-registry'
 import GenerativeUiSurfaceHost from './GenerativeUiSurfaceHost.vue'
 
 const props = defineProps<{
@@ -23,9 +24,12 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const cache = new GenerativeUiProjectionCache()
-const projection = ref<GenerativeUiProjectionV1 | null>(null)
+const projection = shallowRef<GenerativeUiProjectionV1 | null>(null)
 const loading = ref(false)
 const error = ref('')
+const runtimeRegistry = computed(() => (
+  projection.value ? buildProjectedGenerativeUiRegistry(projection.value.ui_registry) : null
+))
 let requestGeneration = 0
 
 function currentContext() {
@@ -49,7 +53,7 @@ async function refresh(): Promise<void> {
     projection.value = cache.current()
   } catch (cause) {
     if (generation !== requestGeneration) return
-    projection.value = null
+    projection.value = cache.current()
     error.value = cause && typeof cause === 'object' && 'message' in cause
       ? String((cause as { message: unknown }).message)
       : t('voice.generativeUi.previewUnavailable')
@@ -95,13 +99,15 @@ defineExpose({ acceptStreamEvent, refresh })
     <p v-if="loading && !projection" class="generative-ui-shadow-preview__state">
       {{ t('voice.generativeUi.loading') }}
     </p>
-    <p v-else-if="error" class="generative-ui-shadow-preview__state generative-ui-shadow-preview__state--error">
+    <p v-else-if="error && !projection" class="generative-ui-shadow-preview__state generative-ui-shadow-preview__state--error">
       {{ error }}
     </p>
     <GenerativeUiSurfaceHost
       v-else-if="projection"
       :document="projection.document"
       :composition="projection.composition"
+      :registry="runtimeRegistry?.renderers"
+      :action-registry="runtimeRegistry?.actions"
       :interactive="false"
       @open-preview="emit('open-preview', $event)"
     />

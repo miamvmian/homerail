@@ -17,13 +17,14 @@ type TopicSource = {
 }
 
 const props = defineProps<{
-  widget: VoiceWidget
+  widget?: VoiceWidget
+  content?: Record<string, unknown>
 }>()
 
 const { t } = useI18n()
 
-const data = computed(() => props.widget.data ?? {})
-const brief = computed(() => text(data.value.brief || props.widget.body, 220))
+const data = computed(() => props.content ?? props.widget?.data ?? {})
+const brief = computed(() => text(data.value.brief || props.widget?.body, 220))
 const audience = computed(() => text(data.value.audience, 60))
 const angle = computed(() => text(data.value.angle, 90))
 const thesis = computed(() => text(data.value.thesis, 140))

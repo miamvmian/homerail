@@ -6,9 +6,15 @@ import type {
   GenerativeUiPlacement,
   GenerativeUiSurface,
 } from 'homerail-protocol'
-import { coreGenerativeUiRendererRegistry } from '@/generative-ui/core-renderer-registry'
+import {
+  emptyGenerativeUiActionRegistry,
+  GenerativeUiActionRegistry,
+} from '@/generative-ui/action-registry'
 import { resolveGenerativeUiFocusIndex, type GenerativeUiFocusDirection } from '@/generative-ui/focus-navigation'
-import { GenerativeUiRendererRegistry } from '@/generative-ui/renderer-registry'
+import {
+  emptyGenerativeUiRendererRegistry,
+  GenerativeUiRendererRegistry,
+} from '@/generative-ui/renderer-registry'
 import type {
   GenerativeUiActionRequestV1,
   GenerativeUiPreviewRequestV1,
@@ -19,6 +25,7 @@ const props = withDefaults(defineProps<{
   document: GenerativeUiDocumentV1
   composition: GenerativeUiCompositionV1
   registry?: GenerativeUiRendererRegistry
+  actionRegistry?: GenerativeUiActionRegistry
   surface?: GenerativeUiSurface
   placement?: GenerativeUiPlacement | 'all'
   interactive?: boolean
@@ -36,7 +43,8 @@ const emit = defineEmits<{
 }>()
 
 const root = ref<HTMLElement | null>(null)
-const registry = computed(() => props.registry ?? coreGenerativeUiRendererRegistry)
+const registry = computed(() => props.registry ?? emptyGenerativeUiRendererRegistry)
+const actionRegistry = computed(() => props.actionRegistry ?? emptyGenerativeUiActionRegistry)
 const nodesById = computed(() => new Map(props.document.nodes.map(node => [node.id, node])))
 const rendered = computed(() => props.composition.items
   .filter(item => !props.surface || item.surface === props.surface)
@@ -97,6 +105,7 @@ defineExpose({ focus, focusNode })
       :placement="entry.item"
       :context="composition.context"
       :registry="registry"
+      :action-registry="actionRegistry"
       :interactive="interactive"
       @action="emit('action', $event)"
       @open-preview="emit('open-preview', $event)"

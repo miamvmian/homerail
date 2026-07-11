@@ -77,6 +77,13 @@ function projection(): GenerativeUiProjectionV1 {
     cursor: 1,
     overrides: [],
     composition: composition(),
+    ui_registry: {
+      registry_revision: 1,
+      registry_fingerprint: '0'.repeat(64),
+      kinds: [],
+      renderers: [],
+      actions: [],
+    },
   }
 }
 
@@ -122,9 +129,22 @@ describe('GenerativeUiProjectionCache', () => {
     cache.acceptProjection(projection())
     const first = cache.current()!
     first.document.nodes[0].fallback.title = 'mutated'
+    first.ui_registry.registry_fingerprint = 'f'.repeat(64)
     expect(cache.current()?.document.nodes[0].fallback.title).toBe('Fallback note')
+    expect(cache.current()?.ui_registry.registry_fingerprint).toBe('0'.repeat(64))
     expect(cache.cursor).toBe(1)
     expect(cache.stale).toBe(false)
+  })
+
+  it('accepts a registry-only revision without requiring a document revision', () => {
+    const cache = new GenerativeUiProjectionCache()
+    cache.acceptProjection(projection())
+    const updated = projection()
+    updated.ui_registry.registry_revision = 2
+    updated.ui_registry.registry_fingerprint = '1'.repeat(64)
+    cache.acceptProjection(updated)
+    expect(cache.current()?.document.revision).toBe(1)
+    expect(cache.current()?.ui_registry.registry_revision).toBe(2)
   })
 
   it('accepts snapshot stream events and ignores ledger rows already covered by the snapshot cursor', () => {
@@ -140,6 +160,7 @@ describe('GenerativeUiProjectionCache', () => {
       cursor: current.cursor,
       overrides: current.overrides,
       composition: current.composition,
+      ui_registry: current.ui_registry,
     }
     expect(cache.acceptStreamEvent(snapshot)).toBe('applied_snapshot')
     expect(cache.acceptStreamEvent(transactionEvent(1, 0))).toBe('ignored_replay')
@@ -163,6 +184,10 @@ describe('GenerativeUiProjectionCache', () => {
     const invalidContext = projection()
     invalidContext.composition.context.device = 'watch' as never
     expect(() => cache.acceptProjection(invalidContext)).toThrow('composition context')
+
+    const invalidRegistry = projection()
+    invalidRegistry.ui_registry.registry_fingerprint = 'not-a-digest'
+    expect(() => cache.acceptProjection(invalidRegistry)).toThrow('plugin registry projection')
 
     cache.acceptProjection(projection())
     const invalidEvent = transactionEvent(2, 1)

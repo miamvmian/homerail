@@ -7,9 +7,11 @@ import type {
   GenerativeUiStoredNodeV1,
 } from 'homerail-protocol'
 import { i18n } from '@/plugins/i18n'
+import { GenerativeUiActionRegistry } from '@/generative-ui/action-registry'
 import { GenerativeUiRendererRegistry } from '@/generative-ui/renderer-registry'
 import GenerativeUiNodeHost from './GenerativeUiNodeHost.vue'
 import GenerativeUiSurfaceHost from './GenerativeUiSurfaceHost.vue'
+import TopicOutlineRenderer from '@/plugins/builtin/topic-outline/TopicOutlineRenderer.vue'
 
 const ExactRenderer = defineComponent({
   name: 'ExactRenderer',
@@ -66,12 +68,26 @@ const context = {
 function registry(component = ExactRenderer): GenerativeUiRendererRegistry {
   return new GenerativeUiRendererRegistry([{
     renderer_api_version: 1,
+    plugin_id: 'com.example.plugin',
+    plugin_version: '1.0.0',
+    renderer_id: 'card-main',
     kind: 'com.example.plugin/card',
     kind_version: 1,
     surface: 'task',
     device: 'desktop',
     mode: 'specialized',
     component,
+  }])
+}
+
+function actionRegistry(): GenerativeUiActionRegistry {
+  return new GenerativeUiActionRegistry([{
+    plugin_id: 'com.example.plugin',
+    plugin_version: '1.0.0',
+    local_id: 'approve',
+    qualified_id: 'com.example.plugin:approve',
+    capability_ids: [],
+    intent: 'com.example.plugin.approve',
   }])
 }
 
@@ -146,6 +162,7 @@ describe('GenerativeUiNodeHost', () => {
       placement: placement(),
       context,
       registry: registry(),
+      actionRegistry: actionRegistry(),
       onAction,
     })
     mounted.querySelector<HTMLButtonElement>('button')!.click()
@@ -166,9 +183,41 @@ describe('GenerativeUiNodeHost', () => {
       placement: placement(),
       context,
       registry: registry(),
+      actionRegistry: actionRegistry(),
       interactive: false,
     })
     expect(mounted.querySelector('.generative-ui-node-host__actions')).toBeNull()
+  })
+
+  it('suppresses Actions that are absent from the enabled Manager projection', () => {
+    const mounted = mount(GenerativeUiNodeHost, {
+      documentId: 'document-one',
+      node: node('node-one', {
+        actions: [{ id: 'approve', label: 'Approve', intent: 'com.example.plugin.approve' }],
+      }),
+      placement: placement(),
+      context,
+      registry: registry(),
+      actionRegistry: new GenerativeUiActionRegistry([]),
+    })
+    expect(mounted.querySelector('.generative-ui-node-host__actions')).toBeNull()
+  })
+
+  it('renders canonical topic content without a legacy_widget envelope', () => {
+    const mounted = mount(TopicOutlineRenderer, {
+      node: node('topic-one', {
+        kind: 'com.homerail.topic-outline/outline',
+        owner: { id: 'com.homerail.topic-outline', version: '1.0.0' },
+        content: {
+          title: 'Plugin pipeline',
+          brief: 'Design a repeatable plugin development path.',
+          outline: [{ title: 'Manifest', status: 'ready', points: ['Declare the scene'] }],
+        },
+      }),
+    })
+    expect(mounted.textContent).toContain('Design a repeatable plugin development path.')
+    expect(mounted.textContent).toContain('Manifest')
+    expect(mounted.textContent).toContain('Declare the scene')
   })
 })
 
