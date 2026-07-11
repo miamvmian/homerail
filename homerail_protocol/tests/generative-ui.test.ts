@@ -111,6 +111,23 @@ describe("Generative UI semantic protocol", () => {
       javascript: "alert(1)",
     }];
     expect(validateGenerativeUiNode(unsafe).valid).toBe(false);
+
+    const unsafeArtifact = structuredClone(taskNode());
+    unsafeArtifact.fallback.artifact_refs = [{
+      label: "unsafe",
+      uri: "javascript:alert(document.domain)",
+    }];
+    expect(validateGenerativeUiNode(unsafeArtifact).valid).toBe(false);
+    unsafeArtifact.fallback.artifact_refs = [{ label: "unsafe", uri: "file:///etc/passwd" }];
+    expect(validateGenerativeUiNode(unsafeArtifact).valid).toBe(false);
+    unsafeArtifact.fallback.artifact_refs = [{ label: "unsafe", uri: " //evil.example/x" }];
+    expect(validateGenerativeUiNode(unsafeArtifact).valid).toBe(false);
+    unsafeArtifact.fallback.artifact_refs = [{ label: "unsafe", uri: "\\\\evil.example\\share" }];
+    expect(validateGenerativeUiNode(unsafeArtifact).valid).toBe(false);
+    unsafeArtifact.fallback.artifact_refs = [{ label: "safe", uri: "artifact:artifact-1" }];
+    expect(validateGenerativeUiNode(unsafeArtifact).valid).toBe(true);
+    unsafeArtifact.fallback.artifact_refs = [{ label: "safe", uri: "/safe/report 1.html" }];
+    expect(validateGenerativeUiNode(unsafeArtifact).valid).toBe(true);
   });
 
   it("enforces plugin kind ownership and unique symbolic action ids", () => {
@@ -138,6 +155,22 @@ describe("Generative UI semantic protocol", () => {
       operations: [{ op: "put", node: taskNode() }],
     });
     expect(validateGenerativeUiTransaction(invalidTime).errors[0]?.keyword).toBe("date-time");
+
+    for (const createdAt of [
+      "2026-02-30T00:00:00Z",
+      "2025-02-29T00:00:00Z",
+      "2026-01-01T24:00:00Z",
+      "2026-01-01T00:00:00+24:00",
+    ]) {
+      expect(validateGenerativeUiTransaction(transaction({
+        created_at: createdAt,
+        operations: [{ op: "put", node: taskNode() }],
+      })).errors[0]?.keyword).toBe("date-time");
+    }
+    expect(validateGenerativeUiTransaction(transaction({
+      created_at: "2024-02-29T23:59:59.123+08:00",
+      operations: [{ op: "put", node: taskNode() }],
+    })).valid).toBe(true);
   });
 
   it("applies put, patch, and remove as revisioned atomic operations", () => {
@@ -241,6 +274,17 @@ describe("Generative UI semantic protocol", () => {
     expect(second.status).toBe("duplicate");
     expect(second.revision).toBe(1);
     expect(second.document).toBe(first.document);
+
+    const replayAfterDisable = applyGenerativeUiTransaction(
+      first.document,
+      put,
+      reducerContext({
+        transaction_already_applied: true,
+        validate_kind: () => [{ path: "/", message: "kind disabled", keyword: "kindRegistry" }],
+      }),
+    );
+    expect(replayAfterDisable.status).toBe("duplicate");
+    expect(replayAfterDisable.document).toBe(first.document);
   });
 
   it("prevents patch operations from changing semantic identity", () => {
@@ -252,6 +296,28 @@ describe("Generative UI semantic protocol", () => {
       }],
     } as unknown as Pick<GenerativeUiTransactionV1, "operations">);
     expect(validateGenerativeUiTransaction(invalid).valid).toBe(false);
+  });
+
+  it("applies node semantic validation to patch fields before reduction", () => {
+    const unsafePatch = transaction({
+      operations: [{
+        op: "patch",
+        node_id: "current-task",
+        changes: {
+          fallback: {
+            title: "Unsafe credentialed URL",
+            artifact_refs: [{
+              label: "unsafe",
+              uri: "https://user:pass@example.com/report",
+            }],
+          },
+        },
+      }],
+    });
+    expect(validateGenerativeUiTransaction(unsafePatch)).toMatchObject({
+      valid: false,
+      errors: [{ keyword: "artifactUri" }],
+    });
   });
 
   it("rejects documents with duplicate node ids before reducing", () => {
@@ -312,6 +378,23 @@ describe("Generative UI semantic protocol", () => {
     expect(rejected.status).toBe("rejected");
     expect(rejected.errors?.[0]).toMatchObject({ keyword: "kindSchema" });
     expect(rejected.document.nodes).toEqual([]);
+  });
+
+  it("isolates canonical state from mutating kind validators", () => {
+    const initial = document();
+    const put = transaction({ operations: [{ op: "put", node: taskNode() }] });
+    const result = applyGenerativeUiTransaction(initial, put, reducerContext({
+      validate_kind: (candidate) => {
+        candidate.content.objective = "mutated by validator";
+        candidate.fallback.title = "mutated by validator";
+        return [];
+      },
+    }));
+
+    expect(result.status).toBe("applied");
+    expect(result.document.nodes[0].content.objective).toBe("Design the generated UI foundation");
+    expect(result.document.nodes[0].fallback.title).toBe("Generated UI foundation");
+    expect(initial.nodes).toEqual([]);
   });
 
   it("rejects reducers without an explicit kind-registry policy", () => {

@@ -116,6 +116,7 @@ export interface GenerativeUiLifecycleV1 {
 
 export interface GenerativeUiArtifactRefV1 {
   label: string;
+  /** Passive reference only. Executable/data URI schemes are forbidden. */
   uri: string;
   media_type?: string;
 }

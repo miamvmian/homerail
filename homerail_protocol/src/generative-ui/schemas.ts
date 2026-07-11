@@ -96,7 +96,12 @@ const artifactRefSchema = {
   type: "object",
   properties: {
     label: { type: "string", minLength: 1, maxLength: 200 },
-    uri: { type: "string", minLength: 1, maxLength: 2048 },
+    uri: {
+      type: "string",
+      minLength: 1,
+      maxLength: 2048,
+      pattern: "^(?![\\s])(?![\\\\/]{2})(?!\\\\)(?!.*[\\s]$)(?:[Hh][Tt][Tt][Pp][Ss]?://[^\\s\\\\\\u0000-\\u001F\\u007F]+|[Aa][Rr][Tt][Ii][Ff][Aa][Cc][Tt]:[A-Za-z0-9][A-Za-z0-9._~/%-]*|[A-Za-z]:[\\\\/](?![\\\\/])[^\\u0000-\\u001F\\u007F]*|[^:\\u0000-\\u001F\\u007F]+)$",
+    },
     media_type: { type: "string", minLength: 1, maxLength: 160 },
   },
   required: ["label", "uri"],

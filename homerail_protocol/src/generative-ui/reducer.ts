@@ -65,7 +65,9 @@ function kindErrors(
   path: string,
 ): GenerativeUiValidationError[] {
   try {
-    return prefixErrors(path, context.validate_kind(node));
+    // Registry callbacks are policy extensions, not owners of reducer state.
+    // Always isolate them from both the canonical input and candidate output.
+    return prefixErrors(path, context.validate_kind(structuredClone(node)));
   } catch (cause) {
     return [error(
       path,
@@ -128,11 +130,6 @@ export function applyGenerativeUiTransaction(
   const duplicateErrors = duplicateNodeIdErrors(document);
   if (duplicateErrors.length) return result("rejected", document, duplicateErrors);
 
-  const existingKindErrors = document.nodes.flatMap((node, index) =>
-    kindErrors(context, node, `/document/nodes/${index}/content`)
-  );
-  if (existingKindErrors.length) return result("rejected", document, existingKindErrors);
-
   const transactionValidation = validateGenerativeUiTransaction(transaction);
   if (!transactionValidation.valid) {
     return result("rejected", document, prefixErrors("/transaction", transactionValidation.errors));
@@ -151,6 +148,14 @@ export function applyGenerativeUiTransaction(
   if (context.transaction_already_applied) {
     return result("duplicate", document);
   }
+
+  // Exact replays are resolved above by the idempotency authority. Only new
+  // transactions are subject to the registry's current enablement policy;
+  // disabling a plugin must not rewrite an already-applied result.
+  const existingKindErrors = document.nodes.flatMap((node, index) =>
+    kindErrors(context, node, `/document/nodes/${index}/content`)
+  );
+  if (existingKindErrors.length) return result("rejected", document, existingKindErrors);
 
   if (transaction.base_revision !== document.revision) {
     return result("conflict", document, [

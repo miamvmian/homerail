@@ -7,3 +7,6 @@ export * from "./types.js";
 export * from "./schemas.js";
 export * from "./validation.js";
 export * from "./reducer.js";
+export * from "./shadow-comparator.js";
+export * from "./json-value.js";
+export * from "./artifact-uri.js";

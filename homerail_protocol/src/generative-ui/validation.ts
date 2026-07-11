@@ -6,6 +6,17 @@
 import AjvModule from "ajv";
 import type { ErrorObject, ValidateFunction } from "ajv";
 import { generativeUiSchemas } from "./schemas.js";
+import { isSafeGenerativeUiArtifactUri } from "./artifact-uri.js";
+import {
+  GENERATIVE_UI_MAX_ACTION_ARGUMENT_BYTES,
+  GENERATIVE_UI_MAX_DOCUMENT_BYTES,
+  GENERATIVE_UI_MAX_MISC_ENVELOPE_BYTES,
+  GENERATIVE_UI_MAX_NODE_CONTENT_BYTES,
+  GENERATIVE_UI_MAX_NODE_ENVELOPE_BYTES,
+  GENERATIVE_UI_MAX_TRANSACTION_BYTES,
+  analyzeGenerativeUiJsonValue,
+  type GenerativeUiJsonValueLimits,
+} from "./json-value.js";
 import type {
   GenerativeUiDocumentV1,
   GenerativeUiInteractionEventV1,
@@ -20,9 +31,6 @@ import type {
 // constructor without changing validation semantics.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const AjvClass = (AjvModule as any).default || AjvModule;
-
-const MAX_NODE_CONTENT_BYTES = 128 * 1024;
-const MAX_ACTION_ARGUMENT_BYTES = 32 * 1024;
 
 export interface GenerativeUiValidationResult<T> {
   valid: boolean;
@@ -55,6 +63,24 @@ function createGenerativeUiValidator() {
 let validator: any;
 
 function validate<T>(schemaName: string, value: unknown): GenerativeUiValidationResult<T> {
+  const json = analyzeGenerativeUiJsonValue(value, {
+    limits: jsonLimitsForSchema(schemaName),
+  });
+  if (!json.valid) {
+    return { valid: false, errors: [json.error ?? { path: "", message: "invalid JSON value", keyword: "jsonValue" }] };
+  }
+  let stableValue: unknown;
+  try {
+    // Semantic validation must not re-read a hostile or late-changing object
+    // after the JSON preflight. A wire-compatible snapshot also rejects Proxy
+    // values, which structured clone cannot serialize.
+    stableValue = structuredClone(value);
+  } catch {
+    return {
+      valid: false,
+      errors: [{ path: "", message: "JSON value could not be snapshotted safely", keyword: "jsonSnapshot" }],
+    };
+  }
   validator ??= createGenerativeUiValidator();
   const validateFn: ValidateFunction | undefined = validator.getSchema(schemaName);
   if (!validateFn) {
@@ -63,10 +89,23 @@ function validate<T>(schemaName: string, value: unknown): GenerativeUiValidation
       errors: [{ path: "", message: `Schema not found: ${schemaName}`, keyword: "unknown" }],
     };
   }
-  if (!validateFn(value)) {
-    return { valid: false, errors: normalizeErrors(validateFn.errors) };
+  try {
+    if (!validateFn(stableValue)) {
+      return { valid: false, errors: normalizeErrors(validateFn.errors) };
+    }
+  } catch {
+    return { valid: false, errors: [{ path: "", message: "schema validation failed safely", keyword: "schemaValidation" }] };
   }
-  return { valid: true, value: value as T, errors: [] };
+  return { valid: true, value: stableValue as T, errors: [] };
+}
+
+function jsonLimitsForSchema(schemaName: string): Partial<GenerativeUiJsonValueLimits> {
+  if (schemaName === "generative-ui-document") return { max_bytes: GENERATIVE_UI_MAX_DOCUMENT_BYTES };
+  if (schemaName === "generative-ui-transaction") return { max_bytes: GENERATIVE_UI_MAX_TRANSACTION_BYTES };
+  if (schemaName === "generative-ui-node" || schemaName === "generative-ui-stored-node") {
+    return { max_bytes: GENERATIVE_UI_MAX_NODE_ENVELOPE_BYTES };
+  }
+  return { max_bytes: GENERATIVE_UI_MAX_MISC_ENVELOPE_BYTES };
 }
 
 function withSemanticErrors<T>(
@@ -75,6 +114,72 @@ function withSemanticErrors<T>(
 ): GenerativeUiValidationResult<T> {
   if (!validation.valid || !errors.length) return validation;
   return { valid: false, errors };
+}
+
+function contentSemanticErrors(
+  content: Record<string, unknown>,
+  path: string,
+): GenerativeUiValidationError[] {
+  const analysis = analyzeGenerativeUiJsonValue(content, {
+    path,
+    limits: { max_bytes: GENERATIVE_UI_MAX_NODE_CONTENT_BYTES },
+  });
+  return analysis.valid
+    ? []
+    : [{
+        path: analysis.error?.path || path,
+        message: analysis.error?.message || `content exceeds ${GENERATIVE_UI_MAX_NODE_CONTENT_BYTES} bytes`,
+        keyword: analysis.error?.keyword || "maxPayloadBytes",
+      }];
+}
+
+function fallbackSemanticErrors(
+  fallback: GenerativeUiNodeV1["fallback"],
+  path: string,
+): GenerativeUiValidationError[] {
+  const errors: GenerativeUiValidationError[] = [];
+  fallback.artifact_refs?.forEach((artifact, index) => {
+    if (!isSafeGenerativeUiArtifactUri(artifact.uri)) {
+      errors.push({
+        path: `${path}/artifact_refs/${index}/uri`,
+        message: "must be a passive http(s), artifact, drive, or local path reference",
+        keyword: "artifactUri",
+      });
+    }
+  });
+  return errors;
+}
+
+function actionSemanticErrors(
+  actions: GenerativeUiNodeV1["actions"],
+  path: string,
+): GenerativeUiValidationError[] {
+  const errors: GenerativeUiValidationError[] = [];
+  const actionIds = new Set<string>();
+  actions?.forEach((action, index) => {
+    if (actionIds.has(action.id)) {
+      errors.push({
+        path: `${path}/${index}/id`,
+        message: `duplicate action id: ${action.id}`,
+        keyword: "uniqueActionId",
+      });
+    }
+    const argumentsAnalysis = action.arguments
+      ? analyzeGenerativeUiJsonValue(action.arguments, {
+          path: `${path}/${index}/arguments`,
+          limits: { max_bytes: GENERATIVE_UI_MAX_ACTION_ARGUMENT_BYTES },
+        })
+      : null;
+    if (argumentsAnalysis && !argumentsAnalysis.valid) {
+      errors.push({
+        path: argumentsAnalysis.error?.path || `${path}/${index}/arguments`,
+        message: argumentsAnalysis.error?.message || `arguments exceed ${GENERATIVE_UI_MAX_ACTION_ARGUMENT_BYTES} bytes`,
+        keyword: argumentsAnalysis.error?.keyword || "maxPayloadBytes",
+      });
+    }
+    actionIds.add(action.id);
+  });
+  return errors;
 }
 
 function nodeSemanticErrors(
@@ -89,51 +194,40 @@ function nodeSemanticErrors(
       keyword: "ownerNamespace",
     });
   }
-  if (jsonByteLength(node.content) > MAX_NODE_CONTENT_BYTES) {
-    errors.push({
-      path: `${path}/content`,
-      message: `content exceeds ${MAX_NODE_CONTENT_BYTES} bytes`,
-      keyword: "maxPayloadBytes",
-    });
-  }
-  if (node.lifecycle?.expires_at && !isValidTimestamp(node.lifecycle.expires_at)) {
+  errors.push(...contentSemanticErrors(node.content, `${path}/content`));
+  errors.push(...fallbackSemanticErrors(node.fallback, `${path}/fallback`));
+  if (node.lifecycle?.expires_at && !isValidGenerativeUiTimestamp(node.lifecycle.expires_at)) {
     errors.push({
       path: `${path}/lifecycle/expires_at`,
       message: "must be a valid RFC 3339 timestamp",
       keyword: "date-time",
     });
   }
-  const actionIds = new Set<string>();
-  node.actions?.forEach((action, index) => {
-    if (actionIds.has(action.id)) {
-      errors.push({
-        path: `${path}/actions/${index}/id`,
-        message: `duplicate action id: ${action.id}`,
-        keyword: "uniqueActionId",
-      });
-    }
-    if (action.arguments && jsonByteLength(action.arguments) > MAX_ACTION_ARGUMENT_BYTES) {
-      errors.push({
-        path: `${path}/actions/${index}/arguments`,
-        message: `arguments exceed ${MAX_ACTION_ARGUMENT_BYTES} bytes`,
-        keyword: "maxPayloadBytes",
-      });
-    }
-    actionIds.add(action.id);
-  });
+  errors.push(...actionSemanticErrors(node.actions, `${path}/actions`));
   return errors;
 }
 
-function jsonByteLength(value: unknown): number {
-  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
-}
-
-function isValidTimestamp(value: string): boolean {
-  return !Number.isNaN(Date.parse(value));
+export function isValidGenerativeUiTimestamp(value: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/.exec(value);
+  if (!match) return false;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, offsetHourText, offsetMinuteText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const offsetHour = offsetHourText === undefined ? 0 : Number(offsetHourText);
+  const offsetMinute = offsetMinuteText === undefined ? 0 : Number(offsetMinuteText);
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
+  if (offsetHour > 23 || offsetMinute > 59) return false;
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day >= 1 && day <= daysInMonth[month - 1];
 }
 
 function timestampError(path: string, value: string): GenerativeUiValidationError[] {
-  return isValidTimestamp(value)
+  return isValidGenerativeUiTimestamp(value)
     ? []
     : [{ path, message: "must be a valid RFC 3339 timestamp", keyword: "date-time" }];
 }
@@ -202,11 +296,31 @@ export function validateGenerativeUiTransaction(
     if (operation.op === "put") {
       errors.push(...nodeSemanticErrors(operation.node, `/operations/${index}/node`));
     }
-    if (operation.op === "patch" && operation.changes.unset) {
-      for (const field of operation.changes.unset) {
+    if (operation.op === "patch") {
+      const changesPath = `/operations/${index}/changes`;
+      if (operation.changes.content) {
+        errors.push(...contentSemanticErrors(operation.changes.content, `${changesPath}/content`));
+      }
+      if (operation.changes.fallback) {
+        errors.push(...fallbackSemanticErrors(operation.changes.fallback, `${changesPath}/fallback`));
+      }
+      if (operation.changes.actions) {
+        errors.push(...actionSemanticErrors(operation.changes.actions, `${changesPath}/actions`));
+      }
+      if (
+        operation.changes.lifecycle?.expires_at
+        && !isValidGenerativeUiTimestamp(operation.changes.lifecycle.expires_at)
+      ) {
+        errors.push({
+          path: `${changesPath}/lifecycle/expires_at`,
+          message: "must be a valid RFC 3339 timestamp",
+          keyword: "date-time",
+        });
+      }
+      for (const field of operation.changes.unset ?? []) {
         if (Object.prototype.hasOwnProperty.call(operation.changes, field)) {
           errors.push({
-            path: `/operations/${index}/changes/unset`,
+            path: `${changesPath}/unset`,
             message: `cannot both set and unset ${field}`,
             keyword: "patchConflict",
           });
