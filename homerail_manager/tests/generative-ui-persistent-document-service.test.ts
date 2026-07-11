@@ -187,7 +187,7 @@ describe("PersistentGenerativeUiDocumentService", () => {
     legacy.close();
 
     expect(getDb().prepare("SELECT version FROM schema_migrations ORDER BY version").all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
     expect(getDb().prepare("SELECT data FROM voice_agent_sessions WHERE session_id = ?").get("legacy-v2"))
       .toEqual({ data: legacyPayload });
     expect(getDb().prepare(`
@@ -200,6 +200,8 @@ describe("PersistentGenerativeUiDocumentService", () => {
     ]);
     closeDb();
     expect(getDb().prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 3").get())
+      .toEqual({ count: 1 });
+    expect(getDb().prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 4").get())
       .toEqual({ count: 1 });
   });
 
@@ -216,6 +218,14 @@ describe("PersistentGenerativeUiDocumentService", () => {
 
     expect(() => getDb()).toThrow(
       "Schema migration 3 is incomplete: missing table generative_ui_documents",
+    );
+  });
+
+  it("fails closed when the v4 override table disappears after migration", () => {
+    getDb().exec("DROP TABLE generative_ui_user_overrides");
+    closeDb();
+    expect(() => getDb()).toThrow(
+      "Schema migration 4 is incomplete: missing table generative_ui_user_overrides",
     );
   });
 });

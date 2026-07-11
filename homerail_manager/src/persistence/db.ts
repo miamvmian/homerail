@@ -49,6 +49,7 @@ const CLEARABLE_TABLES = new Set([
   "manager_agent_config",
   "voice_agent_config",
   "voice_agent_sessions",
+  "generative_ui_user_overrides",
   "generative_ui_transactions",
   "generative_ui_documents",
   "experience_nodes",
@@ -450,48 +451,102 @@ function validateGenerativeUiSchemaV3(db: SqliteDatabase): void {
   }
 }
 
-const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [{
-  version: 3,
-  up: (db) => db.exec(`
-    CREATE TABLE generative_ui_documents (
-      document_id TEXT PRIMARY KEY,
-      purpose TEXT NOT NULL CHECK(purpose IN ('canonical', 'legacy_widget_shadow')),
-      scope_type TEXT NOT NULL CHECK(scope_type IN ('voice_session', 'project', 'run')),
-      scope_id TEXT NOT NULL,
-      ir_version INTEGER NOT NULL CHECK(ir_version = 1),
-      revision INTEGER NOT NULL CHECK(revision >= 0),
-      snapshot_json TEXT NOT NULL,
-      snapshot_hash TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      deleted_at TEXT
-    );
-    CREATE INDEX idx_generative_ui_documents_scope
-      ON generative_ui_documents(scope_type, scope_id, deleted_at, updated_at);
-    CREATE UNIQUE INDEX idx_generative_ui_documents_active_scope
-      ON generative_ui_documents(scope_type, scope_id, purpose)
-      WHERE deleted_at IS NULL;
+function validateGenerativeUiSchemaV4(db: SqliteDatabase): void {
+  const table = "generative_ui_user_overrides";
+  const tableRow = db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+  ).get(table);
+  if (!tableRow) throw new Error(`Schema migration 4 is incomplete: missing table ${table}`);
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string; pk: number }>;
+  const byName = new Map(columns.map((column) => [column.name, column]));
+  const required = ["document_id", "node_id", "visibility", "pinned", "preferred_surface", "updated_at"];
+  const missing = required.filter((column) => !byName.has(column));
+  if (missing.length) {
+    throw new Error(`Schema migration 4 is incomplete: ${table} is missing columns ${missing.join(", ")}`);
+  }
+  if (byName.get("document_id")?.pk !== 1 || byName.get("node_id")?.pk !== 2) {
+    throw new Error("Schema migration 4 is incomplete: Generative UI override identity constraint is missing");
+  }
+  const foreignKeys = db.prepare(`PRAGMA foreign_key_list(${table})`).all() as Array<{
+    table: string;
+    from: string;
+    to: string;
+    on_delete: string;
+  }>;
+  const documentForeignKey = foreignKeys.find((foreignKey) => (
+    foreignKey.table === "generative_ui_documents"
+    && foreignKey.from === "document_id"
+    && foreignKey.to === "document_id"
+    && foreignKey.on_delete.toUpperCase() === "RESTRICT"
+  ));
+  if (!documentForeignKey) {
+    throw new Error("Schema migration 4 is incomplete: Generative UI override ownership constraint is missing");
+  }
+}
 
-    CREATE TABLE generative_ui_transactions (
-      seq INTEGER PRIMARY KEY AUTOINCREMENT,
-      document_id TEXT NOT NULL,
-      transaction_id TEXT NOT NULL,
-      fingerprint TEXT NOT NULL,
-      base_revision INTEGER NOT NULL CHECK(base_revision >= 0),
-      committed_revision INTEGER NOT NULL CHECK(committed_revision >= 1),
-      transaction_json TEXT NOT NULL,
-      producer_created_at TEXT NOT NULL,
-      committed_at TEXT NOT NULL,
-      CHECK(committed_revision = base_revision + 1),
-      UNIQUE(document_id, transaction_id),
-      UNIQUE(document_id, committed_revision),
-      FOREIGN KEY(document_id) REFERENCES generative_ui_documents(document_id) ON DELETE RESTRICT
-    );
-    CREATE INDEX idx_generative_ui_transactions_document_seq
-      ON generative_ui_transactions(document_id, seq);
-  `),
-  validate: validateGenerativeUiSchemaV3,
-}];
+const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
+  {
+    version: 3,
+    up: (db) => db.exec(`
+      CREATE TABLE generative_ui_documents (
+        document_id TEXT PRIMARY KEY,
+        purpose TEXT NOT NULL CHECK(purpose IN ('canonical', 'legacy_widget_shadow')),
+        scope_type TEXT NOT NULL CHECK(scope_type IN ('voice_session', 'project', 'run')),
+        scope_id TEXT NOT NULL,
+        ir_version INTEGER NOT NULL CHECK(ir_version = 1),
+        revision INTEGER NOT NULL CHECK(revision >= 0),
+        snapshot_json TEXT NOT NULL,
+        snapshot_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        deleted_at TEXT
+      );
+      CREATE INDEX idx_generative_ui_documents_scope
+        ON generative_ui_documents(scope_type, scope_id, deleted_at, updated_at);
+      CREATE UNIQUE INDEX idx_generative_ui_documents_active_scope
+        ON generative_ui_documents(scope_type, scope_id, purpose)
+        WHERE deleted_at IS NULL;
+
+      CREATE TABLE generative_ui_transactions (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id TEXT NOT NULL,
+        transaction_id TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        base_revision INTEGER NOT NULL CHECK(base_revision >= 0),
+        committed_revision INTEGER NOT NULL CHECK(committed_revision >= 1),
+        transaction_json TEXT NOT NULL,
+        producer_created_at TEXT NOT NULL,
+        committed_at TEXT NOT NULL,
+        CHECK(committed_revision = base_revision + 1),
+        UNIQUE(document_id, transaction_id),
+        UNIQUE(document_id, committed_revision),
+        FOREIGN KEY(document_id) REFERENCES generative_ui_documents(document_id) ON DELETE RESTRICT
+      );
+      CREATE INDEX idx_generative_ui_transactions_document_seq
+        ON generative_ui_transactions(document_id, seq);
+    `),
+    validate: validateGenerativeUiSchemaV3,
+  },
+  {
+    version: 4,
+    up: (db) => db.exec(`
+      CREATE TABLE generative_ui_user_overrides (
+        document_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        visibility TEXT CHECK(visibility IN ('visible', 'minimized', 'hidden')),
+        pinned INTEGER CHECK(pinned IN (0, 1)),
+        preferred_surface TEXT CHECK(preferred_surface IN ('task', 'execution', 'result', 'ambient')),
+        updated_at TEXT NOT NULL,
+        CHECK(visibility IS NOT NULL OR pinned IS NOT NULL OR preferred_surface IS NOT NULL),
+        PRIMARY KEY(document_id, node_id),
+        FOREIGN KEY(document_id) REFERENCES generative_ui_documents(document_id) ON DELETE RESTRICT
+      );
+      CREATE INDEX idx_generative_ui_user_overrides_document
+        ON generative_ui_user_overrides(document_id, node_id);
+    `),
+    validate: validateGenerativeUiSchemaV4,
+  },
+];
 
 function initializeSchema(db: SqliteDatabase, filePath: string): void {
   db.pragma("journal_mode = WAL");

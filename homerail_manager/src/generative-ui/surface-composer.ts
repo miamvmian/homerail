@@ -73,6 +73,22 @@ function assertSurfaceContext(context: GenerativeUiSurfaceContextV1): void {
   if (!INPUTS.has(context.input)) throw new Error(`Unsupported Generative UI input: ${context.input}`);
   if (!VIEWPORTS.has(context.viewport)) throw new Error(`Unsupported Generative UI viewport: ${context.viewport}`);
   if (!ATTENTION.has(context.attention)) throw new Error(`Unsupported Generative UI attention: ${context.attention}`);
+  if (
+    context.active_run_id !== undefined
+    && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(context.active_run_id)
+  ) {
+    throw new Error("Generative UI active_run_id must be a bounded identifier");
+  }
+  if (
+    context.active_session_id !== undefined
+    && (
+      context.active_session_id.length < 1
+      || context.active_session_id.length > 256
+      || /[\u0000-\u001F\u007F]/.test(context.active_session_id)
+    )
+  ) {
+    throw new Error("Generative UI active_session_id must be a bounded opaque id");
+  }
   if (context.surface_capacities) {
     for (const [surface, capacity] of Object.entries(context.surface_capacities)) {
       if (!SURFACES.includes(surface as GenerativeUiSurface)) {

@@ -192,5 +192,8 @@ describe("Generative UI Surface Composer", () => {
     expect(() => composeGenerativeUi(doc, [], context({
       surface_capacities: { task: 129 },
     }), metadata)).toThrow("between 0 and 128");
+    expect(() => composeGenerativeUi(doc, [], context({
+      active_run_id: "not a valid run id",
+    }), metadata)).toThrow("bounded identifier");
   });
 });

@@ -146,6 +146,18 @@ export class PersistentGenerativeUiDocumentService implements GenerativeUiDocume
     return structuredClone(decodeDocument(row));
   }
 
+  getIncludingDeleted(
+    documentId: string,
+    expectedScope: GenerativeUiDocumentScopeV1,
+  ): GenerativeUiDocumentV1 | undefined {
+    const row = this.#row(documentId);
+    if (!row) return undefined;
+    if (!sameScope(rowScope(row), expectedScope)) {
+      throw new Error(`Generative UI document scope mismatch: ${documentId}`);
+    }
+    return structuredClone(decodeDocument(row));
+  }
+
   getLatestForScope(
     scope: GenerativeUiDocumentScopeV1,
     purpose: DocumentRow["purpose"] = "canonical",
@@ -352,6 +364,7 @@ export class PersistentGenerativeUiDocumentService implements GenerativeUiDocume
 
   clear(): void {
     getDb().transaction(() => {
+      getDb().prepare("DELETE FROM generative_ui_user_overrides").run();
       getDb().prepare("DELETE FROM generative_ui_transactions").run();
       getDb().prepare("DELETE FROM generative_ui_documents").run();
     })();

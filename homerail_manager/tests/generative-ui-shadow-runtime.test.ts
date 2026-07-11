@@ -230,6 +230,107 @@ describe("Voice Generative UI shadow runtime", () => {
     });
   });
 
+  it("persists scope-bound user overrides and recomposes without mutating the document", async () => {
+    await configure(baseUrl, "shadow");
+    const sessionId = await createSession(baseUrl);
+    _setHostCodexManagerAgentRunnerForTest(async (input) => resultWithWidget(input));
+    expect((await fetch(`${baseUrl}/api/voice-agent/sessions/${sessionId}/turn`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "Create one overridable note." }),
+    })).status).toBe(200);
+
+    const before = await fetch(
+      `${baseUrl}/api/voice-agent/sessions/${sessionId}/generative-ui?device=phone&input=touch&viewport=compact`,
+    );
+    const beforeBody = await before.json() as {
+      data: {
+        document: { revision: number; nodes: Array<Record<string, unknown>> };
+        overrides: unknown[];
+        composition: { context: { device: string }; items: Array<{ node_id: string }>; hidden_node_ids: string[] };
+      };
+    };
+    expect(beforeBody.data).toMatchObject({
+      document: { revision: 1 },
+      overrides: [],
+      composition: {
+        context: { device: "phone" },
+        items: [{ node_id: "shadow-note" }],
+        hidden_node_ids: [],
+      },
+    });
+    const beforeEtag = before.headers.get("etag");
+    expect(beforeEtag).toBeTruthy();
+
+    const saved = await fetch(
+      `${baseUrl}/api/voice-agent/sessions/${sessionId}/generative-ui/overrides/shadow-note`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ visibility: "hidden", pinned: true }),
+      },
+    );
+    expect(saved.status).toBe(200);
+    expect(await saved.json()).toMatchObject({
+      data: { override: { node_id: "shadow-note", visibility: "hidden", pinned: true } },
+    });
+
+    const recomposed = await fetch(
+      `${baseUrl}/api/voice-agent/sessions/${sessionId}/generative-ui?device=phone&input=touch&viewport=compact`,
+      { headers: { "If-None-Match": beforeEtag! } },
+    );
+    const recomposedBody = await recomposed.json() as {
+      data: {
+        document: { revision: number; nodes: Array<Record<string, unknown>> };
+        overrides: Array<{ node_id: string; visibility: string }>;
+        composition: { items: unknown[]; hidden_node_ids: string[] };
+      };
+    };
+    expect(recomposed.status).toBe(200);
+    expect(recomposed.headers.get("etag")).not.toBe(beforeEtag);
+    expect(recomposedBody.data).toMatchObject({
+      document: { revision: 1 },
+      overrides: [{ node_id: "shadow-note", visibility: "hidden" }],
+      composition: { items: [], hidden_node_ids: ["shadow-note"] },
+    });
+    expect(recomposedBody.data.document.nodes[0]).not.toHaveProperty("pinned");
+    expect(recomposedBody.data.document.nodes[0]).not.toHaveProperty("visibility");
+
+    closeDb();
+    const recovered = await fetch(`${baseUrl}/api/voice-agent/sessions/${sessionId}/generative-ui`);
+    expect((await recovered.json()) as unknown).toMatchObject({
+      data: {
+        overrides: [{ node_id: "shadow-note", visibility: "hidden" }],
+        composition: { hidden_node_ids: ["shadow-note"] },
+      },
+    });
+    expect((await fetch(`${baseUrl}/api/voice-agent/sessions/${sessionId}/generative-ui?device=watch`)).status)
+      .toBe(400);
+    expect((await fetch(
+      `${baseUrl}/api/voice-agent/sessions/${sessionId}/generative-ui/overrides/shadow-note`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ css: "position: fixed" }),
+      },
+    )).status).toBe(400);
+
+    expect((await fetch(
+      `${baseUrl}/api/voice-agent/sessions/${sessionId}/generative-ui/overrides/shadow-note`,
+      { method: "DELETE" },
+    )).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/voice-agent/sessions/${sessionId}`, { method: "DELETE" })).status)
+      .toBe(200);
+    expect((await fetch(
+      `${baseUrl}/api/voice-agent/sessions/${sessionId}/generative-ui/overrides/shadow-note`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pinned: true }),
+      },
+    )).status).toBe(409);
+  });
+
   it("keeps the exact legacy path when the session snapshot is off", async () => {
     await configure(baseUrl, "off");
     const sessionId = await createSession(baseUrl);
