@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { DAGDispatcher, DispatchEnvelope, DispatchResult } from "../src/orchestration/dag-dispatcher.js";
+import { parseWorkflowSource } from "../src/orchestration/workflow-spec-v1.js";
 import { parseDAGYaml } from "../src/orchestration/yaml-loader.js";
 import { _clearListeners } from "../src/events/bus.js";
 import { closeDb } from "../src/persistence/db.js";
@@ -13,7 +14,9 @@ import {
   autoHandoffAfterCorrectionExhausted,
   createActiveRun,
   dispatchReadyNodes,
+  failActiveRun,
   getActiveRun,
+  handoffActiveRun,
   requestNodeCorrection,
 } from "../src/runtime/active-runs.js";
 
@@ -27,6 +30,34 @@ agents:
     agent_type: deterministic
 nodes:
   start:
+    agent: worker
+    outputs:
+      done:
+        to: ""
+`;
+}
+
+function correctionWithDownstreamYaml(): string {
+  return `
+name: correction-downstream
+limits:
+  max_corrections_per_node: 1
+agents:
+  worker:
+    agent_type: deterministic
+nodes:
+  start:
+    agent: worker
+    outputs:
+      done:
+        to: downstream.in:result
+  downstream:
+    agent: worker
+    after: [start]
+    outputs:
+      done:
+        to: ""
+  hold:
     agent: worker
     outputs:
       done:
@@ -88,6 +119,27 @@ describe("DAG correction and dispatch retry", () => {
     expect(dispatchReadyNodes("run-correction", dispatcher)).toBe(1);
     expect(dispatcher.calls).toHaveLength(2);
     expect(dispatcher.calls[1].inputs.correction?.[0]).toContain("agent ended without DAG handoff");
+    expect(dispatcher.calls[1].inputs.correction?.[0]).toContain("Declared output ports for this node: done.");
+    expect(dispatcher.calls[1].inputs.correction?.[0]).toContain("Your next and only action must call the handoff tool");
+  });
+
+  it("restores success descendants skipped by the failed attempt", () => {
+    const parsed = parseDAGYaml(correctionWithDownstreamYaml());
+    createActiveRun("run-correction-descendants", parsed);
+    const dispatcher = new FlakyDispatcher({ status: "dispatched", targetType: "fake", targetId: "first" });
+    expect(dispatchReadyNodes("run-correction-descendants", dispatcher)).toBe(2);
+
+    failActiveRun("run-correction-descendants", "start", "invalid handoff contract");
+    expect(getActiveRun("run-correction-descendants")?.dagRun.nodeStates.get("downstream")).toBe("SKIPPED");
+    expect(requestNodeCorrection(
+      "run-correction-descendants",
+      "start",
+      "invalid handoff contract",
+    ).status).toBe("scheduled");
+    expect(getActiveRun("run-correction-descendants")?.dagRun.nodeStates.get("downstream")).toBe("PENDING");
+
+    handoffActiveRun("run-correction-descendants", "start", "done", { corrected: true });
+    expect(getActiveRun("run-correction-descendants")?.dagRun.nodeStates.get("downstream")).toBe("READY");
   });
 
   it("auto-handoffs on a success port after correction attempts are exhausted", () => {
@@ -103,6 +155,53 @@ describe("DAG correction and dispatch retry", () => {
     const run = autoHandoffAfterCorrectionExhausted("run-auto-handoff", "start", "missing handoff again");
     expect(run?.status).toBe("completed");
     expect(run?.dagRun.nodeStates.get("start")).toBe("COMPLETED");
+  });
+
+  it("fails the run without throwing when an exhausted auto-handoff violates a v1 contract", () => {
+    const parsed = parseWorkflowSource(`
+api_version: homerail.ai/v1
+kind: Workflow
+metadata: { id: correction-contract, name: Correction Contract }
+spec:
+  contracts:
+    Text: { type: string }
+  agents:
+    worker: { system: Return text. }
+  nodes:
+    start:
+      kind: agent
+      agent: worker
+      outputs:
+        done: { contract: Text }
+    terminal:
+      kind: terminal
+      outcome: success
+      inputs:
+        result: { contract: Text }
+  edges:
+    - { from: start.done, to: terminal.result }
+  policies:
+    max_corrections_per_node: 0
+`);
+    parsed.meta.agents!.worker!.agent_type = "deterministic";
+    createActiveRun("run-auto-handoff-contract", parsed);
+    dispatchReadyNodes(
+      "run-auto-handoff-contract",
+      new FlakyDispatcher({ status: "dispatched", targetType: "fake", targetId: "first" }),
+    );
+
+    expect(requestNodeCorrection(
+      "run-auto-handoff-contract",
+      "start",
+      "missing handoff",
+    ).status).toBe("exhausted");
+    expect(() => autoHandoffAfterCorrectionExhausted(
+      "run-auto-handoff-contract",
+      "start",
+      "missing handoff",
+    )).not.toThrow();
+    expect(getActiveRun("run-auto-handoff-contract")?.status).toBe("failed");
+    expect(getActiveRun("run-auto-handoff-contract")?.dagRun.nodeStates.get("start")).toBe("FAILED");
   });
 
   it("retries retryable dispatch failures once before marking the node running", () => {

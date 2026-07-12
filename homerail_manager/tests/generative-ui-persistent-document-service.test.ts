@@ -187,7 +187,7 @@ describe("PersistentGenerativeUiDocumentService", () => {
     legacy.close();
 
     expect(getDb().prepare("SELECT version FROM schema_migrations ORDER BY version").all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }]);
+      .toEqual(Array.from({ length: 16 }, (_, index) => ({ version: index + 1 })));
     expect(getDb().prepare("SELECT data FROM voice_agent_sessions WHERE session_id = ?").get("legacy-v2"))
       .toEqual({ data: legacyPayload });
     expect(getDb().prepare(`
@@ -213,6 +213,53 @@ describe("PersistentGenerativeUiDocumentService", () => {
       .toEqual({ count: 1 });
     expect(getDb().prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 9").get())
       .toEqual({ count: 1 });
+  });
+
+  it("remaps main's colliding DAG migration markers before applying the merged chain", () => {
+    closeDb();
+    fs.mkdirSync(path.dirname(getDbPath()), { recursive: true });
+    const mainDb = new Database(getDbPath());
+    mainDb.exec(`
+      CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+      INSERT INTO schema_migrations(version, applied_at)
+      VALUES (1, '${time0}'), (2, '${time0}'), (3, '${time0}'), (4, '${time0}');
+      CREATE TABLE dag_workflows (
+        workflow_id TEXT PRIMARY KEY,
+        head_revision INTEGER NOT NULL DEFAULT 0,
+        api_version TEXT,
+        canonical_hash TEXT,
+        compiler_version TEXT
+      );
+      CREATE TABLE dag_workflow_revisions (
+        workflow_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        canonical_hash TEXT NOT NULL,
+        PRIMARY KEY(workflow_id, revision)
+      );
+      CREATE TABLE dag_approvals (
+        run_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        proposer_actor TEXT NOT NULL,
+        expires_at INTEGER,
+        decision TEXT,
+        actor TEXT,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(run_id, node_id)
+      );
+    `);
+    mainDb.close();
+
+    expect(getDb().prepare("SELECT version FROM schema_migrations ORDER BY version").all())
+      .toEqual(Array.from({ length: 16 }, (_, index) => ({ version: index + 1 })));
+    expect(getDb().prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name IN ('generative_ui_documents', 'generative_ui_user_overrides')
+      ORDER BY name
+    `).all()).toEqual([
+      { name: "generative_ui_documents" },
+      { name: "generative_ui_user_overrides" },
+    ]);
   });
 
   it("fails closed when a v3 migration marker exists without its schema objects", () => {

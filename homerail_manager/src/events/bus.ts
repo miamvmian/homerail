@@ -39,6 +39,16 @@ export type DAGEventType =
   | "dag:cleanup_completed"
   | "dag:cleanup_failed"
   | "dag:run_recovered"
+  | "dag:deterministic_command"
+  | "dag:state_updated"
+  | "dag:approval_requested"
+  | "dag:approval_decided"
+  | "dag:approval_expired"
+  | "dag:fanout_started"
+  | "dag:fanout_completed"
+  | "dag:trigger_skipped"
+  | "dag:trigger_dispatched"
+  | "dag:trigger_failed"
   | "voice:session_status"
   | "plugin:registry_changed";
 
@@ -83,6 +93,16 @@ export const DAG_EVENT_TYPES: DAGEventType[] = [
   "dag:cleanup_completed",
   "dag:cleanup_failed",
   "dag:run_recovered",
+  "dag:deterministic_command",
+  "dag:state_updated",
+  "dag:approval_requested",
+  "dag:approval_decided",
+  "dag:approval_expired",
+  "dag:fanout_started",
+  "dag:fanout_completed",
+  "dag:trigger_skipped",
+  "dag:trigger_dispatched",
+  "dag:trigger_failed",
   "voice:session_status",
   "plugin:registry_changed",
 ];
@@ -390,6 +410,12 @@ export interface PluginRegistryChangedPayload {
   registry_fingerprint: string;
 }
 
+export interface RuntimePrimitivePayload {
+  runId?: string;
+  nodeId?: string;
+  [key: string]: unknown;
+}
+
 export type DAGEventPayload =
   | RunCreatedPayload
   | HandoffPayload
@@ -431,6 +457,7 @@ export type DAGEventPayload =
   | CleanupCompletedPayload
   | CleanupFailedPayload
   | RunRecoveredPayload
+  | RuntimePrimitivePayload
   | VoiceSessionStatusPayload
   | PluginRegistryChangedPayload;
 

@@ -233,7 +233,7 @@ describe("signed remote plugin registry", () => {
     expect(listPluginRegistryUpdateAttempts("stable.example").filter((attempt) => attempt.status === "failed"))
       .toHaveLength(3);
     expect(getDb().prepare("SELECT MAX(version) AS version FROM schema_migrations").get())
-      .toEqual({ version: 14 });
+      .toEqual({ version: 16 });
   });
 
   it("rejects signed catalog releases whose payload or publisher digest disagrees with the HRP", () => {

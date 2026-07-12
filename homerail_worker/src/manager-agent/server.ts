@@ -24,6 +24,7 @@ import {
   homerailPluginTurnContextDigestInput,
   analyzeGenerativeUiJsonValue,
   normalizeManagerAgentRuntimeAgentType,
+  redactTelemetry,
   type ManagerAgentWidgetFileToolAdapter,
   type ManagerAgentWidgetFileToolResult,
   type ManagerAgentToolName,
@@ -176,7 +177,8 @@ function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
 }
 
 function short(value: unknown, max = 4000): string {
-  const text = typeof value === "string" ? value : JSON.stringify(value);
+  const redacted = redactTelemetry(value);
+  const text = typeof redacted === "string" ? redacted : JSON.stringify(redacted);
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
@@ -243,7 +245,8 @@ async function requestManager(pathname: string, init?: RequestInit): Promise<unk
   const credential = envelope
     ? Buffer.from(JSON.stringify(envelope), "utf8").toString("base64url")
     : undefined;
-  const headers = managerRequestHeaders(url, init, credential);
+  const mutationToken = process.env.HOMERAIL_DAG_MUTATION_TOKEN;
+  const headers = managerRequestHeaders(url, init, credential, mutationToken);
   try {
     const res = await fetch(url, { ...init, headers });
     const text = await res.text();
@@ -259,7 +262,7 @@ async function requestManager(pathname: string, init?: RequestInit): Promise<unk
     return body;
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : String(cause);
-    const error = new Error(redactManagerCredential(message, credential));
+    const error = new Error(redactManagerCredential(message, credential, mutationToken));
     if (cause instanceof Error) error.name = cause.name;
     throw error;
   }
@@ -276,11 +279,17 @@ export function _withManagerTurnEnvelopeForTest<T>(
   return activeManagerTurn.run(envelope, callback);
 }
 
-function managerRequestHeaders(url: string, init: RequestInit | undefined, credential: string | undefined): Headers {
+function managerRequestHeaders(
+  url: string,
+  init: RequestInit | undefined,
+  credential: string | undefined,
+  mutationToken: string | undefined,
+): Headers {
   const headers = new Headers(init?.headers);
   if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   headers.delete("Authorization");
   headers.delete(HOMERAIL_MANAGER_TURN_HEADER);
+  headers.delete("X-Homerail-Dag-Token");
   const method = (init?.method || "GET").toUpperCase();
   const pathname = new URL(url).pathname;
   if (
@@ -288,11 +297,17 @@ function managerRequestHeaders(url: string, init: RequestInit | undefined, crede
     && ["POST", "PUT", "PATCH", "DELETE"].includes(method)
     && (pathname === "/api" || pathname.startsWith("/api/"))
   ) headers.set(HOMERAIL_MANAGER_TURN_HEADER, credential);
+  if (mutationToken && method !== "GET") headers.set("X-Homerail-Dag-Token", mutationToken);
   return headers;
 }
 
-function redactManagerCredential(message: string, credential: string | undefined): string {
+function redactManagerCredential(
+  message: string,
+  credential: string | undefined,
+  mutationToken: string | undefined,
+): string {
   let redacted = credential ? message.split(credential).join("***REDACTED***") : message;
+  if (mutationToken) redacted = redacted.split(mutationToken).join("***REDACTED***");
   redacted = redacted.replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1***REDACTED***");
   redacted = redacted.replace(/(credential=)[A-Za-z0-9_-]{32,}/gi, "$1***REDACTED***");
   return redacted;
@@ -566,6 +581,61 @@ export function createManagerTools(state: {
           });
           throw error;
         }
+      },
+    },
+    {
+      ...managerAgentToolSpec("list_dag_approvals"),
+      async handler() {
+        return { content: [{ type: "text", text: short(await requestManager("/dag/approvals"), 20000) }] };
+      },
+    },
+    {
+      ...managerAgentToolSpec("list_dag_triggers"),
+      async handler() {
+        return { content: [{ type: "text", text: short(await requestManager("/dag/triggers"), 20000) }] };
+      },
+    },
+    {
+      ...managerAgentToolSpec("fire_dag_event"),
+      async handler(args) {
+        const event = String(args.event ?? "").trim();
+        if (!event) throw new Error("fire_dag_event requires event");
+        const body = await requestManager(`/dag/triggers/events/${encodeURIComponent(event)}`, {
+          method: "POST",
+          body: JSON.stringify({
+            idempotency_key: args.idempotency_key,
+            payload: args.payload,
+            authorization_token: process.env.HOMERAIL_DAG_MUTATION_TOKEN ?? process.env.HOMERAIL_DAG_APPROVAL_TOKEN,
+          }),
+        });
+        return { content: [{ type: "text", text: short(body, 20000) }] };
+      },
+    },
+    {
+      ...managerAgentToolSpec("get_dag_state"),
+      async handler(args) {
+        const namespace = String(args.namespace ?? "").trim();
+        const key = String(args.key ?? "").trim();
+        if (!namespace || !key) throw new Error("get_dag_state requires namespace and key");
+        const body = await requestManager(`/dag/state/${encodeURIComponent(namespace)}/${encodeURIComponent(key)}`);
+        return { content: [{ type: "text", text: short(body, 20000) }] };
+      },
+    },
+    {
+      ...managerAgentToolSpec("set_dag_state"),
+      async handler(args) {
+        const namespace = String(args.namespace ?? "").trim();
+        const key = String(args.key ?? "").trim();
+        if (!namespace || !key) throw new Error("set_dag_state requires namespace and key");
+        const body = await requestManager(`/dag/state/${encodeURIComponent(namespace)}/${encodeURIComponent(key)}`, {
+          method: "POST",
+          body: JSON.stringify({
+            value: args.value,
+            expected_version: args.expected_version,
+            authorization_token: process.env.HOMERAIL_DAG_MUTATION_TOKEN ?? process.env.HOMERAIL_DAG_APPROVAL_TOKEN,
+          }),
+        });
+        return { content: [{ type: "text", text: short(body, 20000) }] };
       },
     },
     {

@@ -68,6 +68,7 @@ describe("/api/manager/chat", () => {
   let oldManagerAgentPort: string | undefined;
   let oldHostEntry: string | undefined;
   let oldHostShell: string | undefined;
+  let oldDagMutationToken: string | undefined;
 
   beforeEach(async () => {
     oldHome = process.env.HOMERAIL_HOME;
@@ -76,6 +77,7 @@ describe("/api/manager/chat", () => {
     oldManagerAgentPort = process.env.HOMERAIL_MANAGER_AGENT_PORT;
     oldHostEntry = process.env.HOMERAIL_MANAGER_AGENT_HOST_ENTRY;
     oldHostShell = process.env.HOMERAIL_MANAGER_AGENT_SHELL;
+    oldDagMutationToken = process.env.HOMERAIL_DAG_MUTATION_TOKEN;
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "homerail-manager-chat-"));
     process.env.HOMERAIL_HOME = tmpHome;
     process.env.HOMERAIL_LOCAL_NODE_AUTOSTART = "0";
@@ -109,6 +111,8 @@ describe("/api/manager/chat", () => {
     else process.env.HOMERAIL_MANAGER_AGENT_HOST_ENTRY = oldHostEntry;
     if (oldHostShell === undefined) delete process.env.HOMERAIL_MANAGER_AGENT_SHELL;
     else process.env.HOMERAIL_MANAGER_AGENT_SHELL = oldHostShell;
+    if (oldDagMutationToken === undefined) delete process.env.HOMERAIL_DAG_MUTATION_TOKEN;
+    else process.env.HOMERAIL_DAG_MUTATION_TOKEN = oldDagMutationToken;
     closeDb();
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
@@ -1172,6 +1176,9 @@ describe("/api/manager/chat", () => {
       "list_dag_patterns",
       "get_dag_pattern",
       "instantiate_dag_pattern",
+      "get_dag_schema",
+      "validate_dag_workflow",
+      "sync_dag_workflow",
       "update_voice_memo",
       "validate_widget_file",
       "write_widget_file",
@@ -1186,6 +1193,7 @@ describe("/api/manager/chat", () => {
   });
 
   it("exposes skill and DAG pattern operations through host Codex tools", async () => {
+    process.env.HOMERAIL_DAG_MUTATION_TOKEN = "host-tool-mutation-secret";
     const port = await listen(server);
     const managerRestUrl = `http://127.0.0.1:${port}/api`;
 
@@ -1215,7 +1223,7 @@ describe("/api/manager/chat", () => {
       { pattern_id: "heartbeat" },
       { managerRestUrl },
     );
-    expect(pattern.result.content[0].text).toContain("condition_gateway");
+    expect(pattern.result.content[0].text).toContain("deterministic_check");
 
     const instantiated = await _invokeHostCodexVoiceToolForTest(
       "instantiate_dag_pattern",
@@ -1228,6 +1236,29 @@ describe("/api/manager/chat", () => {
     );
     expect(instantiated.result.is_error).toBeFalsy();
     expect(instantiated.result.content[0].text).toContain('"synced":true');
+
+    const stateWrite = await _invokeHostCodexVoiceToolForTest(
+      "set_dag_state",
+      { namespace: "host-tool", key: "redaction", value: { api_key: "host-tool-sensitive-value" } },
+      { managerRestUrl },
+    );
+    expect(stateWrite.result.is_error).toBeFalsy();
+    expect(stateWrite.result.content[0].text).not.toContain("host-tool-sensitive-value");
+    expect(stateWrite.result.content[0].text).toContain("***REDACTED***");
+
+    const schema = await _invokeHostCodexVoiceToolForTest(
+      "get_dag_schema",
+      {},
+      { managerRestUrl },
+    );
+    expect(schema.result.content[0].text).toContain("homerail.ai/v1");
+
+    const validation = await _invokeHostCodexVoiceToolForTest(
+      "validate_dag_workflow",
+      { source: "api_version: homerail.ai/v1\nkind: Workflow\n" },
+      { managerRestUrl },
+    );
+    expect(validation.result.content[0].text).toContain("DAG_SCHEMA_REQUIRED_FIELD");
 
     const workflow = await fetch(`http://127.0.0.1:${port}/api/dag/workflows/host-skill-heartbeat`);
     expect(workflow.status).toBe(200);

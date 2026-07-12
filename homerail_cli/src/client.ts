@@ -15,12 +15,14 @@ export interface HomeRailClientOptions {
   baseUrl?: string;
   timeoutMs?: number;
   adminToken?: string;
+  mutationToken?: string;
 }
 
 export class HomeRailClient {
   readonly baseUrl: string;
   readonly timeoutMs: number;
   private readonly adminToken?: string;
+  readonly mutationToken?: string;
 
   constructor(opts: HomeRailClientOptions = {}) {
     this.baseUrl = HomeRailClient.resolveBaseUrl(opts.baseUrl);
@@ -28,6 +30,7 @@ export class HomeRailClient {
     this.adminToken = opts.adminToken === undefined
       ? resolveConfiguredManagerAdminToken()
       : opts.adminToken || undefined;
+    this.mutationToken = opts.mutationToken ?? process.env.HOMERAIL_DAG_MUTATION_TOKEN;
   }
 
   static resolveBaseUrl(override?: string): string {
@@ -194,6 +197,9 @@ export class HomeRailClient {
           ...(this.adminToken && isProtectedApiMutationRequest(method, path) ? {
             Authorization: `Bearer ${this.adminToken}`,
           } : {}),
+          ...(method !== "GET" && this.mutationToken
+            ? { "X-Homerail-Dag-Token": this.mutationToken }
+            : {}),
           ...(payload ? {
             "Content-Type": payload.type === "json"
               ? "application/json"
@@ -230,7 +236,7 @@ export class HomeRailClient {
       if (err instanceof Error && err.name === "AbortError") {
         throw new Error(`Request timed out after ${this.timeoutMs}ms`);
       }
-      throw redactClientError(err, this.adminToken);
+      throw redactClientError(err, this.adminToken, this.mutationToken);
     } finally {
       clearTimeout(timer);
     }
@@ -247,9 +253,14 @@ function isProtectedApiMutationRequest(method: string, pathValue: string): boole
   }
 }
 
-function redactClientError(error: unknown, adminToken: string | undefined): Error {
+function redactClientError(
+  error: unknown,
+  adminToken: string | undefined,
+  mutationToken: string | undefined,
+): Error {
   let message = error instanceof Error ? error.message : String(error);
   if (adminToken) message = message.split(adminToken).join("***REDACTED***");
+  if (mutationToken) message = message.split(mutationToken).join("***REDACTED***");
   message = message.replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1***REDACTED***");
   const safe = new Error(message);
   if (error instanceof Error) safe.name = error.name;

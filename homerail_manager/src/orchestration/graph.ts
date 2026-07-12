@@ -24,14 +24,15 @@ export interface DAGNodeRequirements {
 }
 
 export interface DAGGatewayConfig {
-  type?: "loop" | "condition" | "join" | "while" | string;
-  kind?: "loop" | "condition" | "join" | "while" | string;
+  type?: "loop" | "condition" | "join" | "while" | "command" | "approval" | "state" | "fanout" | string;
+  kind?: "loop" | "condition" | "join" | "while" | "command" | "approval" | "state" | "fanout" | string;
   mode?: "all" | "any" | "n_of_m" | string;
   field?: string;
   routes?: Record<string, string>;
   cases?: Record<string, string>;
   default_port?: string;
   items?: unknown[];
+  input?: string;
   item_port?: string;
   result_port?: string;
   done_port?: string;
@@ -44,6 +45,45 @@ export interface DAGGatewayConfig {
   operator?: "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "truthy" | "falsy" | string;
   value?: unknown;
   max_iterations?: number;
+  max_items?: number;
+  command?: string[];
+  command_field?: string;
+  stdin_field?: string;
+  cwd?: string;
+  timeout_ms?: number;
+  success_exit_codes?: number[];
+  success_port?: string;
+  failure_port?: string;
+  capture_limit?: number;
+  parse_stdout?: "text" | "json" | "number";
+  approval_id?: string;
+  proposal_field?: string;
+  proposer_actor?: string;
+  authorized_actors?: string[];
+  approved_port?: string;
+  rejected_port?: string;
+  expires_after_ms?: number;
+  namespace?: string;
+  key?: string;
+  key_field?: string;
+  operation?: "get" | "set" | "increment" | "compare_and_set" | "trust_update" | "budget_admit" | string;
+  value_field?: string;
+  expected_version?: number;
+  conflict_port?: string;
+  pass_field?: string;
+  auto_min_runs?: number;
+  auto_min_rate?: number;
+  watch_min_rate?: number;
+  budget_limit?: number;
+  usage_field?: string;
+  item_field?: string;
+  context_field?: string;
+  worker_agent?: string;
+  max_parallelism?: number;
+  completion?: "all" | "any" | "n_of_m" | string;
+  result_contract?: string;
+  success_field?: string;
+  cancel_remaining?: boolean;
 }
 
 export interface DAGPatternInstanceMeta {
@@ -78,6 +118,7 @@ export interface DAGEdge {
   condition: string;
   label?: string;
   retry_policy?: DAGEdgeRetryPolicy;
+  terminal_outcome?: "success" | "failure" | "cancelled";
 }
 
 export interface RuntimeProfileAgentMapping {
@@ -139,6 +180,20 @@ export interface ScorecardPolicyConfig {
 export interface ResolvedWorkflowMeta {
   name: string;
   workflow_id?: string;
+  workflow_revision?: number;
+  canonical_hash?: string;
+  compiler_version?: string;
+  source_api_version?: string;
+  contracts?: Record<string, unknown>;
+  triggers?: Record<string, {
+    type: "interval" | "event";
+    every_ms?: number;
+    event?: string;
+    overlap: "skip" | "allow";
+    max_concurrency: number;
+    enabled: boolean;
+  }>;
+  run_input_targets?: Array<{ node: string; port: string; contract?: string }>;
   description?: string;
   llm?: { provider?: string; model?: string };
   runtime_profiles?: Record<string, RuntimeProfile>;

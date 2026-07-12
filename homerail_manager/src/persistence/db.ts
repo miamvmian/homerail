@@ -35,6 +35,7 @@ const CLEARABLE_TABLES = new Set([
   "dag_handoffs",
   "dag_events",
   "dag_runs",
+  "dag_workflow_revisions",
   "dag_runtime_profiles",
   "dag_workflows",
   "experience_ingest_jobs",
@@ -402,6 +403,55 @@ function runSchemaMigrations(db: SqliteDatabase, migrations: readonly SchemaMigr
       migration.validate?.(db);
       if (!alreadyApplied) record.run(migration.version, nowIso());
     }).immediate();
+  }
+}
+
+function hasTable(db: SqliteDatabase, table: string): boolean {
+  return Boolean(db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+  ).get(table));
+}
+
+/**
+ * main used migration ids 3/4 for DAG schema work while PR #19 independently
+ * used the same ids for Generative UI. Detect only databases that already have
+ * main's physical DAG schema and no Generative UI schema, then free those ids
+ * so the merged 3-14 chain can run. The DAG changes receive durable ids 15/16.
+ */
+function legacyMainMigrationVersions(db: SqliteDatabase): number[] {
+  if (!hasTable(db, "schema_migrations") || hasTable(db, "generative_ui_documents")) return [];
+  const hasVersion = (version: number) => Boolean(db.prepare(
+    "SELECT 1 FROM schema_migrations WHERE version = ?",
+  ).get(version));
+  const versions: number[] = [];
+  if (
+    hasVersion(3)
+    && hasTable(db, "dag_workflow_revisions")
+    && hasColumn(db, "dag_workflows", "head_revision")
+    && hasColumn(db, "dag_workflows", "canonical_hash")
+  ) versions.push(3);
+  if (
+    hasVersion(4)
+    && hasTable(db, "dag_approvals")
+    && hasColumn(db, "dag_approvals", "proposer_actor")
+  ) versions.push(4);
+  return versions;
+}
+
+function validateDagWorkflowSchemaV15(db: SqliteDatabase): void {
+  if (!hasTable(db, "dag_workflow_revisions")) {
+    throw new Error("Schema migration 15 is incomplete: missing table dag_workflow_revisions");
+  }
+  for (const column of ["head_revision", "api_version", "canonical_hash", "compiler_version"]) {
+    if (!hasColumn(db, "dag_workflows", column)) {
+      throw new Error(`Schema migration 15 is incomplete: dag_workflows is missing column ${column}`);
+    }
+  }
+}
+
+function validateDagApprovalIdentityV16(db: SqliteDatabase): void {
+  if (!hasTable(db, "dag_approvals") || !hasColumn(db, "dag_approvals", "proposer_actor")) {
+    throw new Error("Schema migration 16 is incomplete: dag_approvals proposer identity is missing");
   }
 }
 
@@ -1632,12 +1682,35 @@ const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
     `),
     validate: validatePluginAgentToolContinuationSchemaV14,
   },
+  {
+    version: 15,
+    up: (db) => {
+      ensureColumn(db, "dag_workflows", "head_revision", "INTEGER NOT NULL DEFAULT 0");
+      ensureColumn(db, "dag_workflows", "api_version", "TEXT");
+      ensureColumn(db, "dag_workflows", "canonical_hash", "TEXT");
+      ensureColumn(db, "dag_workflows", "compiler_version", "TEXT");
+    },
+    validate: validateDagWorkflowSchemaV15,
+  },
+  {
+    version: 16,
+    up: (db) => {
+      ensureColumn(db, "dag_approvals", "proposer_actor", "TEXT NOT NULL DEFAULT ''");
+      db.prepare(`
+        UPDATE dag_approvals
+        SET expires_at = 0, decision = NULL, actor = NULL, updated_at = ?
+        WHERE status = 'waiting' AND TRIM(COALESCE(proposer_actor, '')) = ''
+      `).run(Date.now());
+    },
+    validate: validateDagApprovalIdentityV16,
+  },
 ];
 
 function initializeSchema(db: SqliteDatabase, filePath: string): void {
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   db.pragma("busy_timeout = 5000");
+  const collidingMainVersions = legacyMainMigrationVersions(db);
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       version INTEGER PRIMARY KEY,
@@ -1988,6 +2061,24 @@ function initializeSchema(db: SqliteDatabase, filePath: string): void {
       data TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS dag_workflow_revisions (
+      workflow_id TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      api_version TEXT NOT NULL,
+      source_format TEXT NOT NULL,
+      source_text TEXT NOT NULL,
+      source_hash TEXT NOT NULL,
+      canonical_json TEXT NOT NULL,
+      canonical_hash TEXT NOT NULL,
+      compiler_version TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(workflow_id, revision),
+      UNIQUE(workflow_id, canonical_hash),
+      FOREIGN KEY(workflow_id) REFERENCES dag_workflows(workflow_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_dag_workflow_revisions_hash
+      ON dag_workflow_revisions(workflow_id, canonical_hash);
+
     CREATE TABLE IF NOT EXISTS dag_runtime_profiles (
       profile_key TEXT PRIMARY KEY,
       workflow_id TEXT NOT NULL,
@@ -2042,6 +2133,74 @@ function initializeSchema(db: SqliteDatabase, filePath: string): void {
       FOREIGN KEY(run_id) REFERENCES dag_runs(run_id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_dag_metrics_run ON dag_metrics(run_id, seq);
+
+    CREATE TABLE IF NOT EXISTS dag_approvals (
+      run_id TEXT NOT NULL,
+      node_id TEXT NOT NULL,
+      approval_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      proposal_hash TEXT NOT NULL,
+      proposal_json TEXT NOT NULL,
+      proposer_actor TEXT NOT NULL,
+      authorized_actors TEXT NOT NULL,
+      decision TEXT,
+      actor TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      expires_at INTEGER,
+      PRIMARY KEY(run_id, node_id),
+      FOREIGN KEY(run_id) REFERENCES dag_runs(run_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_dag_approvals_status ON dag_approvals(status, updated_at);
+
+    CREATE TABLE IF NOT EXISTS dag_state_records (
+      namespace TEXT NOT NULL,
+      state_key TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      value_json TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(namespace, state_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS dag_state_history (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      namespace TEXT NOT NULL,
+      state_key TEXT NOT NULL,
+      before_json TEXT,
+      after_json TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      run_id TEXT,
+      node_id TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_dag_state_history_key ON dag_state_history(namespace, state_key, seq);
+
+    CREATE TABLE IF NOT EXISTS dag_triggers (
+      trigger_key TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL,
+      trigger_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      config_json TEXT NOT NULL,
+      enabled INTEGER NOT NULL,
+      next_fire_at INTEGER,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(workflow_id, trigger_id),
+      FOREIGN KEY(workflow_id) REFERENCES dag_workflows(workflow_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_dag_triggers_due ON dag_triggers(enabled, next_fire_at);
+
+    CREATE TABLE IF NOT EXISTS dag_trigger_deliveries (
+      delivery_key TEXT PRIMARY KEY,
+      trigger_key TEXT NOT NULL,
+      fire_key TEXT NOT NULL,
+      status TEXT NOT NULL,
+      run_id TEXT,
+      payload_json TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(trigger_key, fire_key),
+      FOREIGN KEY(trigger_key) REFERENCES dag_triggers(trigger_key) ON DELETE CASCADE
+    );
 
     CREATE TABLE IF NOT EXISTS experience_ingest_jobs (
       id TEXT PRIMARY KEY,
@@ -2294,6 +2453,12 @@ function initializeSchema(db: SqliteDatabase, filePath: string): void {
   ensureExpandedColumns(db);
   seedBuiltinProviderCatalog(db);
   db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(2, nowIso());
+  if (collidingMainVersions.length > 0) {
+    const remove = db.prepare("DELETE FROM schema_migrations WHERE version = ?");
+    db.transaction(() => {
+      for (const version of collidingMainVersions) remove.run(version);
+    })();
+  }
   runSchemaMigrations(db, SCHEMA_MIGRATIONS);
   chmodPrivate(filePath);
 }
