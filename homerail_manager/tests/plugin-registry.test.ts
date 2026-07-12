@@ -192,6 +192,7 @@ describe("HomeRail plugin archive and activation registry", () => {
       manifest: {
         id: "com.homerail.pr-closeout",
         runtime: { trust: "data_only" },
+        kinds: [{ versions: [{ default_variant: "detail" }] }],
         tools: [{ id: "upsert_pr_closeout", handler: { type: "projection" } }],
         renderers: [{ id: "pr-closeout-main", source: { type: "builtin", id: "pr-closeout" } }],
       },

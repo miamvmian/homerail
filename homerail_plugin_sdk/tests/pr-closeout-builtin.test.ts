@@ -25,6 +25,7 @@ describe("PR Closeout builtin capability", () => {
         id: "com.homerail.pr-closeout",
         runtime: { trust: "data_only" },
         tools: [{ id: "upsert_pr_closeout", handler: { type: "projection" } }],
+        kinds: [{ versions: [{ default_variant: "detail" }] }],
         renderers: [{ id: "pr-closeout-main", source: { type: "builtin", id: "pr-closeout" } }],
       },
     });

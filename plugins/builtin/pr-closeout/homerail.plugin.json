@@ -59,7 +59,7 @@
           "content_schema": "pr-closeout-content-v1",
           "allowed_surfaces": ["task", "result"],
           "default_surface": "result",
-          "default_variant": "summary",
+          "default_variant": "detail",
           "max_content_bytes": 131072,
           "preferred_visuals": ["dashboard", "graph", "timeline", "matrix"],
           "fallback": "portable_required",
