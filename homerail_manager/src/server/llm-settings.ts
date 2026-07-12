@@ -207,6 +207,7 @@ function _settingCreateBody(b: Record<string, unknown>) {
       ? b.models as string[]
       : undefined,
     api_key: _requiredString(b, "api_key"),
+    reuse_existing_api_key: b.reuse_existing_api_key === true,
     display_name: _requiredString(b, "display_name") ?? _requiredString(b, "alias"),
     alias: _requiredString(b, "alias"),
     endpoint_id: _requiredString(b, "endpoint_id"),
@@ -434,7 +435,15 @@ export function llmSettingsRoutesHandler(
           _badRequest(res, "Missing required field: model_name");
           return;
         }
-        if (!parsed.api_key) {
+        if (parsed.api_key === "__reuse_existing__") {
+          _badRequest(res, "Reserved API key value: __reuse_existing__; use reuse_existing_api_key instead");
+          return;
+        }
+        if (parsed.api_key && parsed.reuse_existing_api_key) {
+          _badRequest(res, "api_key and reuse_existing_api_key are mutually exclusive");
+          return;
+        }
+        if (!parsed.api_key && !parsed.reuse_existing_api_key) {
           _badRequest(res, "Missing required field: api_key");
           return;
         }
@@ -444,7 +453,7 @@ export function llmSettingsRoutesHandler(
             ...parsed,
             provider_id: parsed.provider_id,
             model_name: parsed.model_name,
-            api_key: parsed.api_key,
+            api_key: parsed.api_key ?? "",
           });
           _created(res, "Setting created", _maskSetting(setting));
         } catch (err) {

@@ -211,6 +211,7 @@ async function handleSubmit(payload: ModelFormPayload): Promise<void> {
         tts_format: model.ttsFormat,
         tts_sample_rate: model.ttsSampleRate,
         api_key: payload.apiKey,
+        reuse_existing_api_key: payload.reuseExistingApiKey,
         is_default: payload.isDefault && index === 0,
         is_active: payload.isActive,
         ...model.capabilities

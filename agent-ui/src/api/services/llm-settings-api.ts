@@ -96,7 +96,8 @@ export interface CreateLLMSettingsRequest {
   tts_voice?: string
   tts_format?: string
   tts_sample_rate?: number
-  api_key: string
+  api_key?: string
+  reuse_existing_api_key?: boolean
   is_default?: boolean
   is_active?: boolean
   supports_llm?: boolean

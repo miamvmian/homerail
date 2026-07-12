@@ -75,6 +75,7 @@ export interface LLMSettingInput extends ModelCapabilities {
   /** 该凭证可用的模型列表（多模型凭证）。若提供，model_name 取第一个作为主模型。 */
   models?: string[];
   api_key: string;
+  reuse_existing_api_key?: boolean;
   display_name?: string;
   alias?: string;
   endpoint_id?: string;
@@ -1041,6 +1042,7 @@ export function updateProvider(id: string, patch: Partial<Omit<ProviderInput, "i
   if (_isReadonlyProvider(id) || findCatalogProvider(id)) {
     throw new Error(`Cannot update built-in provider: ${id}`);
   }
+  const previousEndpoint = _customEndpointForProvider(existing);
   const provider = upsertProvider({
     id,
     name: patch.name ?? existing.name,
@@ -1063,21 +1065,51 @@ export function updateProvider(id: string, patch: Partial<Omit<ProviderInput, "i
     supports_video_input: patch.supports_video_input ?? existing.supports_video_input,
   });
   const endpoint = _customEndpointForProvider(provider);
-  if (endpoint) {
+  if (endpoint && previousEndpoint) {
     const settings = _readSettings();
     let changed = false;
     const updatedAt = new Date().toISOString();
     for (const setting of settings) {
       if (setting.provider_id !== id) continue;
-      setting.base_url = endpoint.base_url;
-      setting.chat_completions_base_url = endpoint.chat_completions_base_url;
-      setting.responses_base_url = endpoint.responses_base_url;
-      setting.anthropic_base_url = endpoint.anthropic_base_url;
-      setting.voice_adapter = endpoint.voice_adapter;
-      setting.tts_http_url = endpoint.tts_http_url;
-      setting.tts_realtime_url = endpoint.tts_realtime_url;
-      setting.asr_realtime_url = endpoint.asr_realtime_url;
-      setting.asr_async_url = endpoint.asr_async_url;
+      if (setting.endpoint_id && setting.endpoint_id !== previousEndpoint.id) continue;
+      const inherited = <T>(current: T | undefined, previous: T | undefined, next: T | undefined) =>
+        current === undefined || current === previous ? next : current;
+      const nextValues = {
+        base_url: inherited(setting.base_url, previousEndpoint.base_url, endpoint.base_url),
+        chat_completions_base_url: inherited(
+          setting.chat_completions_base_url,
+          previousEndpoint.chat_completions_base_url,
+          endpoint.chat_completions_base_url,
+        ),
+        responses_base_url: inherited(
+          setting.responses_base_url,
+          previousEndpoint.responses_base_url,
+          endpoint.responses_base_url,
+        ),
+        anthropic_base_url: inherited(
+          setting.anthropic_base_url,
+          previousEndpoint.anthropic_base_url,
+          endpoint.anthropic_base_url,
+        ),
+        voice_adapter: inherited(setting.voice_adapter, previousEndpoint.voice_adapter, endpoint.voice_adapter),
+        tts_http_url: inherited(setting.tts_http_url, previousEndpoint.tts_http_url, endpoint.tts_http_url),
+        tts_realtime_url: inherited(
+          setting.tts_realtime_url,
+          previousEndpoint.tts_realtime_url,
+          endpoint.tts_realtime_url,
+        ),
+        asr_realtime_url: inherited(
+          setting.asr_realtime_url,
+          previousEndpoint.asr_realtime_url,
+          endpoint.asr_realtime_url,
+        ),
+        asr_async_url: inherited(setting.asr_async_url, previousEndpoint.asr_async_url, endpoint.asr_async_url),
+      };
+      const settingChanged = Object.entries(nextValues).some(
+        ([field, value]) => setting[field as keyof typeof nextValues] !== value,
+      );
+      if (!settingChanged) continue;
+      Object.assign(setting, nextValues);
       setting.updated_at = updatedAt;
       changed = true;
     }
@@ -1377,7 +1409,10 @@ export function createSetting(input: LLMSettingInput): LLMSetting {
   // 只复用同 credential/endpoint 的 key。Provider 相同但计费方式不同
   // （例如 Xiaomi API 计费 vs Token Plan）必须使用不同 key。
   // 占位标记 "local-no-key" 用于本地无鉴权服务，保持原行为不强制复用。
-  if (!input.api_key || input.api_key === "__reuse_existing__") {
+  if (input.api_key === "__reuse_existing__") {
+    throw new Error("Reserved API key value: __reuse_existing__; use reuse_existing_api_key instead");
+  }
+  if (input.reuse_existing_api_key) {
     const donor = settings.find(
       (s) =>
         s.provider_id === input.provider_id &&
@@ -1389,6 +1424,8 @@ export function createSetting(input: LLMSettingInput): LLMSetting {
       throw new Error("Missing required field: api_key (no existing key to reuse for this credential)");
     }
     input = { ...input, api_key: donor.api_key };
+  } else if (!input.api_key) {
+    throw new Error("Missing required field: api_key");
   } else if (input.api_key === "local-no-key") {
     // 本地服务无鉴权：允许空 key 占位通过
   }

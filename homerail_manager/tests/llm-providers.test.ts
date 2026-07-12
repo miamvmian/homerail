@@ -197,15 +197,28 @@ describe("custom LLM providers", () => {
     });
     expect(settingResponse.status).toBe(201);
 
+    const overrideResponse = await fetch(`http://127.0.0.1:${port}/api/llm/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider_id: "editable-provider",
+        model_name: "model-v2",
+        base_url: "http://model-override.test/v1",
+        api_key: "local-no-key",
+        supports_llm: true,
+      }),
+    });
+    expect(overrideResponse.status).toBe(201);
+
     const updateResponse = await fetch(`http://127.0.0.1:${port}/api/llm/providers/editable-provider`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         name: "Renamed Provider",
-        base_url: "http://provider.test/v1",
+        base_url: "http://provider-new.test/v1",
         voice_adapter: "openai_audio",
-        asr_async_url: "http://provider.test/v1/audio/transcriptions",
-        asr_realtime_url: "ws://provider.test/v1/realtime",
+        asr_async_url: "http://provider-new.test/v1/audio/transcriptions",
+        asr_realtime_url: "ws://provider-new.test/v1/realtime",
       }),
     });
     expect(updateResponse.status).toBe(200);
@@ -224,16 +237,19 @@ describe("custom LLM providers", () => {
       id: "editable-provider",
       name: "Renamed Provider",
       default_model: "model-v1",
-      base_url: "http://provider.test/v1",
+      base_url: "http://provider-new.test/v1",
       supports_asr: true,
-      asr_async_url: "http://provider.test/v1/audio/transcriptions",
-      asr_realtime_url: "ws://provider.test/v1/realtime",
+      asr_async_url: "http://provider-new.test/v1/audio/transcriptions",
+      asr_realtime_url: "ws://provider-new.test/v1/realtime",
     });
     expect(findActiveSetting("editable-provider", "model-v1")).toMatchObject({
-      base_url: "http://provider.test/v1",
+      base_url: "http://provider-new.test/v1",
       voice_adapter: "openai_audio",
-      asr_async_url: "http://provider.test/v1/audio/transcriptions",
-      asr_realtime_url: "ws://provider.test/v1/realtime",
+      asr_async_url: "http://provider-new.test/v1/audio/transcriptions",
+      asr_realtime_url: "ws://provider-new.test/v1/realtime",
+    });
+    expect(findActiveSetting("editable-provider", "model-v2")).toMatchObject({
+      base_url: "http://model-override.test/v1",
     });
   });
 
@@ -421,7 +437,7 @@ describe("custom LLM providers", () => {
         provider_id: "xiaomi",
         endpoint_id: "xiaomi_mimo_api",
         model_name: "mimo-v2.5-tts",
-        api_key: "__reuse_existing__",
+        reuse_existing_api_key: true,
         is_active: true,
         supports_llm: false,
         supports_tts: true,
@@ -437,7 +453,7 @@ describe("custom LLM providers", () => {
         provider_id: "xiaomi",
         endpoint_id: "xiaomi_mimo_token_plan",
         model_name: "mimo-v2.5-pro",
-        api_key: "__reuse_existing__",
+        reuse_existing_api_key: true,
         is_active: true,
       }),
     });
@@ -445,6 +461,20 @@ describe("custom LLM providers", () => {
     expect(tokenPlanResponse.status).toBe(400);
     expect(tokenPlanBody.success).toBe(false);
     expect(tokenPlanBody.error).toContain("no existing key to reuse for this credential");
+
+    const reservedSentinelResponse = await fetch(`http://127.0.0.1:${port}/api/llm/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider_id: "xiaomi",
+        endpoint_id: "xiaomi_mimo_api",
+        model_name: "mimo-reserved-key",
+        api_key: "__reuse_existing__",
+      }),
+    });
+    const reservedSentinelBody = await reservedSentinelResponse.json() as { error?: string };
+    expect(reservedSentinelResponse.status).toBe(400);
+    expect(reservedSentinelBody.error).toContain("Reserved API key value");
   });
 
   it("stores Doubao Speech API billing settings without returning plaintext API keys", async () => {

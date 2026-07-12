@@ -50,6 +50,7 @@ export interface ModelFormPayload {
   ttsFormat?: string
   ttsSampleRate?: number
   apiKey: string
+  reuseExistingApiKey: boolean
   isDefault: boolean
   isActive: boolean
   capabilities: ModelCapabilities
@@ -648,7 +649,8 @@ async function submit(): Promise<void> {
       ttsVoice: ep.tts_voice,
       ttsFormat: ep.tts_format,
       ttsSampleRate: ep.tts_sample_rate,
-      apiKey: reusingCredential.value ? '__reuse_existing__' : apiKey.value.trim(),
+      apiKey: reusingCredential.value ? '' : apiKey.value.trim(),
+      reuseExistingApiKey: reusingCredential.value,
       isDefault: isDefault.value,
       isActive: isActive.value,
       capabilities: effectiveCapabilities.value,

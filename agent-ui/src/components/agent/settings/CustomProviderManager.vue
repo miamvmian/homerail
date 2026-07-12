@@ -42,6 +42,7 @@ const supportsLlm = ref(true)
 const supportsAsr = ref(false)
 const supportsTts = ref(false)
 const deleteConfirmOpen = ref(false)
+const loadedDraftSignature = ref('')
 
 const customProviders = computed(() =>
   props.providers.filter(provider => provider.source === 'custom')
@@ -79,6 +80,29 @@ const defaultTtsStreamingUrl = computed(() => voiceEndpoint('audio/speech/stream
 const defaultAsrHttpUrl = computed(() => voiceEndpoint('audio/transcriptions'))
 const defaultAsrRealtimeUrl = computed(realtimeWsEndpoint)
 
+function draftSignature(): string {
+  return JSON.stringify({
+    providerId: providerId.value,
+    providerName: providerName.value,
+    defaultModel: defaultModel.value,
+    baseUrl: baseUrl.value,
+    chatCompletionsBaseUrl: chatCompletionsBaseUrl.value,
+    responsesBaseUrl: responsesBaseUrl.value,
+    anthropicBaseUrl: anthropicBaseUrl.value,
+    ttsHttpUrl: ttsHttpUrl.value,
+    ttsStreamingUrl: ttsStreamingUrl.value,
+    asrHttpUrl: asrHttpUrl.value,
+    asrRealtimeUrl: asrRealtimeUrl.value,
+    supportsLlm: supportsLlm.value,
+    supportsAsr: supportsAsr.value,
+    supportsTts: supportsTts.value
+  })
+}
+
+const isDirty = computed(
+  () => !creating.value && Boolean(loadedDraftSignature.value) && draftSignature() !== loadedDraftSignature.value
+)
+
 function normalizeVoiceBaseUrl(): void {
   if (!supportsLlm.value && (supportsAsr.value || supportsTts.value)) {
     baseUrl.value = voiceApiBase(baseUrl.value)
@@ -112,6 +136,7 @@ function loadProvider(provider: Provider): void {
   supportsTts.value = configuredModels.length
     ? configuredModels.some(setting => setting.supports_tts)
     : Boolean(provider.supports_tts)
+  loadedDraftSignature.value = draftSignature()
 }
 
 function startCreate(): void {
@@ -133,6 +158,7 @@ function startCreate(): void {
   supportsLlm.value = true
   supportsAsr.value = false
   supportsTts.value = false
+  loadedDraftSignature.value = draftSignature()
 }
 
 watch(
@@ -140,8 +166,8 @@ watch(
   ([providers]) => {
     if (createRequested.value) return
     const selected = providers.find(provider => provider.id === selectedId.value) ?? providers[0]
-    if (selected) loadProvider(selected)
-    else creating.value = true
+    if (selected && (selected.id !== selectedId.value || !isDirty.value)) loadProvider(selected)
+    else if (!selected) creating.value = true
   },
   { immediate: true }
 )
@@ -174,14 +200,18 @@ async function save(): Promise<void> {
     anthropic_base_url: anthropicBaseUrl.value.trim() || undefined,
     voice_adapter:
       supportsAsr.value || supportsTts.value ? ('openai_audio' as const) : ('custom' as const),
-    tts_http_url: supportsTts.value ? ttsHttpUrl.value.trim() || defaultTtsHttpUrl.value : '',
+    tts_http_url: supportsTts.value
+      ? ttsHttpUrl.value.trim() || defaultTtsHttpUrl.value
+      : undefined,
     tts_realtime_url: supportsTts.value
       ? ttsStreamingUrl.value.trim() || defaultTtsStreamingUrl.value
-      : '',
-    asr_async_url: supportsAsr.value ? asrHttpUrl.value.trim() || defaultAsrHttpUrl.value : '',
+      : undefined,
+    asr_async_url: supportsAsr.value
+      ? asrHttpUrl.value.trim() || defaultAsrHttpUrl.value
+      : undefined,
     asr_realtime_url: supportsAsr.value
       ? asrRealtimeUrl.value.trim() || defaultAsrRealtimeUrl.value
-      : '',
+      : undefined,
     status: 'active' as const,
     supports_llm: supportsLlm.value,
     supports_asr: supportsAsr.value,
@@ -196,6 +226,7 @@ async function save(): Promise<void> {
     creating.value = false
     createRequested.value = false
     selectedId.value = id
+    loadedDraftSignature.value = draftSignature()
     emit('refresh')
     emit('notice', t('settings.models.providers.saved'))
   } catch (error) {

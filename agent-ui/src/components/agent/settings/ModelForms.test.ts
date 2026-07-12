@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick, type App } from 'vue'
+import { createApp, defineComponent, h, nextTick, ref, type App } from 'vue'
 import { i18n } from '@/plugins/i18n'
 import type { LLMSetting } from '@/api/services/llm-settings-api'
 import type { Provider } from '@/api/types/orchestration-v2.types'
@@ -239,7 +239,8 @@ describe('model purpose forms', () => {
     await nextTick()
 
     expect(submitted?.modelName).toBe('second-chat-model')
-    expect(submitted?.apiKey).toBe('__reuse_existing__')
+    expect(submitted?.apiKey).toBe('')
+    expect(submitted?.reuseExistingApiKey).toBe(true)
   })
 
   it('uses a separate edit form with a read-only provider binding', async () => {
@@ -301,6 +302,29 @@ describe('model purpose forms', () => {
     })
   })
 
+  it('keeps an unsaved provider draft when unrelated settings refresh', async () => {
+    const settings = ref<LLMSetting[]>([customSetting])
+    const Wrapper = defineComponent({
+      setup: () => () =>
+        h(CustomProviderManager, {
+          providers: [customProvider],
+          settings: settings.value
+        })
+    })
+    const root = await mount(Wrapper, {})
+    const nameInput = Array.from(root.querySelectorAll<HTMLInputElement>('input')).find(
+      input => input.value === customProvider.name
+    )!
+
+    nameInput.value = 'Unsaved provider name'
+    nameInput.dispatchEvent(new Event('input'))
+    await nextTick()
+    settings.value = [{ ...customSetting, is_active: false }]
+    await nextTick()
+
+    expect(nameInput.value).toBe('Unsaved provider name')
+  })
+
   it('derives and saves HTTP and WebSocket endpoints for an ASR provider', async () => {
     const root = await mount(CustomProviderManager, {
       providers: [asrProvider],
@@ -334,5 +358,30 @@ describe('model purpose forms', () => {
         asr_realtime_url: 'ws://192.168.100.10:5002/v1/realtime'
       })
     )
+  })
+
+  it('keeps saved voice endpoints when a provider capability is disabled', async () => {
+    const root = await mount(CustomProviderManager, {
+      providers: [asrProvider],
+      settings: [asrSetting]
+    })
+    const capabilityButton = (name: string) =>
+      Array.from(root.querySelectorAll<HTMLButtonElement>('button')).find(
+        button => button.textContent?.trim() === name
+      )!
+
+    capabilityButton('LLM').click()
+    capabilityButton('ASR').click()
+    await nextTick()
+    Array.from(root.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === '保存')!
+      .click()
+    await nextTick()
+    await nextTick()
+
+    const payload = vi.mocked(agentSettingsApi.updateProvider).mock.calls.at(-1)?.[1]
+    expect(payload).toMatchObject({ supports_llm: true, supports_asr: false })
+    expect(payload?.asr_async_url).toBeUndefined()
+    expect(payload?.asr_realtime_url).toBeUndefined()
   })
 })
