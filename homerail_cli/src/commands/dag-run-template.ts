@@ -109,6 +109,7 @@ export async function resolvePrReviewInput(
     fetchImpl?: typeof fetch;
     env?: NodeJS.ProcessEnv;
     now?: Date;
+    apiBaseUrl?: string;
   } = {},
 ): Promise<ResolvedPrReviewInput> {
   const repo = optionalString(input.repo);
@@ -122,8 +123,10 @@ export async function resolvePrReviewInput(
   let author = optionalString(input.author);
   if (!base || !head) {
     const fetchImpl = options.fetchImpl ?? fetch;
-    const response = await fetchImpl(`https://api.github.com/repos/${repo}/pulls/${pr}`, {
-      headers: githubHeaders(options.env ?? process.env),
+    const env = options.env ?? process.env;
+    const apiBaseUrl = (options.apiBaseUrl ?? env.HOMERAIL_GITHUB_API_BASE_URL ?? "https://api.github.com").replace(/\/+$/, "");
+    const response = await fetchImpl(`${apiBaseUrl}/repos/${repo}/pulls/${pr}`, {
+      headers: githubHeaders(env),
     });
     if (!response.ok) throw new Error(`GitHub PR lookup failed: HTTP ${response.status}`);
     const data = await response.json() as Record<string, unknown>;

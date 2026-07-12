@@ -77,6 +77,23 @@ describe("PR Review run-template", () => {
     });
   });
 
+  it("resolves PR metadata through the configured GitHub Enterprise API", async () => {
+    const fetchImpl = vi.fn(async () => response({
+      base: { sha: "a".repeat(40) },
+      head: { sha: "b".repeat(40) },
+    }));
+
+    await resolvePrReviewInput(
+      { repo: "enterprise/homerail", pr: 8 },
+      { fetchImpl: fetchImpl as typeof fetch, env: { HOMERAIL_GITHUB_API_BASE_URL: "https://github.example/api/v3/" } },
+    );
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://github.example/api/v3/repos/enterprise/homerail/pulls/8",
+      expect.any(Object),
+    );
+  });
+
   it("syncs the tracked template and starts a run from structured input", async () => {
     const assetRoot = path.join(tmpDir, "asset");
     fs.mkdirSync(path.join(assetRoot, "orchestrations"), { recursive: true });
