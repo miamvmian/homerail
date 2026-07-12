@@ -6447,6 +6447,14 @@ function summarizeTask(value: string): string {
   -webkit-overflow-scrolling: touch;
 }
 
+.voice-card-grid > :deep(.generative-ui-canonical-surface) {
+  grid-column: span 3;
+}
+
+.voice-cockpit--phone-portrait .voice-card-grid > :deep(.generative-ui-canonical-surface) {
+  grid-column: span 1;
+}
+
 .voice-card-grid--status-active {
   grid-template-columns: none;
 }
@@ -8295,6 +8303,11 @@ function summarizeTask(value: string): string {
 }
 
 @media (max-width: 1024px) {
+  .voice-cockpit:not(.voice-cockpit--phone-landscape):not(.voice-cockpit--phone-portrait)
+    .voice-card-grid > :deep(.generative-ui-canonical-surface) {
+    grid-column: span 1;
+  }
+
   .voice-cockpit:not(.voice-cockpit--phone-landscape):not(.voice-cockpit--phone-portrait)
     .voice-card-grid {
     grid-template-columns: 1fr;

@@ -145,7 +145,7 @@ onMounted(() => { void refresh() })
           <input
             :data-testid="`agent-settings-plugin-toggle-${plugin.id}`"
             type="checkbox"
-            class="h-5 w-9 accent-cyan-300 disabled:cursor-not-allowed disabled:opacity-45"
+            class="peer sr-only"
             :aria-label="t('settings.plugins.toggleLabel', {
               name: plugin.name,
               state: plugin.enabled ? t('settings.plugins.enabled') : t('settings.plugins.disabled'),
@@ -154,6 +154,19 @@ onMounted(() => { void refresh() })
             :disabled="plugin.locked || loading || saving !== null"
             @change="toggle(plugin.id, ($event.target as HTMLInputElement).checked)"
           >
+          <span
+            aria-hidden="true"
+            class="relative inline-flex h-6 w-11 flex-none rounded-full border transition-colors duration-150 peer-focus-visible:ring-2 peer-focus-visible:ring-cyan-200/70 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-black"
+            :class="[
+              plugin.enabled ? 'border-cyan-200/60 bg-cyan-300/80' : 'border-white/20 bg-white/10',
+              plugin.locked || loading || saving !== null ? 'cursor-not-allowed opacity-45' : 'cursor-pointer',
+            ]"
+          >
+            <span
+              class="absolute top-1 h-4 w-4 rounded-full bg-white shadow-sm transition-transform duration-150"
+              :class="plugin.enabled ? 'translate-x-6' : 'translate-x-1'"
+            />
+          </span>
         </label>
       </article>
     </div>
