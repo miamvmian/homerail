@@ -5,7 +5,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RUNNER_BASE="${HOMERAIL_RUNNER_BASE:-$HOME/.homerail-runners}"
 HOME_BASE="${HOMERAIL_LIVE_HOME_BASE:-$RUNNER_BASE/homerail_home}"
 ARTIFACT_BASE="${HOMERAIL_LIVE_ARTIFACTS:-$RUNNER_BASE/artifacts}"
-MANAGER_PORT="${HOMERAIL_MANAGER_PORT:-}"
+PREFERRED_MANAGER_PORT="${HOMERAIL_MANAGER_PORT:-}"
 MODEL_BASE_URL="${HOMERAIL_PATTERN_MODEL_BASE_URL:-}"
 MODEL_NAME="${HOMERAIL_PATTERN_MODEL:-qwen3.6}"
 MODEL_MAC="${HOMERAIL_PATTERN_MODEL_MAC:-}"
@@ -15,18 +15,12 @@ AGENT_TYPE="${HOMERAIL_PATTERN_AGENT_TYPE:-claude-sdk}"
 RUN_KEY="${HOMERAIL_LIVE_RUN_KEY:-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}}"
 RUN_KEY="$(printf '%s' "$RUN_KEY" | tr -c 'A-Za-z0-9_.-' '-')"
 
-if [ -z "$MANAGER_PORT" ]; then
-  echo "HOMERAIL_MANAGER_PORT is required for live DAG validation." >&2
-  exit 1
-fi
 if [ -z "$MODEL_BASE_URL" ]; then
   echo "HOMERAIL_PATTERN_MODEL_BASE_URL is required for live DAG validation." >&2
   exit 1
 fi
 
 export HOMERAIL_HOME="$HOME_BASE/run-$RUN_KEY"
-export HOMERAIL_MANAGER_PORT="$MANAGER_PORT"
-export HOMERAIL_MANAGER_URL="http://127.0.0.1:$MANAGER_PORT"
 export HOMERAIL_PATTERN_MODEL="$MODEL_NAME"
 export HOMERAIL_PATTERN_MODEL_PROTOCOL="$MODEL_PROTOCOL"
 export HOMERAIL_PATTERN_AGENT_TYPE="$AGENT_TYPE"
@@ -113,6 +107,33 @@ wait_for_model() {
   return 1
 }
 
+port_is_available() {
+  local port="$1"
+  ! ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .
+}
+
+select_manager_port() {
+  local preferred="$1"
+  local start offset candidate
+  if [[ "$preferred" =~ ^[0-9]+$ ]] \
+    && [ "$preferred" -ge 20000 ] \
+    && [ "$preferred" -le 29999 ] \
+    && port_is_available "$preferred"; then
+    printf '%s\n' "$preferred"
+    return 0
+  fi
+
+  start=$((20000 + $(printf '%s' "$RUN_KEY" | cksum | awk '{print $1}') % 10000))
+  for offset in $(seq 0 9999); do
+    candidate=$((20000 + (start - 20000 + offset) % 10000))
+    if port_is_available "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 wake_model() {
   if [ -z "$MODEL_MAC" ]; then
     echo "Model host is offline and HOMERAIL_PATTERN_MODEL_MAC is not configured." >&2
@@ -147,18 +168,24 @@ if ! wait_for_model 6 5; then
   fi
 fi
 
-if curl -fsS --max-time 3 "$HOMERAIL_MANAGER_URL/health" >/dev/null 2>&1 \
-  || ss -H -ltn "sport = :$MANAGER_PORT" | grep -q .; then
-  echo "Runner Manager port $MANAGER_PORT is already serving another process; refusing to interfere." >&2
-  exit 1
-fi
-
 echo "Building isolated worker image $HOMERAIL_WORKER_IMAGE"
 docker build \
   --label "org.homerail.live_run=$RUN_KEY" \
   -t "$HOMERAIL_WORKER_IMAGE" \
   -f "$REPO_ROOT/homerail_worker/Dockerfile" \
   "$REPO_ROOT"
+
+if ! MANAGER_PORT="$(select_manager_port "$PREFERRED_MANAGER_PORT")"; then
+  echo "No free Runner Manager port is available in the 20000-29999 range." >&2
+  exit 1
+fi
+export HOMERAIL_MANAGER_PORT="$MANAGER_PORT"
+export HOMERAIL_MANAGER_URL="http://127.0.0.1:$MANAGER_PORT"
+if [ -n "$PREFERRED_MANAGER_PORT" ] && [ "$MANAGER_PORT" != "$PREFERRED_MANAGER_PORT" ]; then
+  echo "Preferred Runner Manager port $PREFERRED_MANAGER_PORT is busy; using isolated port $MANAGER_PORT."
+else
+  echo "Using isolated Runner Manager port $MANAGER_PORT."
+fi
 
 node "$REPO_ROOT/homerail_cli/dist/cli.js" start --host 0.0.0.0 --no-build-worker-image
 SETTING_ID="$(node "$REPO_ROOT/scripts/configure-live-pattern-model.mjs")"
