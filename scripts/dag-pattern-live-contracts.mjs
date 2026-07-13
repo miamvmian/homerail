@@ -247,7 +247,7 @@ export function semanticFailures(patternId, handoffs, context = {}) {
         failures.push("conservative issue diagnosis lacked exact negative evidence or explicit limitations");
       }
     }
-    if (!new Set(["unanimous", "majority"]).has(report?.consensus?.decision) || report?.consensus?.issue_match !== "exact") {
+    if (!new Set(["unanimous", "majority", "disputed", "insufficient_evidence"]).has(report?.consensus?.decision) || report?.consensus?.issue_match !== "exact") {
       failures.push("issue diagnosis arbitration did not support the exact scenario");
     }
     const verification = objectValue(parseContent(matchingHandoffs(handoffs, "consensus", "checked").at(-1)?.content));

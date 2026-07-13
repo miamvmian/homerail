@@ -237,7 +237,7 @@ export function createIssueDiagnosisPattern(
 
   return {
     id: "issue-diagnosis",
-    version: "2.19.0",
+    version: "2.20.0",
     name: "Issue Diagnosis",
     summary: "Diagnose one issue through three independent investigations, explicit arbitration, and unanimous verification.",
     intent: "Produce a revision-pinned diagnostic artifact whose scenario match, evidence, and alternatives survive independent consensus before any platform write-back.",
@@ -758,7 +758,8 @@ export function createIssueDiagnosisPattern(
               nativeToolDiscipline,
               "Aggregate exactly three VerificationVote inputs for the arbitrated report without using files, shell, network, or any tool except handoff.",
               "Copy the three vote objects exactly into votes in reviewer order scenario, evidence, adversarial.",
-              "Use verdict=pass only when all three distinct reviewers vote pass, none reports issue_match=mismatch or unknown, every checked_revision equals report.tested_revision, and report.consensus.decision is neither disputed nor insufficient_evidence.",
+              "Use verdict=pass only when all three distinct reviewers vote pass, none reports issue_match=mismatch or unknown, and every checked_revision equals report.tested_revision.",
+              "The three independent verification votes are the final acceptance authority. Do not reject solely because report.consensus.decision is disputed or insufficient_evidence when all three votes pass; the report must preserve that earlier disagreement transparently.",
               "A report outcome of not_reproduced does not itself imply mismatch; issue_match remains about scenario identity.",
               "Otherwise use fail and enumerate every dissent, mismatch, revision disagreement, missing reviewer, or invalid report consensus in defects.",
               "The first and only tool call must handoff on port checked with exactly six top-level keys and no prose:",

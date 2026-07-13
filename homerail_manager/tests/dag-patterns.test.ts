@@ -171,6 +171,8 @@ describe("built-in DAG patterns", () => {
     expect(pattern.parsed.meta.agents.evidence_verifier?.system).toContain("stop exploring duplicate medium/low evidence");
     expect(pattern.parsed.meta.agents.adversarial_verifier?.system).toContain("strongest competing hypothesis");
     expect(pattern.parsed.meta.agents.consensus?.system).toContain("all three distinct reviewers vote pass");
+    expect(pattern.parsed.meta.agents.consensus?.system).toContain("final acceptance authority");
+    expect(pattern.parsed.meta.agents.consensus?.system).toContain("Do not reject solely");
     expect(validateJsonContract(contracts?.IssueDiagnosisRequest, request)).toMatchObject({ valid: true });
     expect(validateJsonContract(contracts?.IssueDiagnosisRequest, {
       ...request,

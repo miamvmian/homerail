@@ -156,6 +156,11 @@ test("requires a complete independently verified issue diagnosis", () => {
     consensus: { ...report.consensus, decision: "majority" },
   };
   assert.deepEqual(semanticFailures("issue-diagnosis", handoffs), []);
+  handoffs[2].content = {
+    ...report,
+    consensus: { ...report.consensus, decision: "disputed" },
+  };
+  assert.deepEqual(semanticFailures("issue-diagnosis", handoffs), []);
   handoffs[2].content = report;
   handoffs[2].content = { ...report, tested_revision: "main" };
   assert.match(semanticFailures("issue-diagnosis", handoffs).join(";"), /exact requested full commit revision/);

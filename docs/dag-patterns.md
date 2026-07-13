@@ -205,7 +205,10 @@ evidence, but cannot add evidence. Scenario-match, evidence-integrity, and
 adversarial verifiers subsequently inspect the arbitrated report in parallel.
 The success terminal requires all three verification votes to pass at the same
 revision; one dissent routes the run to review instead of accepting a plausible
-but wrong diagnosis.
+but wrong diagnosis. Those three independent verification votes are the final
+acceptance authority: a transparently preserved `disputed` or
+`insufficient_evidence` arbitration label does not by itself fail a report that
+all three verifiers independently pass.
 
 Top-level handoff objects and machine-facing decision fields remain strict.
 Nested findings, evidence, and tests keep their causal fields while allowing
