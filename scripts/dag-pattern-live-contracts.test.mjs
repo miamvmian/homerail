@@ -11,11 +11,11 @@ import {
   semanticRequirements,
 } from "./dag-pattern-live-contracts.mjs";
 
-test("covers the complete ten-pattern catalog", () => {
+test("covers the complete eleven-pattern catalog", () => {
   const catalog = EXPECTED_PATTERN_IDS.map((id) => ({ id, name: id }));
   assert.deepEqual(catalogCoverageFailures(catalog), []);
-  assert.equal(Object.keys(prompts).length, 10);
-  assert.equal(Object.keys(semanticRequirements).length, 10);
+  assert.equal(Object.keys(prompts).length, 11);
+  assert.equal(Object.keys(semanticRequirements).length, 11);
   assert.deepEqual(JSON.parse(prompts["trust-ledger"]).acceptance_criteria, [
     "top-level evidence equals synthetic bounded check completed",
   ]);
@@ -74,6 +74,49 @@ test("requires real advisor and durable approval evidence", () => {
     approval: { status: "approved", actor: "live-validator", proposal_hash: "abc" },
   }), []);
   assert.match(semanticFailures("compost", compostHandoffs, {})[0], /approval/);
+});
+
+test("requires a complete independently verified issue diagnosis", () => {
+  const report = {
+    schema_version: "2.0",
+    issue_id: "live-synthetic",
+    outcome: "not_reproduced",
+    tested_revision: "0123456789abcdef",
+    consensus: { decision: "unanimous", issue_match: "exact" },
+    findings: [],
+    evidence: [{ id: "arbiter-e001" }],
+    tests: [],
+    recommendations: [],
+    limitations: [],
+  };
+  const votes = ["scenario", "evidence", "adversarial"].map((reviewer_id) => ({
+    reviewer_id,
+    verdict: "pass",
+    issue_match: "exact",
+    checked_revision: report.tested_revision,
+    checked_evidence_ids: ["arbiter-e001"],
+    evidence: ["checked"],
+    defects: [],
+  }));
+  const verification = {
+    verdict: "pass",
+    policy: "unanimous-three-reviewers",
+    checked_revision: report.tested_revision,
+    votes,
+    evidence: ["unanimous"],
+    defects: [],
+  };
+  const handoffs = [
+    { from_node: "arbitrate", port: "reported", content: report },
+    { from_node: "verify_scenario", port: "voted", content: votes[0] },
+    { from_node: "verify_evidence", port: "voted", content: votes[1] },
+    { from_node: "verify_adversarial", port: "voted", content: votes[2] },
+    { from_node: "consensus", port: "checked", content: verification },
+    { from_node: "consensus_gate", port: "accepted", content: verification },
+  ];
+  assert.deepEqual(semanticFailures("issue-diagnosis", handoffs), []);
+  handoffs[4].content = { ...verification, verdict: "fail" };
+  assert.match(semanticFailures("issue-diagnosis", handoffs).join(";"), /verification/);
 });
 
 test("requires adjacent Manager-owned ratchet measurements", () => {

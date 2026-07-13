@@ -16,6 +16,7 @@ describe("built-in DAG patterns", () => {
 
     expect(patterns.map((pattern) => pattern.id)).toEqual([
       "heartbeat",
+      "issue-diagnosis",
       "orchestrator-workers",
       "executor-advisor",
       "budget-gate",
@@ -38,6 +39,226 @@ describe("built-in DAG patterns", () => {
       expect(pattern.node_count).toBeGreaterThan(1);
       expect(pattern.source).toEqual(DAG_PATTERN_SOURCE);
     }
+  });
+
+  it("keeps issue diagnosis platform-neutral, read-only, and contract driven", () => {
+    const pattern = instantiateDAGPattern("issue-diagnosis");
+    const spec = pattern.workflow.spec as Record<string, unknown>;
+    const nodes = spec.nodes as Record<string, Record<string, unknown>>;
+    const contracts = pattern.parsed.meta.contracts;
+    const request = {
+      issue: {
+        id: "local-17",
+        title: "Heartbeat pattern appears to be missing",
+        body: "Check the built-in catalog at the supplied revision.",
+        source: "manual",
+        discussion: [{ author: "reporter", body: "The catalog response did not show heartbeat." }],
+      },
+      target: {
+        repository_url: "https://example.test/owner/repository",
+        revision: "main",
+      },
+      constraints: {
+        max_test_seconds: 120,
+        focus_paths: ["homerail_manager/src/orchestration/dag-patterns.ts"],
+      },
+    };
+
+    expect(spec.triggers).toBeUndefined();
+    expect(spec.workspace).toEqual({ mode: "shared" });
+    expect(spec.artifacts).toEqual([
+      expect.objectContaining({ name: "diagnosis.json", contract: "DiagnosisReport", required: true, publish: "always" }),
+      expect.objectContaining({ name: "verification.json", contract: "ConsensusVerification", required: true, publish: "always" }),
+    ]);
+    expect(pattern.parsed.meta.artifacts).toEqual([
+      expect.objectContaining({ name: "diagnosis.json", media_type: "application/json" }),
+      expect.objectContaining({ name: "verification.json", media_type: "application/json" }),
+    ]);
+    expect(Object.values(nodes).map((node) => node.kind)).toEqual([
+      "agent",
+      "agent",
+      "agent",
+      "agent",
+      "agent",
+      "agent",
+      "agent",
+      "agent",
+      "agent",
+      "agent",
+      "condition",
+      "terminal",
+      "terminal",
+    ]);
+    expect(nodes.prepare_repository?.workspace_access).toMatchObject({ writable_paths: ["source"] });
+    expect(nodes.prepare_repository?.depends_on).toEqual(["triage"]);
+    expect(nodes.review_reproduction?.workspace_access).toMatchObject({
+      writable_paths: ["scratch/reproduction"],
+      readonly_paths: ["source"],
+    });
+    expect(nodes.review_dataflow?.depends_on).toEqual(["review_reproduction"]);
+    expect(nodes.review_history?.depends_on).toEqual(["review_reproduction"]);
+    for (const nodeId of ["review_dataflow", "review_history", "verify_scenario", "verify_evidence", "verify_adversarial"]) {
+      expect(nodes[nodeId]?.workspace_access).toMatchObject({ writable_paths: [], readonly_paths: ["source"] });
+    }
+    expect(nodes.consensus_gate?.config).toMatchObject({
+      field: "verdict",
+      routes: { pass: "accepted", fail: "rejected" },
+      default: "rejected",
+    });
+    expect((spec.policies as Record<string, unknown>).max_parallelism).toBe(3);
+    expect((spec.policies as Record<string, unknown>).max_corrections_per_node).toBe(5);
+    expect(pattern.parsed.meta.agents.repository_preparer?.system).toContain("Do not inspect issue URLs");
+    expect(pattern.parsed.meta.agents.repository_preparer?.system).toContain("read credentials");
+    expect(pattern.parsed.meta.agents.repository_preparer?.system).toContain("without a shallow-depth assumption");
+    expect(pattern.parsed.meta.agents.triage?.system).toContain("exactly five top-level keys");
+    expect(pattern.parsed.meta.agents.triage?.system).toContain("stated_facts");
+    expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("at least two materially different state variants");
+    expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("copy source to scratch/reproduction/source");
+    expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("never run npm install");
+    expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("unbuilt local workspace package");
+    expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("failing-case/control pair");
+    expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("history reviewer owns that work");
+    expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("type=test, http, or runtime");
+    expect(pattern.parsed.meta.agents.history_reviewer?.system).toContain("pseudo-tool text does not execute");
+    expect(pattern.parsed.meta.agents.dataflow_reviewer?.system).toContain("caller or UI payload");
+    expect(pattern.parsed.meta.agents.dataflow_reviewer?.system).toContain("at most sixteen tool calls");
+    expect(pattern.parsed.meta.agents.dataflow_reviewer?.system).toContain("regression archaeology belongs to the history reviewer");
+    expect(pattern.parsed.meta.agents.dataflow_reviewer?.system).toContain("Do not run package managers");
+    expect(pattern.parsed.meta.agents.history_reviewer?.system).toContain("parent-versus-current");
+    expect(pattern.parsed.meta.agents.history_reviewer?.system).toContain("three phases only");
+    expect(pattern.parsed.meta.agents.history_reviewer?.system).toContain("never emit a prose summary");
+    expect(pattern.parsed.meta.agents.history_reviewer?.system).toContain("Never clone another checkout");
+    expect(pattern.parsed.meta.agents.arbiter?.system).toContain("different scenarios");
+    expect(pattern.parsed.meta.agents.scenario_verifier?.system).toContain("user's exact scenario");
+    expect(pattern.parsed.meta.agents.scenario_verifier?.system).toContain("scratch/reproduction/source");
+    expect(pattern.parsed.meta.agents.evidence_verifier?.system).toContain("wrong locator");
+    expect(pattern.parsed.meta.agents.evidence_verifier?.system).toContain("at most sixteen tool calls");
+    expect(pattern.parsed.meta.agents.evidence_verifier?.system).toContain("stop exploring duplicate medium/low evidence");
+    expect(pattern.parsed.meta.agents.adversarial_verifier?.system).toContain("strongest competing hypothesis");
+    expect(pattern.parsed.meta.agents.consensus?.system).toContain("all three distinct reviewers vote pass");
+    expect(validateJsonContract(contracts?.IssueDiagnosisRequest, request)).toMatchObject({ valid: true });
+    expect(validateJsonContract(contracts?.IssueDiagnosisRequest, {
+      ...request,
+      target: { ...request.target, token: "must-not-be-accepted" },
+    })).toMatchObject({ valid: false });
+    expect(validateJsonContract(contracts?.IssueDiagnosisRequest, {
+      ...request,
+      target: { repository_url: "git@example.test:owner/repository", revision: "main" },
+    })).toMatchObject({ valid: false });
+    expect(validateJsonContract(contracts?.IssueDiagnosisRequest, {
+      ...request,
+      target: { repository_url: "https://user:secret@example.test/owner/repository", revision: "main" },
+    })).toMatchObject({ valid: false });
+    expect(validateJsonContract(
+      contracts?.DiagnosticPlan,
+      JSON.stringify({ scope: "same-key ASR to TTS", hypotheses: ["contract drift", "provider error"] }),
+    )).toMatchObject({ valid: true });
+    expect(validateJsonContract(contracts?.DiagnosticPlan, {
+      scope: "same-key ASR to TTS",
+      checks: [{ id: "check-tts-validation-logic", objective: "Compare the caller and server contracts" }],
+    })).toMatchObject({ valid: true });
+    expect(validateJsonContract(contracts?.DiagnosticPlan, 17)).toMatchObject({ valid: false });
+    expect(validateJsonContract(contracts?.RepositoryPreparation, {
+      status: "prepared",
+      tested_revision: "0123456789012345678901234567890123456789",
+      source_path: "source",
+      evidence: { command: "git rev-parse HEAD", result: "matched" },
+    })).toMatchObject({ valid: true });
+
+    const report = {
+      schema_version: "2.0",
+      issue_id: "local-17",
+      outcome: "not_reproduced",
+      summary: "The claimed absence was not reproduced.",
+      tested_revision: "0123456789012345678901234567890123456789",
+      consensus: {
+        decision: "unanimous",
+        issue_match: "exact",
+        supporting_review_ids: ["reproduction", "dataflow", "history"],
+        dissenting_review_ids: [],
+        rationale: "All three reviews found heartbeat at the supplied revision.",
+        review_summaries: ["reproduction", "dataflow", "history"].map((reviewer_id) => ({
+          reviewer_id,
+          issue_match: "exact",
+          reproduction: "not_reproduced",
+          position: "support",
+          summary: "Heartbeat is registered at the tested revision.",
+        })),
+      },
+      root_cause: { status: "unknown", explanation: "The pattern is present at this revision.", evidence_ids: ["arbiter-e001"] },
+      findings: [{ id: "arbiter-f001", severity: "info", claim: "Heartbeat is present.", evidence_ids: ["arbiter-e001"] }],
+      evidence: [{ id: "arbiter-e001", type: "source", locator: "dag-patterns.ts:heartbeat", observation: "The catalog registers heartbeat." }],
+      tests: [{ command: "targeted catalog test", status: "passed", summary: "The catalog test includes heartbeat." }],
+      recommendations: [{ priority: "next", action: "Verify the caller's revision.", rationale: "The supplied revision is healthy." }],
+      limitations: [],
+      confidence: "high",
+    };
+    expect(validateJsonContract(contracts?.DiagnosisReport, report)).toMatchObject({ valid: true });
+    expect(validateJsonContract(contracts?.DiagnosisReport, {
+      ...report,
+      consensus: {
+        ...report.consensus,
+        review_summaries: {
+          reproduction: "Same causal chain, behavioral evidence pending.",
+          dataflow: "Caller/server mismatch confirmed.",
+          history: "Regression commit identified.",
+        },
+      },
+      root_cause: {
+        mechanism: "The caller sends a retired key-reuse sentinel.",
+        introduced_in: "e2ad824",
+      },
+      recommendations: [{ priority: "P0", fix: "Migrate onboarding to the boolean reuse field." }],
+    })).toMatchObject({ valid: true });
+    expect(validateJsonContract(contracts?.DiagnosisReport, { ...report, platform_comment_id: "write-back" }))
+      .toMatchObject({ valid: false });
+    expect(validateJsonContract(contracts?.DiagnosisReport, {
+      ...report,
+      outcome: "confirmed",
+    })).toMatchObject({ valid: false });
+    expect(validateJsonContract(contracts?.VerificationVote, {
+      reviewer_id: "scenario",
+      verdict: "pass",
+      issue_match: "exact",
+      checked_revision: "0123456789012345678901234567890123456789",
+      checked_evidence_ids: ["repro-e001"],
+      evidence: [{ locator: "OnboardingStepForm.vue:345", result: "matched" }],
+      defects: [],
+    })).toMatchObject({ valid: true });
+    const reviewWithScalarLimitation = {
+      reviewer_id: "reproduction",
+      tested_revision: "0123456789012345678901234567890123456789",
+      issue_match: "exact",
+      reproduction: "confirmed",
+      hypothesis: "The caller sends a retired sentinel.",
+      root_cause: { status: "identified", explanation: "Caller and server contracts differ.", evidence_ids: ["repro-e001"] },
+      findings: [{ id: "repro-f001", severity: "high", claim: "The request is rejected.", evidence_ids: ["repro-e001"] }],
+      evidence: [{ id: "repro-e001", type: "http", locator: "POST /api/llm-settings", observation: "Returned 400." }],
+      tests: [{ command: "focused request test", status: "passed", summary: "Failing and control variants diverged." }],
+      limitations: "The browser toast was not captured.",
+      confidence: "high",
+    };
+    expect(validateJsonContract(contracts?.IndependentReview, reviewWithScalarLimitation))
+      .toMatchObject({ valid: true });
+    expect(validateJsonContract(contracts?.IndependentReview, {
+      ...reviewWithScalarLimitation,
+      evidence: [{
+        id: "repro-e001",
+        type: "source",
+        locator: "agent-ui/src/component.ts:17",
+        observation: "Source inspection only.",
+      }],
+    })).toMatchObject({ valid: false });
+    expect(validateJsonContract(contracts?.IndependentReview, {
+      ...reviewWithScalarLimitation,
+      reproduction: "inconclusive",
+      evidence: [{
+        id: "repro-e001",
+        type: "source",
+        locator: "agent-ui/src/component.ts:17",
+        observation: "Source inspection only.",
+      }],
+    })).toMatchObject({ valid: true });
   });
 
   it("exposes Executor-Advisor as a bounded callable advisor topology", () => {

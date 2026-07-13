@@ -165,6 +165,7 @@ hashes still apply.
 | Pattern | Invariant |
 | --- | --- |
 | `heartbeat` | Cheap quiet exit, one selected action, independent verdict. |
+| `issue-diagnosis` | One pinned revision, three independent investigations, explicit arbitration, and unanimous three-role verification. |
 | `orchestrator-workers` | One planner, independent workers, aggregate, fresh verifier. |
 | `executor-advisor` | One executor retains context and consults a bounded advisor only at ambiguity boundaries. |
 | `budget-gate` | Explicit budget admission before expensive work. |
@@ -174,6 +175,78 @@ hashes still apply.
 | `sparring` | Breaker, builder, and verifier remain separate. |
 | `ratchet` | Bounded measured attempts until a target or exhaustion. |
 | `compost` | Repeated failures become bounded proposals behind human review. |
+
+`issue-diagnosis` is deliberately an on-demand diagnostic workflow, not an
+issue-tracker bot. Its strict input contract accepts a platform-neutral issue
+snapshot plus a credential-free HTTPS repository URL and revision. It emits a
+versioned `DiagnosisReport` containing the tested revision, outcome, root-cause
+assessment, findings, evidence, test results, recommendations, limitations,
+confidence, and the agreement or dissent among the independent reviews.
+
+Pure input triage completes first, then one repository-preparation node checks
+out the revision once. This ordering prevents the shared-workspace clone from
+being attributed to the triage node's policy snapshot. The reproduction
+reviewer then copies the tree into its private `scratch/reproduction/source`
+path for focused tests. After that sole writer finishes, the caller-to-server
+data-flow and regression-history reviewers run in parallel against read-only
+`source`. They receive only completion dependencies, never the reproduction
+conclusion, so the reviews remain independent without cross-reviewer snapshot
+races; no node writes back to the remote repository.
+An arbiter may report
+unanimous agreement, a non-contradictory majority, a dispute, or insufficient
+evidence, but cannot add evidence. Scenario-match, evidence-integrity, and
+adversarial verifiers subsequently inspect the arbitrated report in parallel.
+The success terminal requires all three verification votes to pass at the same
+revision; one dissent routes the run to review instead of accepting a plausible
+but wrong diagnosis.
+
+Top-level handoff objects and machine-facing decision fields remain strict.
+Nested findings, evidence, and tests keep their causal fields while allowing
+extra metadata. Root-cause detail, reviewer summaries, and recommendation items
+are deliberately extensible JSON because the independent verification stage,
+not harmless wording such as `support` versus `supporting`, decides whether the
+diagnosis is trustworthy.
+Verification verdicts, checked evidence IDs, revision, issue match, and defects
+stay strict; the explanatory `evidence` notes may be strings or structured
+objects because consensus does not branch on their presentation.
+
+The run
+publishes `diagnosis.json` and `verification.json` as fixed, contract-validated
+artifacts. Retrieve them without any issue-specific command:
+
+```bash
+hr dag artifacts <run-id>
+hr dag artifact <run-id> diagnosis.json --output diagnosis.json
+```
+
+The workflow
+has no trigger, provider binding, platform API, comment write-back, or secret
+field. Those integrations can consume the verified report later without
+changing this diagnostic core.
+
+```json
+{
+  "issue": {
+    "id": "manual-17",
+    "title": "Observed failure",
+    "body": "Reproduction details supplied by the reporter",
+    "discussion": [
+      {
+        "author": "reporter",
+        "body": "State, ordering, provider, and whether an existing credential was reused"
+      }
+    ]
+  },
+  "target": {
+    "repository_url": "https://example.test/owner/repository",
+    "revision": "0123456789abcdef"
+  },
+  "constraints": {
+    "max_test_seconds": 300,
+    "focus_paths": ["src/component.ts"]
+  }
+}
+```
 
 List and inspect the live catalog:
 

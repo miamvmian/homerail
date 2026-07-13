@@ -1,5 +1,6 @@
 import YAML from "yaml";
 
+import { createIssueDiagnosisPattern } from "./issue-diagnosis-pattern.js";
 import { assertGraphValid, validateGraph, type GraphValidationResult } from "./graph-validator.js";
 import type { ParsedDAG } from "./graph.js";
 import { assertRuntimeGraphParity } from "./runtime-graph-parity.js";
@@ -172,6 +173,8 @@ const heartbeat: DAGPatternDefinition = {
     },
   },
 };
+
+const issueDiagnosis = createIssueDiagnosisPattern(DAG_PATTERN_SOURCE);
 
 const orchestratorWorkers: DAGPatternDefinition = {
   id: "orchestrator-workers",
@@ -867,6 +870,7 @@ const compost: DAGPatternDefinition = {
 
 const definitions = [
   heartbeat,
+  issueDiagnosis,
   orchestratorWorkers,
   executorAdvisor,
   budgetGate,

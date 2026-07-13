@@ -1,5 +1,6 @@
 export const EXPECTED_PATTERN_IDS = [
   "heartbeat",
+  "issue-diagnosis",
   "orchestrator-workers",
   "executor-advisor",
   "budget-gate",
@@ -59,6 +60,29 @@ export const prompts = {
     instruction: "Select one bounded synthetic action and preserve the exact check_command in the conductor work order.",
     check_command: passCommand,
   }),
+  "issue-diagnosis": JSON.stringify({
+    issue: {
+      id: "live-synthetic",
+      title: "Heartbeat is missing from the built-in pattern catalog",
+      body: "The reporter claims homerail_manager/src/orchestration/dag-patterns.ts does not register a heartbeat pattern. Check the exact requested revision and determine whether this claim reproduces. Use only bounded source inspection and the smallest relevant test.",
+      source: "live-validator",
+      discussion: [{
+        author: "live-validator",
+        body: "This is the built-in catalog path, not a custom pattern or a stale generated file. Check current main and the focused catalog test.",
+      }],
+    },
+    target: {
+      repository_url: "https://github.com/xiaotianfotos/homerail",
+      revision: "main",
+    },
+    constraints: {
+      max_test_seconds: 300,
+      focus_paths: [
+        "homerail_manager/src/orchestration/dag-patterns.ts",
+        "homerail_manager/tests/dag-patterns.test.ts",
+      ],
+    },
+  }),
   "orchestrator-workers": "Topology-only validation. Do not inspect files, shell, network, or external systems. Create exactly three execution work_items and no verifier/reviewer item: check id equals sample-1, count equals 2, and status equals ready for the record {id:sample-1,count:2,status:ready}. Give every item concrete acceptance_criteria. Every worker must report top-level status using exactly success or failed plus top-level evidence; never use pass/fail as status values. The existing downstream verifier confirms all three results and hands off verified.",
   "executor-advisor": "Use the declared advisor_id expert exactly once to decide whether signed audit records should use canonical JSON or ordinary JSON. Continue in the same executor turn after advice and hand off done with consulted_advisor=true, advisor_id=expert, a decision, and two constraints.",
   "budget-gate": JSON.stringify({ task: "Immediately hand off completed with exactly {usage:1,evidence:'synthetic bounded check completed'}. Do not call any other tool.", expected_usage: 1 }),
@@ -93,6 +117,14 @@ export const semanticRequirements = {
     { node: "signal_gate", port: "act" },
     { node: "verdict_gate", port: "check" },
     { node: "deterministic_check", port: "passed" },
+  ],
+  "issue-diagnosis": [
+    { node: "arbitrate", port: "reported" },
+    { node: "verify_scenario", port: "voted" },
+    { node: "verify_evidence", port: "voted" },
+    { node: "verify_adversarial", port: "voted" },
+    { node: "consensus", port: "checked" },
+    { node: "consensus_gate", port: "accepted" },
   ],
   "orchestrator-workers": [
     { node: "fanout", port: "passed" },
@@ -167,6 +199,36 @@ export function semanticFailures(patternId, handoffs, context = {}) {
     const aggregate = objectValue(parseContent(matchingHandoffs(handoffs, "fanout", "passed").at(-1)?.content));
     if (aggregate?.total !== 3 || aggregate?.successes !== 3 || aggregate?.failures !== 0) {
       failures.push("dynamic fan-out did not complete exactly three successful worker items");
+    }
+  }
+  if (patternId === "issue-diagnosis") {
+    const report = objectValue(parseContent(matchingHandoffs(handoffs, "arbitrate", "reported").at(-1)?.content));
+    if (report?.schema_version !== "2.0" || report?.issue_id !== "live-synthetic") {
+      failures.push("issue diagnosis did not emit the expected versioned report identity");
+    }
+    if (report?.outcome !== "not_reproduced") {
+      failures.push(`issue diagnosis expected not_reproduced, observed ${String(report?.outcome)}`);
+    }
+    if (typeof report?.tested_revision !== "string" || report.tested_revision.length < 7) {
+      failures.push("issue diagnosis did not record a tested revision");
+    }
+    for (const field of ["findings", "evidence", "tests", "recommendations", "limitations"]) {
+      if (!Array.isArray(report?.[field])) failures.push(`issue diagnosis report is missing ${field}`);
+    }
+    if (report?.consensus?.decision !== "unanimous" || report?.consensus?.issue_match !== "exact") {
+      failures.push("issue diagnosis arbitration was not unanimous for the exact scenario");
+    }
+    const verification = objectValue(parseContent(matchingHandoffs(handoffs, "consensus", "checked").at(-1)?.content));
+    const votes = Array.isArray(verification?.votes) ? verification.votes : [];
+    const reviewerIds = new Set(votes.map((vote) => vote?.reviewer_id));
+    if (
+      verification?.verdict !== "pass" ||
+      verification?.policy !== "unanimous-three-reviewers" ||
+      votes.length !== 3 ||
+      reviewerIds.size !== 3 ||
+      votes.some((vote) => vote?.verdict !== "pass")
+    ) {
+      failures.push("issue diagnosis did not reach unanimous three-reviewer verification");
     }
   }
   if (patternId === "executor-advisor") {

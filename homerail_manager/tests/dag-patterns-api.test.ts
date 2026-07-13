@@ -278,7 +278,7 @@ describe("DAG patterns API", () => {
     };
     expect(listResponse.status).toBe(200);
     expect(listBody.success).toBe(true);
-    expect(listBody.data.total).toBe(10);
+    expect(listBody.data.total).toBe(11);
     expect(listBody.data.patterns.find((pattern) => pattern.id === "quorum")?.typical_uses.length).toBeGreaterThan(0);
 
     const detailResponse = await fetch(`${baseUrl}/api/dag/patterns/ratchet`);
@@ -289,6 +289,33 @@ describe("DAG patterns API", () => {
     expect(detailBody.data.required_primitives).toContain("while_gateway");
     expect(detailBody.data.workflow_template.api_version).toBe("homerail.ai/v1");
     expect(detailBody.data.workflow_template.spec.nodes).toHaveProperty("target_gate");
+
+    const diagnosisResponse = await fetch(`${baseUrl}/api/dag/patterns/issue-diagnosis`);
+    const diagnosisBody = await diagnosisResponse.json() as {
+      data: {
+        workflow_template: {
+          spec: {
+            triggers?: unknown;
+            contracts: Record<string, unknown>;
+            artifacts: Array<Record<string, unknown>>;
+            nodes: Record<string, unknown>;
+          };
+        };
+      };
+    };
+    expect(diagnosisResponse.status).toBe(200);
+    expect(diagnosisBody.data.workflow_template.spec.triggers).toBeUndefined();
+    expect(diagnosisBody.data.workflow_template.spec.contracts).toHaveProperty("DiagnosisReport");
+    expect(diagnosisBody.data.workflow_template.spec.artifacts).toEqual([
+      expect.objectContaining({ name: "diagnosis.json" }),
+      expect.objectContaining({ name: "verification.json" }),
+    ]);
+    expect(diagnosisBody.data.workflow_template.spec.nodes).toHaveProperty("arbitrate");
+    expect(diagnosisBody.data.workflow_template.spec.nodes).toHaveProperty("verify_scenario");
+    expect(diagnosisBody.data.workflow_template.spec.nodes).toHaveProperty("verify_evidence");
+    expect(diagnosisBody.data.workflow_template.spec.nodes).toHaveProperty("verify_adversarial");
+    expect(diagnosisBody.data.workflow_template.spec.nodes).toHaveProperty("consensus_gate");
+    expect(JSON.stringify(diagnosisBody.data.workflow_template)).not.toContain('"token"');
   });
 
   it("instantiates a typed pattern and returns validated YAML without persisting it", async () => {
