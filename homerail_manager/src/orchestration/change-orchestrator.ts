@@ -273,7 +273,13 @@ export class ChangeOrchestrator {
       try {
         return this.graphExecutor.createRun(runId, dagWithRuntime, request.prompt);
       } finally {
-        if (reservation.reserved) releaseWorkflowRunReservation(runId);
+        if (reservation.reserved) {
+          try {
+            releaseWorkflowRunReservation(runId);
+          } catch {
+            // Persisted runs supersede this row; failed creations leave only a TTL-bounded orphan.
+          }
+        }
       }
     })();
 

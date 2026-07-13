@@ -132,6 +132,59 @@ describe("workflow-level run admission", () => {
     })).toMatchObject({ reserved: true });
   });
 
+  it("cleans a crash-window reservation as soon as its run row exists", () => {
+    const policy = { overlap: "allow", max_concurrency: 1, trigger_ids: ["push"] } as const;
+    reserveWorkflowRun({
+      runId: "crash-window-run",
+      workflowId: "restart-workflow",
+      source: "test:before-crash",
+      policy,
+    });
+    const now = Date.now();
+    getDb().prepare(`
+      INSERT INTO dag_runs(run_id, status, created_at, updated_at, workflow_id, metadata)
+      VALUES (?, 'active', ?, ?, ?, '{}')
+    `).run("crash-window-run", now, now, "restart-workflow");
+
+    expect(() => reserveWorkflowRun({
+      runId: "competing-run",
+      workflowId: "restart-workflow",
+      source: "test:while-active",
+      policy,
+    })).toThrowError(expect.objectContaining({ reason: "max_concurrency" }));
+    expect(getDb().prepare(
+      "SELECT COUNT(*) AS count FROM dag_run_admissions WHERE run_id = ?",
+    ).get("crash-window-run")).toEqual({ count: 0 });
+
+    getDb().prepare("UPDATE dag_runs SET status = 'completed', updated_at = ? WHERE run_id = ?")
+      .run(Date.now(), "crash-window-run");
+    expect(reserveWorkflowRun({
+      runId: "after-restart-run",
+      workflowId: "restart-workflow",
+      source: "test:after-terminal",
+      policy,
+    })).toMatchObject({ reserved: true });
+  });
+
+  it("expires orphaned reservations that never created a run row", () => {
+    const policy = { overlap: "allow", max_concurrency: 1, trigger_ids: ["push"] } as const;
+    reserveWorkflowRun({
+      runId: "orphaned-reservation",
+      workflowId: "orphaned-workflow",
+      source: "test:orphaned",
+      policy,
+    });
+    getDb().prepare("UPDATE dag_run_admissions SET created_at = 0 WHERE run_id = ?")
+      .run("orphaned-reservation");
+
+    expect(reserveWorkflowRun({
+      runId: "replacement-run",
+      workflowId: "orphaned-workflow",
+      source: "test:replacement",
+      policy,
+    })).toMatchObject({ reserved: true });
+  });
+
   it("applies one concurrency limit across different triggers and manual runs", () => {
     upsertDagWorkflowFromYaml({ yaml_text: workflow("shared-admission", `
 push:
@@ -249,9 +302,32 @@ timer:
         headers,
         body: JSON.stringify({ workflow_id: "http-admission", runId: "http-manual-competing" }),
       });
-      const manual = await manualResponse.json() as { error: string };
-      expect(manualResponse.status).toBe(400);
+      const manual = await manualResponse.json() as {
+        error: string;
+        data: { reason: string; workflow_id: string; active_count: number };
+      };
+      expect(manualResponse.status).toBe(409);
       expect(manual.error).toContain("max_concurrency");
+      expect(manual.data).toMatchObject({
+        reason: "max_concurrency",
+        workflow_id: "http-admission",
+        active_count: 1,
+      });
+
+      const atomicResponse = await fetch(`${baseUrl}/api/runs/create-and-run`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ workflow_id: "http-admission", runId: "http-atomic-competing" }),
+      });
+      const atomic = await atomicResponse.json() as {
+        data: { reason: string; workflow_id: string; active_count: number };
+      };
+      expect(atomicResponse.status).toBe(409);
+      expect(atomic.data).toMatchObject({
+        reason: "max_concurrency",
+        workflow_id: "http-admission",
+        active_count: 1,
+      });
 
       const secondResponse = await fetch(`${baseUrl}/api/dag/triggers/events/schedule.tick`, {
         method: "POST",

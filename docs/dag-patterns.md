@@ -101,7 +101,9 @@ workflow-level admission boundary across interval, event, and manual starts:
 declared limit. SQLite reservations close the gap before the new `dag_runs` row
 exists. Workflows without enabled triggers retain unrestricted legacy behavior.
 This release does not provide a durable queue or replace-running policy; a
-rejected start reports `overlap_policy` or `max_concurrency`. Remote DAG writes require
+rejected manual HTTP start returns `409 Conflict` with structured
+`data.reason`, while trigger delivery results report `overlap_policy` or
+`max_concurrency` on the skipped delivery. Remote DAG writes require
 `HOMERAIL_DAG_MUTATION_TOKEN`, including run lifecycle operations, workflow and
 profile sync, state changes, event delivery, injection, and dynamic graph
 changes; loopback remains the default local trust boundary. `budget_admit`

@@ -49,15 +49,20 @@ export function reserveWorkflowRun(input: {
 }): { reserved: boolean; policy?: WorkflowConcurrencyPolicy } {
   if (!input.policy) return { reserved: false };
   const policy = input.policy;
-  return getDb().transaction(() => {
+  const outcome = getDb().transaction((): {
+    reserved: true;
+    policy: WorkflowConcurrencyPolicy;
+  } | {
+    reserved: false;
+    error: WorkflowRunAdmissionError;
+  } => {
     const now = Date.now();
     getDb().prepare(`
       DELETE FROM dag_run_admissions
       WHERE created_at < ?
-        AND NOT EXISTS (
+        OR EXISTS (
           SELECT 1 FROM dag_runs
           WHERE dag_runs.run_id = dag_run_admissions.run_id
-            AND dag_runs.status = 'active'
         )
     `).run(now - 300_000);
     const activeRuns = Number((getDb().prepare(`
@@ -69,25 +74,28 @@ export function reserveWorkflowRun(input: {
       SELECT COUNT(*) AS count
       FROM dag_run_admissions AS admission
       WHERE admission.workflow_id = ?
-        AND NOT EXISTS (
-          SELECT 1 FROM dag_runs
-          WHERE dag_runs.run_id = admission.run_id
-            AND dag_runs.status = 'active'
-        )
     `).get(input.workflowId) as { count: number }).count);
     const activeCount = activeRuns + pendingAdmissions;
     if (policy.overlap === "skip" && activeCount > 0) {
-      throw new WorkflowRunAdmissionError("overlap_policy", input.workflowId, activeCount, policy);
+      return {
+        reserved: false,
+        error: new WorkflowRunAdmissionError("overlap_policy", input.workflowId, activeCount, policy),
+      };
     }
     if (activeCount >= policy.max_concurrency) {
-      throw new WorkflowRunAdmissionError("max_concurrency", input.workflowId, activeCount, policy);
+      return {
+        reserved: false,
+        error: new WorkflowRunAdmissionError("max_concurrency", input.workflowId, activeCount, policy),
+      };
     }
     getDb().prepare(`
       INSERT INTO dag_run_admissions(run_id, workflow_id, source, created_at)
       VALUES (?, ?, ?, ?)
     `).run(input.runId, input.workflowId, input.source, now);
-    return { reserved: true, policy };
+    return { reserved: true, policy } as const;
   })();
+  if (!outcome.reserved) throw outcome.error;
+  return outcome;
 }
 
 export function releaseWorkflowRunReservation(runId: string): void {
