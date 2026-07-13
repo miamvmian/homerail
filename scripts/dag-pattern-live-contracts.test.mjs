@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   EXPECTED_PATTERN_IDS,
+  LIVE_ISSUE_REVISION,
   catalogCoverageFailures,
   parseContent,
   patternParameters,
@@ -16,6 +17,7 @@ test("covers the complete eleven-pattern catalog", () => {
   assert.deepEqual(catalogCoverageFailures(catalog), []);
   assert.equal(Object.keys(prompts).length, 11);
   assert.equal(Object.keys(semanticRequirements).length, 11);
+  assert.match(LIVE_ISSUE_REVISION, /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
   assert.deepEqual(JSON.parse(prompts["trust-ledger"]).acceptance_criteria, [
     "top-level evidence equals synthetic bounded check completed",
   ]);
@@ -81,7 +83,7 @@ test("requires a complete independently verified issue diagnosis", () => {
     schema_version: "2.0",
     issue_id: "live-synthetic",
     outcome: "not_reproduced",
-    tested_revision: "0123456789abcdef",
+    tested_revision: LIVE_ISSUE_REVISION,
     consensus: { decision: "unanimous", issue_match: "exact" },
     findings: [],
     evidence: [{ id: "arbiter-e001" }],
@@ -107,6 +109,16 @@ test("requires a complete independently verified issue diagnosis", () => {
     defects: [],
   };
   const handoffs = [
+    {
+      from_node: "checkout_repository",
+      port: "checked",
+      content: { ok: true, value: `${report.tested_revision}\n` },
+    },
+    {
+      from_node: "match_repository_revision",
+      port: "checked",
+      content: { ok: true, value: `${report.tested_revision}\n` },
+    },
     { from_node: "arbitrate", port: "reported", content: report },
     { from_node: "verify_scenario", port: "voted", content: votes[0] },
     { from_node: "verify_evidence", port: "voted", content: votes[1] },
@@ -115,7 +127,40 @@ test("requires a complete independently verified issue diagnosis", () => {
     { from_node: "consensus_gate", port: "accepted", content: verification },
   ];
   assert.deepEqual(semanticFailures("issue-diagnosis", handoffs), []);
-  handoffs[4].content = { ...verification, verdict: "fail" };
+  const conservativeHandoffs = handoffs.map((handoff) => handoff.from_node === "arbitrate"
+    ? {
+        ...handoff,
+        content: {
+          ...report,
+          outcome: "insufficient_evidence",
+          confidence: "medium",
+          limitations: ["Two reviewers could not independently execute their preferred source checks."],
+        },
+      }
+    : handoff);
+  conservativeHandoffs.push({
+    from_node: "review_reproduction",
+    port: "reviewed",
+    content: {
+      reviewer_id: "reproduction",
+      tested_revision: report.tested_revision,
+      issue_match: "exact",
+      reproduction: "not_reproduced",
+    },
+  });
+  assert.deepEqual(semanticFailures("issue-diagnosis", conservativeHandoffs), []);
+  handoffs[2].content = { ...report, outcome: "confirmed" };
+  assert.match(semanticFailures("issue-diagnosis", handoffs).join(";"), /safe negative or conservative outcome/);
+  handoffs[2].content = {
+    ...report,
+    consensus: { ...report.consensus, decision: "majority" },
+  };
+  assert.deepEqual(semanticFailures("issue-diagnosis", handoffs), []);
+  handoffs[2].content = report;
+  handoffs[2].content = { ...report, tested_revision: "main" };
+  assert.match(semanticFailures("issue-diagnosis", handoffs).join(";"), /exact requested full commit revision/);
+  handoffs[2].content = report;
+  handoffs[6].content = { ...verification, verdict: "fail" };
   assert.match(semanticFailures("issue-diagnosis", handoffs).join(";"), /verification/);
 });
 

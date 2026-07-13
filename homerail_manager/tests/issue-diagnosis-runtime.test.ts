@@ -31,7 +31,7 @@ const request = {
   },
   target: {
     repository_url: "https://example.test/owner/repository",
-    revision: "main",
+    revision,
   },
 };
 
@@ -231,12 +231,26 @@ function vote(reviewerId: "scenario" | "evidence" | "adversarial", verdict: "pas
   };
 }
 
-function runToConsensus(runId: string): {
+function runToConsensus(runId: string, repositoryPreparation = preparation): {
   dispatcher: FakeDAGDispatcher;
   votes: ReturnType<typeof vote>[];
 } {
   const dispatcher = new FakeDAGDispatcher();
   const parsed = instantiateDAGPattern("issue-diagnosis").parsed;
+  const checkout = parsed.graph.nodes.find((node) => node.node_id === "checkout_repository");
+  if (!checkout?.gateway_config) throw new Error("checkout_repository command is missing");
+  checkout.gateway_config = {
+    ...checkout.gateway_config,
+    command: ["node", "-e", `process.stdout.write(${JSON.stringify(revision)})`],
+    cwd: undefined,
+  };
+  const resolver = parsed.graph.nodes.find((node) => node.node_id === "resolve_repository_head");
+  if (!resolver?.gateway_config) throw new Error("resolve_repository_head command is missing");
+  resolver.gateway_config = {
+    ...resolver.gateway_config,
+    command: ["node", "-e", `process.stdout.write(${JSON.stringify(revision)})`],
+    cwd: undefined,
+  };
   parsed.meta.agents = Object.fromEntries(Object.entries(parsed.meta.agents).map(([id, agent]) => [
     id,
     { ...agent, agent_type: "deterministic" },
@@ -247,8 +261,10 @@ function runToConsensus(runId: string): {
   handoffActiveRun(runId, "triage", "planned", plan);
 
   expect(dispatchReadyNodes(runId, dispatcher)).toBe(1);
-  handoffActiveRun(runId, "prepare_repository", "prepared", preparation);
+  handoffActiveRun(runId, "prepare_repository", "prepared", repositoryPreparation);
 
+  expect(dispatchReadyNodes(runId, dispatcher)).toBe(1);
+  expect(dispatchReadyNodes(runId, dispatcher)).toBe(1);
   expect(dispatchReadyNodes(runId, dispatcher)).toBe(1);
   handoffActiveRun(runId, "review_reproduction", "reviewed", reproductionReview);
 
@@ -276,11 +292,14 @@ function runToConsensus(runId: string): {
 describe("issue-diagnosis pattern runtime", () => {
   let tmpHome: string;
   let oldHome: string | undefined;
+  let oldAllowlist: string | undefined;
 
   beforeEach(() => {
     oldHome = process.env.HOMERAIL_HOME;
+    oldAllowlist = process.env.HOMERAIL_DAG_COMMAND_ALLOWLIST;
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "homerail-issue-diagnosis-"));
     process.env.HOMERAIL_HOME = tmpHome;
+    process.env.HOMERAIL_DAG_COMMAND_ALLOWLIST = "node";
     closeDb();
     _clearActiveRuns();
     _clearAllPersistence();
@@ -292,12 +311,18 @@ describe("issue-diagnosis pattern runtime", () => {
     closeDb();
     if (oldHome === undefined) delete process.env.HOMERAIL_HOME;
     else process.env.HOMERAIL_HOME = oldHome;
+    if (oldAllowlist === undefined) delete process.env.HOMERAIL_DAG_COMMAND_ALLOWLIST;
+    else process.env.HOMERAIL_DAG_COMMAND_ALLOWLIST = oldAllowlist;
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 
   it("publishes the arbitrated report after unanimous verification", async () => {
     const runId = "issue-diagnosis-pass";
-    const { dispatcher, votes } = runToConsensus(runId);
+    const { dispatcher, votes } = runToConsensus(runId, {
+      ...preparation,
+      status: "unavailable",
+      limitations: ["The correction handoff was conservative; deterministic Git HEAD verification is authoritative."],
+    });
     const verification = {
       verdict: "pass",
       policy: "unanimous-three-reviewers",

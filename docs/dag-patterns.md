@@ -178,14 +178,21 @@ hashes still apply.
 
 `issue-diagnosis` is deliberately an on-demand diagnostic workflow, not an
 issue-tracker bot. Its strict input contract accepts a platform-neutral issue
-snapshot plus a credential-free HTTPS repository URL and revision. It emits a
+snapshot plus a credential-free HTTPS repository URL and a full 40- or 64-hex
+commit object ID. The caller must resolve a branch or tag before starting the
+DAG, so a moving ref cannot silently change during diagnosis. It emits a
 versioned `DiagnosisReport` containing the tested revision, outcome, root-cause
 assessment, findings, evidence, test results, recommendations, limitations,
 confidence, and the agreement or dissent among the independent reviews.
 
-Pure input triage completes first, then one repository-preparation node checks
-out the revision once. This ordering prevents the shared-workspace clone from
-being attributed to the triage node's policy snapshot. The reproduction
+Pure input triage completes first, then a fixed Manager-owned command performs
+one credential-isolated HTTPS clone and detached checkout in the
+contained run workspace. A handoff-only preparation node records that command
+result, after which Manager runs `git rev-parse HEAD` and requires the real
+HEAD, the preparation handoff, and the requested commit to match before
+reviewers can trust the source. This ordering prevents a model from claiming a
+checkout that did not happen and prevents the shared-workspace clone from being
+attributed to the triage node's policy snapshot. The reproduction
 reviewer then copies the tree into its private `scratch/reproduction/source`
 path for focused tests. After that sole writer finishes, the caller-to-server
 data-flow and regression-history reviewers run in parallel against read-only
@@ -239,7 +246,7 @@ changing this diagnostic core.
   },
   "target": {
     "repository_url": "https://example.test/owner/repository",
-    "revision": "0123456789abcdef"
+    "revision": "0123456789012345678901234567890123456789"
   },
   "constraints": {
     "max_test_seconds": 300,
@@ -247,6 +254,11 @@ changing this diagnostic core.
   }
 }
 ```
+
+Because revision verification uses fixed Manager-owned `git` and `node`
+commands, deployments running this pattern must include both executables in
+`HOMERAIL_DAG_COMMAND_ALLOWLIST` (for example, `node,git`). No dynamic command
+from issue content is accepted.
 
 List and inspect the live catalog:
 

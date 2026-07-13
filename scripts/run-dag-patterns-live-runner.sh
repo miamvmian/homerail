@@ -27,7 +27,7 @@ export HOMERAIL_PATTERN_MODEL_PROTOCOL="$MODEL_PROTOCOL"
 export HOMERAIL_PATTERN_AGENT_TYPE="$AGENT_TYPE"
 export HOMERAIL_WORKER_IMAGE="${HOMERAIL_LIVE_WORKER_IMAGE_PREFIX:-homerail-worker:dag-live}-$RUN_KEY"
 export HOMERAIL_MANAGER_AGENT_IMAGE="$HOMERAIL_WORKER_IMAGE"
-export HOMERAIL_DAG_COMMAND_ALLOWLIST="${HOMERAIL_DAG_COMMAND_ALLOWLIST:-node}"
+export HOMERAIL_DAG_COMMAND_ALLOWLIST="${HOMERAIL_DAG_COMMAND_ALLOWLIST:-node,git}"
 export HOMERAIL_DAG_ALLOW_DYNAMIC_COMMANDS="${HOMERAIL_DAG_ALLOW_DYNAMIC_COMMANDS:-true}"
 if [ -z "${HOMERAIL_DAG_APPROVAL_TOKEN:-}" ]; then
   HOMERAIL_DAG_APPROVAL_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
@@ -167,6 +167,29 @@ if ! wait_for_model 6 5; then
     echo "Model $MODEL_NAME did not become ready within 10 minutes." >&2
     exit 1
   fi
+fi
+
+requested_live_patterns="${HOMERAIL_LIVE_PATTERNS:-}"
+requested_live_patterns=",${requested_live_patterns//[[:space:]]/},"
+if [ -z "${HOMERAIL_LIVE_PATTERNS:-}" ] || [[ "$requested_live_patterns" == *",issue-diagnosis,"* ]]; then
+  if [ -z "${HOMERAIL_LIVE_ISSUE_REVISION:-}" ]; then
+    HOMERAIL_LIVE_ISSUE_REVISION="$(
+      HOME="$HOMERAIL_HOME" \
+      USERPROFILE="$HOMERAIL_HOME" \
+      XDG_CONFIG_HOME="$HOMERAIL_HOME/.config" \
+      GIT_ASKPASS='' \
+      GIT_TERMINAL_PROMPT=0 \
+      GCM_INTERACTIVE=Never \
+      git -c credential.helper= -c http.extraHeader= ls-remote --exit-code \
+        https://github.com/xiaotianfotos/homerail.git refs/heads/main \
+        | awk 'NR == 1 { print $1 }'
+    )"
+  fi
+  if [[ ! "$HOMERAIL_LIVE_ISSUE_REVISION" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+    echo "Could not resolve an exact commit for live issue diagnosis." >&2
+    exit 1
+  fi
+  export HOMERAIL_LIVE_ISSUE_REVISION
 fi
 
 echo "Building isolated worker image $HOMERAIL_WORKER_IMAGE"

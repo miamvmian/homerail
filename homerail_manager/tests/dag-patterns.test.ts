@@ -46,6 +46,7 @@ describe("built-in DAG patterns", () => {
     const spec = pattern.workflow.spec as Record<string, unknown>;
     const nodes = spec.nodes as Record<string, Record<string, unknown>>;
     const contracts = pattern.parsed.meta.contracts;
+    const exactRevision = "0123456789012345678901234567890123456789";
     const request = {
       issue: {
         id: "local-17",
@@ -56,7 +57,7 @@ describe("built-in DAG patterns", () => {
       },
       target: {
         repository_url: "https://example.test/owner/repository",
-        revision: "main",
+        revision: exactRevision,
       },
       constraints: {
         max_test_seconds: 120,
@@ -76,7 +77,10 @@ describe("built-in DAG patterns", () => {
     ]);
     expect(Object.values(nodes).map((node) => node.kind)).toEqual([
       "agent",
+      "command",
       "agent",
+      "command",
+      "command",
       "agent",
       "agent",
       "agent",
@@ -89,12 +93,33 @@ describe("built-in DAG patterns", () => {
       "terminal",
       "terminal",
     ]);
-    expect(nodes.prepare_repository?.workspace_access).toMatchObject({ writable_paths: ["source"] });
-    expect(nodes.prepare_repository?.depends_on).toEqual(["triage"]);
+    expect(nodes.checkout_repository?.depends_on).toEqual(["triage"]);
+    expect(nodes.checkout_repository?.config).toMatchObject({
+      command: ["node", "-e", expect.stringMatching(/(?=.*HOME:home)(?=.*credential\.helper=)(?=.*http\.extraHeader=)/)],
+      stdin_field: "$inputs",
+      cwd: "$run_workspace",
+      success_port: "checked",
+      failure_port: "checked",
+    });
+    expect(nodes.checkout_repository?.config).not.toHaveProperty("command_field");
+    expect(nodes.prepare_repository?.workspace_access).toEqual({ writable_paths: [], readonly_paths: [] });
+    expect(nodes.prepare_repository?.inputs).toHaveProperty("checkout");
+    expect(nodes.resolve_repository_head?.config).toMatchObject({
+      command: ["git", "-c", "safe.directory=*", "rev-parse", "HEAD"],
+      cwd: "$run_workspace/source",
+      success_port: "checked",
+      failure_port: "checked",
+    });
+    expect(nodes.match_repository_revision?.config).toMatchObject({
+      stdin_field: "$inputs",
+      success_port: "checked",
+      failure_port: "checked",
+    });
     expect(nodes.review_reproduction?.workspace_access).toMatchObject({
       writable_paths: ["scratch/reproduction"],
       readonly_paths: ["source"],
     });
+    expect(nodes.review_reproduction?.inputs).toHaveProperty("revision_check");
     expect(nodes.review_dataflow?.depends_on).toEqual(["review_reproduction"]);
     expect(nodes.review_history?.depends_on).toEqual(["review_reproduction"]);
     for (const nodeId of ["review_dataflow", "review_history", "verify_scenario", "verify_evidence", "verify_adversarial"]) {
@@ -107,12 +132,19 @@ describe("built-in DAG patterns", () => {
     });
     expect((spec.policies as Record<string, unknown>).max_parallelism).toBe(3);
     expect((spec.policies as Record<string, unknown>).max_corrections_per_node).toBe(5);
-    expect(pattern.parsed.meta.agents.repository_preparer?.system).toContain("Do not inspect issue URLs");
-    expect(pattern.parsed.meta.agents.repository_preparer?.system).toContain("read credentials");
-    expect(pattern.parsed.meta.agents.repository_preparer?.system).toContain("without a shallow-depth assumption");
+    expect(pattern.parsed.meta.agents.repository_preparer?.system).toContain("Manager already ran the fixed credential-free checkout command");
+    expect(pattern.parsed.meta.agents.repository_preparer?.system).toContain("do not prepare, inspect, or mutate");
+    expect(pattern.parsed.meta.agents.repository_preparer?.system).toContain("checkout.ok=true");
+    expect(pattern.parsed.meta.agents.repository_preparer?.system).toContain("any tool except handoff");
+    expect(pattern.parsed.meta.agents.repository_preparer?.system).toContain("Never invent a hash");
+    expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("claim proved true");
+    expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("revision_check.ok=true");
+    expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("reproduction=not_reproduced");
     expect(pattern.parsed.meta.agents.triage?.system).toContain("exactly five top-level keys");
     expect(pattern.parsed.meta.agents.triage?.system).toContain("stated_facts");
     expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("at least two materially different state variants");
+    expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("static catalog");
+    expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("without installing dependencies");
     expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("copy source to scratch/reproduction/source");
     expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("never run npm install");
     expect(pattern.parsed.meta.agents.reproduction_reviewer?.system).toContain("unbuilt local workspace package");
@@ -129,7 +161,10 @@ describe("built-in DAG patterns", () => {
     expect(pattern.parsed.meta.agents.history_reviewer?.system).toContain("never emit a prose summary");
     expect(pattern.parsed.meta.agents.history_reviewer?.system).toContain("Never clone another checkout");
     expect(pattern.parsed.meta.agents.arbiter?.system).toContain("different scenarios");
+    expect(pattern.parsed.meta.agents.arbiter?.system).toContain("consensus.issue_match=exact");
+    expect(pattern.parsed.meta.agents.arbiter?.system).toContain("purely static catalog");
     expect(pattern.parsed.meta.agents.scenario_verifier?.system).toContain("user's exact scenario");
+    expect(pattern.parsed.meta.agents.scenario_verifier?.system).toContain("not_reproduced report");
     expect(pattern.parsed.meta.agents.scenario_verifier?.system).toContain("scratch/reproduction/source");
     expect(pattern.parsed.meta.agents.evidence_verifier?.system).toContain("wrong locator");
     expect(pattern.parsed.meta.agents.evidence_verifier?.system).toContain("at most sixteen tool calls");
@@ -143,11 +178,15 @@ describe("built-in DAG patterns", () => {
     })).toMatchObject({ valid: false });
     expect(validateJsonContract(contracts?.IssueDiagnosisRequest, {
       ...request,
-      target: { repository_url: "git@example.test:owner/repository", revision: "main" },
+      target: { repository_url: "git@example.test:owner/repository", revision: exactRevision },
     })).toMatchObject({ valid: false });
     expect(validateJsonContract(contracts?.IssueDiagnosisRequest, {
       ...request,
-      target: { repository_url: "https://user:secret@example.test/owner/repository", revision: "main" },
+      target: { repository_url: "https://user:secret@example.test/owner/repository", revision: exactRevision },
+    })).toMatchObject({ valid: false });
+    expect(validateJsonContract(contracts?.IssueDiagnosisRequest, {
+      ...request,
+      target: { ...request.target, revision: "main" },
     })).toMatchObject({ valid: false });
     expect(validateJsonContract(
       contracts?.DiagnosticPlan,
@@ -163,6 +202,16 @@ describe("built-in DAG patterns", () => {
       tested_revision: "0123456789012345678901234567890123456789",
       source_path: "source",
       evidence: { command: "git rev-parse HEAD", result: "matched" },
+    })).toMatchObject({ valid: true });
+    expect(validateJsonContract(contracts?.RepositoryPreparation, {
+      status: "prepared",
+      tested_revision: "main",
+      source_path: "source",
+    })).toMatchObject({ valid: false });
+    expect(validateJsonContract(contracts?.RepositoryPreparation, {
+      status: "unavailable",
+      tested_revision: "main",
+      source_path: "source",
     })).toMatchObject({ valid: true });
 
     const report = {
@@ -196,6 +245,15 @@ describe("built-in DAG patterns", () => {
     expect(validateJsonContract(contracts?.DiagnosisReport, report)).toMatchObject({ valid: true });
     expect(validateJsonContract(contracts?.DiagnosisReport, {
       ...report,
+      tested_revision: "main",
+    })).toMatchObject({ valid: false });
+    expect(validateJsonContract(contracts?.DiagnosisReport, {
+      ...report,
+      outcome: "insufficient_evidence",
+      tested_revision: "main",
+    })).toMatchObject({ valid: true });
+    expect(validateJsonContract(contracts?.DiagnosisReport, {
+      ...report,
       consensus: {
         ...report.consensus,
         review_summaries: {
@@ -216,7 +274,7 @@ describe("built-in DAG patterns", () => {
       ...report,
       outcome: "confirmed",
     })).toMatchObject({ valid: false });
-    expect(validateJsonContract(contracts?.VerificationVote, {
+    const passingVote = {
       reviewer_id: "scenario",
       verdict: "pass",
       issue_match: "exact",
@@ -224,7 +282,35 @@ describe("built-in DAG patterns", () => {
       checked_evidence_ids: ["repro-e001"],
       evidence: [{ locator: "OnboardingStepForm.vue:345", result: "matched" }],
       defects: [],
+    };
+    expect(validateJsonContract(contracts?.VerificationVote, passingVote)).toMatchObject({ valid: true });
+    expect(validateJsonContract(contracts?.VerificationVote, {
+      ...passingVote,
+      checked_revision: "main",
+    })).toMatchObject({ valid: false });
+    expect(validateJsonContract(contracts?.VerificationVote, {
+      ...passingVote,
+      verdict: "fail",
+      checked_revision: "main",
+      defects: ["Repository preparation was unavailable."],
     })).toMatchObject({ valid: true });
+    const verificationVotes = ["scenario", "evidence", "adversarial"].map((reviewer_id) => ({
+      ...passingVote,
+      reviewer_id,
+    }));
+    const passingConsensus = {
+      verdict: "pass",
+      policy: "unanimous-three-reviewers",
+      checked_revision: passingVote.checked_revision,
+      votes: verificationVotes,
+      evidence: ["All three reviewers independently passed."],
+      defects: [],
+    };
+    expect(validateJsonContract(contracts?.ConsensusVerification, passingConsensus)).toMatchObject({ valid: true });
+    expect(validateJsonContract(contracts?.ConsensusVerification, {
+      ...passingConsensus,
+      checked_revision: "main",
+    })).toMatchObject({ valid: false });
     const reviewWithScalarLimitation = {
       reviewer_id: "reproduction",
       tested_revision: "0123456789012345678901234567890123456789",
@@ -252,6 +338,7 @@ describe("built-in DAG patterns", () => {
     expect(validateJsonContract(contracts?.IndependentReview, {
       ...reviewWithScalarLimitation,
       reproduction: "inconclusive",
+      tested_revision: "main",
       evidence: [{
         id: "repro-e001",
         type: "source",
@@ -259,6 +346,17 @@ describe("built-in DAG patterns", () => {
         observation: "Source inspection only.",
       }],
     })).toMatchObject({ valid: true });
+    expect(validateJsonContract(contracts?.IndependentReview, {
+      ...reviewWithScalarLimitation,
+      reproduction: "not_reproduced",
+      tested_revision: "main",
+      evidence: [{
+        id: "repro-e001",
+        type: "source",
+        locator: "agent-ui/src/component.ts:17",
+        observation: "The exact reported path is healthy.",
+      }],
+    })).toMatchObject({ valid: false });
   });
 
   it("exposes Executor-Advisor as a bounded callable advisor topology", () => {

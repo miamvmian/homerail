@@ -133,8 +133,16 @@ const CommandNode = Type.Object({
     input: Type.Optional(Identifier),
     command: Type.Optional(Type.Array(Type.String({ maxLength: 16_384 }), { minItems: 1, maxItems: 256 })),
     command_field: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
-    stdin_field: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
-    cwd: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })),
+    stdin_field: Type.Optional(Type.String({
+      minLength: 1,
+      maxLength: 256,
+      description: "Selected-input field, $ for its root, or $inputs for the complete named input-port map.",
+    })),
+    cwd: Type.Optional(Type.String({
+      minLength: 1,
+      maxLength: 1024,
+      description: "Manager-relative directory, or $run_workspace[/path] for the contained run-scoped workspace.",
+    })),
     timeout_ms: Type.Integer({ minimum: 100, maximum: 3_600_000 }),
     success_exit_codes: Type.Optional(Type.Array(Type.Integer({ minimum: 0, maximum: 255 }), {
       minItems: 1,

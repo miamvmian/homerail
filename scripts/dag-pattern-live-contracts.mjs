@@ -54,6 +54,9 @@ const sparringTestCommand = [
   "test \"$(cat tests/sparring/live.txt)\" = '1+1 must equal 2' && test \"$(cat src/live-fix.txt)\" = '2'",
 ];
 
+export const LIVE_ISSUE_REVISION = process.env.HOMERAIL_LIVE_ISSUE_REVISION
+  ?? "4bd2cdca7525f488e9ef25211d4430cedcc071cb";
+
 export const prompts = {
   heartbeat: JSON.stringify({
     signal: { value: 2, status: "actionable" },
@@ -64,16 +67,16 @@ export const prompts = {
     issue: {
       id: "live-synthetic",
       title: "Heartbeat is missing from the built-in pattern catalog",
-      body: "The reporter claims homerail_manager/src/orchestration/dag-patterns.ts does not register a heartbeat pattern. Check the exact requested revision and determine whether this claim reproduces. Use only bounded source inspection and the smallest relevant test.",
+      body: "The reporter claims homerail_manager/src/orchestration/dag-patterns.ts does not register a heartbeat pattern. Check the exact requested commit and determine whether this claim reproduces. Use only bounded source inspection and the smallest relevant test.",
       source: "live-validator",
       discussion: [{
         author: "live-validator",
-        body: "This is the built-in catalog path, not a custom pattern or a stale generated file. Check current main and the focused catalog test.",
+        body: "This is the built-in catalog path, not a custom pattern or a stale generated file. Check the requested commit and the focused catalog test.",
       }],
     },
     target: {
       repository_url: "https://github.com/xiaotianfotos/homerail",
-      revision: "main",
+      revision: LIVE_ISSUE_REVISION,
     },
     constraints: {
       max_test_seconds: 300,
@@ -119,6 +122,8 @@ export const semanticRequirements = {
     { node: "deterministic_check", port: "passed" },
   ],
   "issue-diagnosis": [
+    { node: "checkout_repository", port: "checked" },
+    { node: "match_repository_revision", port: "checked" },
     { node: "arbitrate", port: "reported" },
     { node: "verify_scenario", port: "voted" },
     { node: "verify_evidence", port: "voted" },
@@ -183,6 +188,10 @@ function objectValue(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
 }
 
+function isExactGitRevision(value) {
+  return typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
+}
+
 export function semanticFailures(patternId, handoffs, context = {}) {
   const failures = [];
   const requirements = semanticRequirements[patternId];
@@ -202,21 +211,44 @@ export function semanticFailures(patternId, handoffs, context = {}) {
     }
   }
   if (patternId === "issue-diagnosis") {
+    const checkout = objectValue(parseContent(
+      matchingHandoffs(handoffs, "checkout_repository", "checked").at(-1)?.content,
+    ));
+    if (checkout?.ok !== true || String(checkout?.value ?? "").trim() !== LIVE_ISSUE_REVISION) {
+      failures.push("issue diagnosis did not deterministically check out the requested revision");
+    }
+    const revisionCheck = objectValue(parseContent(
+      matchingHandoffs(handoffs, "match_repository_revision", "checked").at(-1)?.content,
+    ));
+    if (revisionCheck?.ok !== true || String(revisionCheck?.value ?? "").trim() !== LIVE_ISSUE_REVISION) {
+      failures.push("issue diagnosis did not deterministically verify repository HEAD against the requested revision");
+    }
     const report = objectValue(parseContent(matchingHandoffs(handoffs, "arbitrate", "reported").at(-1)?.content));
     if (report?.schema_version !== "2.0" || report?.issue_id !== "live-synthetic") {
       failures.push("issue diagnosis did not emit the expected versioned report identity");
     }
-    if (report?.outcome !== "not_reproduced") {
-      failures.push(`issue diagnosis expected not_reproduced, observed ${String(report?.outcome)}`);
+    if (!new Set(["not_reproduced", "insufficient_evidence"]).has(report?.outcome)) {
+      failures.push(`issue diagnosis expected a safe negative or conservative outcome, observed ${String(report?.outcome)}`);
     }
-    if (typeof report?.tested_revision !== "string" || report.tested_revision.length < 7) {
-      failures.push("issue diagnosis did not record a tested revision");
+    if (!isExactGitRevision(report?.tested_revision) || report?.tested_revision !== LIVE_ISSUE_REVISION) {
+      failures.push("issue diagnosis did not record the exact requested full commit revision");
     }
     for (const field of ["findings", "evidence", "tests", "recommendations", "limitations"]) {
       if (!Array.isArray(report?.[field])) failures.push(`issue diagnosis report is missing ${field}`);
     }
-    if (report?.consensus?.decision !== "unanimous" || report?.consensus?.issue_match !== "exact") {
-      failures.push("issue diagnosis arbitration was not unanimous for the exact scenario");
+    if (report?.outcome === "insufficient_evidence") {
+      const reviews = ["review_reproduction", "review_dataflow", "review_history"]
+        .map((node) => objectValue(parseContent(matchingHandoffs(handoffs, node, "reviewed").at(-1)?.content)));
+      const exactNegativeReview = reviews.some((review) =>
+        review?.issue_match === "exact" &&
+        review?.reproduction === "not_reproduced" &&
+        review?.tested_revision === LIVE_ISSUE_REVISION);
+      if (!exactNegativeReview || !Array.isArray(report?.limitations) || report.limitations.length === 0) {
+        failures.push("conservative issue diagnosis lacked exact negative evidence or explicit limitations");
+      }
+    }
+    if (!new Set(["unanimous", "majority"]).has(report?.consensus?.decision) || report?.consensus?.issue_match !== "exact") {
+      failures.push("issue diagnosis arbitration did not support the exact scenario");
     }
     const verification = objectValue(parseContent(matchingHandoffs(handoffs, "consensus", "checked").at(-1)?.content));
     const votes = Array.isArray(verification?.votes) ? verification.votes : [];
@@ -226,7 +258,11 @@ export function semanticFailures(patternId, handoffs, context = {}) {
       verification?.policy !== "unanimous-three-reviewers" ||
       votes.length !== 3 ||
       reviewerIds.size !== 3 ||
-      votes.some((vote) => vote?.verdict !== "pass")
+      verification?.checked_revision !== report?.tested_revision ||
+      votes.some((vote) =>
+        vote?.verdict !== "pass" ||
+        vote?.issue_match !== "exact" ||
+        vote?.checked_revision !== report?.tested_revision)
     ) {
       failures.push("issue diagnosis did not reach unanimous three-reviewer verification");
     }

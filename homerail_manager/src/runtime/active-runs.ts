@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import path from "node:path";
+import { getHomerailHome } from "../config/env.js";
 import { emit } from "../events/bus.js";
 import type { DAGDispatcher, DispatchEnvelope } from "../orchestration/dag-dispatcher.js";
 import type { DAGRun, NodeState } from "../orchestration/dag-engine.js";
@@ -1680,6 +1682,56 @@ function _commandAllowlist(): Set<string> {
   return new Set(configured.split(",").map((value) => value.trim().toLowerCase()).filter(Boolean));
 }
 
+const RUN_WORKSPACE_CWD = "$run_workspace";
+
+function _pathIsWithin(root: string, target: string): boolean {
+  const relative = path.relative(root, target);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function _commandGatewayCwd(
+  run: ActiveRun,
+  configured: string | undefined,
+): { cwd: string; label: string } | { error: string } {
+  const managerRoot = path.resolve(process.cwd());
+  const raw = configured ?? ".";
+  const usesRunWorkspace = raw === RUN_WORKSPACE_CWD ||
+    raw.startsWith(`${RUN_WORKSPACE_CWD}/`) ||
+    raw.startsWith(`${RUN_WORKSPACE_CWD}\\`);
+  if (!usesRunWorkspace) {
+    const cwd = path.resolve(managerRoot, raw);
+    if (!_pathIsWithin(managerRoot, cwd)) return { error: "command cwd escapes Manager workspace" };
+    return { cwd, label: path.relative(managerRoot, cwd) || "." };
+  }
+
+  const workspaceRoot = path.resolve(getHomerailHome(), "workspace");
+  const runWorkspace = path.resolve(workspaceRoot, ...run.runId.split("/"));
+  if (runWorkspace === workspaceRoot || !_pathIsWithin(workspaceRoot, runWorkspace)) {
+    return { error: "command run workspace path is unsafe" };
+  }
+  const suffix = raw.slice(RUN_WORKSPACE_CWD.length).replace(/^[/\\]+/, "");
+  const candidate = path.resolve(runWorkspace, suffix || ".");
+  if (!_pathIsWithin(runWorkspace, candidate)) return { error: "command cwd escapes run workspace" };
+  try {
+    const realWorkspaceRoot = realpathSync(workspaceRoot);
+    const realWorkspace = realpathSync(runWorkspace);
+    if (realWorkspace === realWorkspaceRoot || !_pathIsWithin(realWorkspaceRoot, realWorkspace)) {
+      return { error: "command run workspace resolves outside workspace root" };
+    }
+    const realCandidate = realpathSync(candidate);
+    if (!_pathIsWithin(realWorkspace, realCandidate)) {
+      return { error: "command cwd resolves outside run workspace" };
+    }
+    return {
+      cwd: realCandidate,
+      label: suffix ? `${RUN_WORKSPACE_CWD}/${suffix.replace(/\\/g, "/")}` : RUN_WORKSPACE_CWD,
+    };
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? String(error.code) : "unavailable";
+    return { error: `command run workspace cwd is unavailable (${code})` };
+  }
+}
+
 function _commandGatewayResult(run: ActiveRun, node: DAGGraphNode): { port: string; payload: Record<string, unknown> } {
   const config = node.gateway_config;
   const inputs = _nodeInputs(run.dagRun, node.node_id);
@@ -1709,11 +1761,16 @@ function _commandGatewayResult(run: ActiveRun, node: DAGGraphNode): { port: stri
       payload: { ok: false, error: `executable '${command[0]}' is not in HOMERAIL_DAG_COMMAND_ALLOWLIST` },
     };
   }
-  const root = process.cwd();
-  const cwd = path.resolve(root, config?.cwd ?? ".");
-  if (cwd !== root && !cwd.startsWith(`${root}${path.sep}`)) {
-    return { port: config?.failure_port || "failed", payload: { ok: false, error: "command cwd escapes Manager workspace" } };
+  const resolvedCwd = _commandGatewayCwd(run, config?.cwd);
+  if ("error" in resolvedCwd) {
+    return { port: config?.failure_port || "failed", payload: { ok: false, error: resolvedCwd.error } };
   }
+  const { cwd, label: cwdLabel } = resolvedCwd;
+  const stdinValue = config?.stdin_field === "$inputs"
+    ? inputs
+    : config?.stdin_field
+      ? _fieldValue(input, config.stdin_field)
+      : undefined;
   const captureLimit = Math.max(1, Math.floor(config?.capture_limit ?? 64_000));
   const startedAt = Date.now();
   const result = spawnSync(command[0], command.slice(1), {
@@ -1723,7 +1780,7 @@ function _commandGatewayResult(run: ActiveRun, node: DAGGraphNode): { port: stri
     maxBuffer: captureLimit * 2,
     shell: false,
     env: process.env,
-    ...(config?.stdin_field ? { input: JSON.stringify(_fieldValue(input, config.stdin_field)) } : {}),
+    ...(config?.stdin_field ? { input: JSON.stringify(stdinValue) } : {}),
   });
   const exitCode = typeof result.status === "number" ? result.status : null;
   const successCodes = config?.success_exit_codes ?? [0];
@@ -1743,7 +1800,7 @@ function _commandGatewayResult(run: ActiveRun, node: DAGGraphNode): { port: stri
     ok: ok && !parseFailed,
     command: command[0],
     args: command.slice(1),
-    cwd: path.relative(root, cwd) || ".",
+    cwd: cwdLabel,
     exit_code: exitCode,
     signal: result.signal ?? null,
     stdout,
@@ -1753,7 +1810,7 @@ function _commandGatewayResult(run: ActiveRun, node: DAGGraphNode): { port: stri
     error: result.error?.message,
     value,
     parse_failed: parseFailed,
-    input,
+    input: config?.stdin_field === "$inputs" ? inputs : input,
   };
   const telemetry = redactTelemetry(payload) as Record<string, unknown>;
   emit("dag:deterministic_command", { runId: run.runId, nodeId: node.node_id, ...telemetry });
