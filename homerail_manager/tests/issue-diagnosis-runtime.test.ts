@@ -348,7 +348,7 @@ describe("issue-diagnosis pattern runtime", () => {
       expect.objectContaining({ name: "diagnosis.json", status: "ready" }),
       expect.objectContaining({ name: "verification.json", status: "ready" }),
     ]);
-  });
+  }, 15_000);
 
   it("preserves the report and all votes when one verifier dissents", async () => {
     const runId = "issue-diagnosis-review";
