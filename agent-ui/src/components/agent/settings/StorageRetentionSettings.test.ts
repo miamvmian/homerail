@@ -121,4 +121,26 @@ describe('StorageRetentionSettings', () => {
     expect(cleanupRunWorkspaces).toHaveBeenCalledWith(false)
     app.unmount()
   })
+
+  it('clamps retention days to the supported range before saving', async () => {
+    const { app, root } = mount()
+    await flush()
+
+    const success = root.querySelector<HTMLInputElement>('[data-testid="agent-settings-workspace-retention-success-days"]')!
+    const failure = root.querySelector<HTMLInputElement>('[data-testid="agent-settings-workspace-retention-failure-days"]')!
+    success.value = '4000'
+    success.dispatchEvent(new Event('input', { bubbles: true }))
+    failure.value = '-3'
+    failure.dispatchEvent(new Event('input', { bubbles: true }))
+    root.querySelector<HTMLButtonElement>('[data-testid="agent-settings-workspace-retention-save"]')!
+      .dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await flush()
+
+    expect(updateWorkspaceRetention).toHaveBeenCalledWith({
+      enabled: true,
+      success_days: 3650,
+      failure_days: 0,
+    })
+    app.unmount()
+  })
 })

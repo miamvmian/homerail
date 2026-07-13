@@ -4,6 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { closeDb } from "../src/persistence/db.js";
+import {
+  _clearAllProvisionedWorkers,
+  registerProvisionedWorker,
+} from "../src/orchestration/provisioned-cleanup.js";
 import { loadRunMetadata, writeRunMetadata } from "../src/persistence/store.js";
 import {
   DEFAULT_WORKSPACE_RETENTION_SETTINGS,
@@ -39,11 +43,13 @@ describe("workspace retention", () => {
     process.env.HOMERAIL_HOME = tmpHome;
     closeDb();
     _clearActiveRuns();
+    _clearAllProvisionedWorkers();
   });
 
   afterEach(() => {
     closeDb();
     _clearActiveRuns();
+    _clearAllProvisionedWorkers();
     if (oldHome === undefined) delete process.env.HOMERAIL_HOME;
     else process.env.HOMERAIL_HOME = oldHome;
     if (oldMutationToken === undefined) delete process.env.HOMERAIL_DAG_MUTATION_TOKEN;
@@ -215,6 +221,60 @@ nodes:
     expect(fs.existsSync(workspace)).toBe(false);
   });
 
+  it("protects a truly active in-memory run even if persisted metadata appears terminal", async () => {
+    const now = Date.now();
+    const runId = "active-in-process";
+    createActiveRun(runId, parseDAGYaml(`
+name: retention-active-in-process
+agents:
+  worker:
+    agent_type: deterministic
+nodes:
+  work:
+    agent: worker
+    outputs:
+      done:
+        to: ""
+`));
+    const persisted = loadRunMetadata(runId);
+    if (!persisted) throw new Error("active run metadata was not persisted");
+    writeRunMetadata(runId, {
+      ...persisted,
+      status: "completed",
+      completedAt: now - 8 * DAY_MS,
+    });
+    const workspace = runWorkspacePath(runId);
+    fs.mkdirSync(workspace, { recursive: true });
+    fs.writeFileSync(path.join(workspace, "artifact.txt"), runId);
+
+    const report = await cleanupRunWorkspaces({ dryRun: false, now });
+
+    expect(report.removed).toBe(0);
+    expect(report.items.find((item) => item.run_id === runId)?.reason)
+      .toBe("run_active_in_memory");
+    expect(fs.existsSync(workspace)).toBe(true);
+  });
+
+  it("protects workspaces while provisioned worker cleanup is pending", async () => {
+    const now = Date.now();
+    const runId = "worker-cleanup-pending";
+    const workspace = addRun(runId, "completed", now - 8 * DAY_MS);
+    registerProvisionedWorker({
+      runId,
+      nodeId: "worker-node",
+      workerId: "worker-1",
+      containerId: "container-1",
+      dockerNodeId: "docker-node-1",
+    });
+
+    const report = await cleanupRunWorkspaces({ dryRun: false, now });
+
+    expect(report.removed).toBe(0);
+    expect(report.items.find((item) => item.run_id === runId)?.reason)
+      .toBe("worker_cleanup_pending");
+    expect(fs.existsSync(workspace)).toBe(true);
+  });
+
   it("serializes deletion against pinning and competing cleanup", async () => {
     const now = Date.now();
     const workspace = addRun("cleanup-race", "completed", now - 8 * DAY_MS);
@@ -256,6 +316,10 @@ nodes:
     expect(report.removed).toBe(0);
     expect(report.items.find((item) => item.run_id === "default")?.reason).toBe("reserved_default_workspace");
     expect(fs.existsSync(workspace)).toBe(true);
+  });
+
+  it("rejects run workspace paths that escape the managed root", () => {
+    expect(() => runWorkspacePath("../../outside")).toThrow("Unsafe run workspace path");
   });
 
   it("protects retention mutations with the control-plane authorization boundary", () => {
