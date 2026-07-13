@@ -41,7 +41,6 @@ jobs:
     timeout-minutes: 60
     continue-on-error: true
     env:
-      HOMERAIL_HOME: ${{ runner.temp }}/homerail-pr-review-cli-${{ github.run_id }}
       HOMERAIL_ASSET_DIR: ""
       HOMERAIL_MANAGER_URL: ${{ secrets.HOMERAIL_PR_REVIEW_MANAGER_URL }}
       HOMERAIL_DAG_MUTATION_TOKEN: ${{ secrets.HOMERAIL_DAG_MUTATION_TOKEN }}
@@ -99,6 +98,7 @@ jobs:
         id: review
         continue-on-error: true
         env:
+          HOMERAIL_HOME: ${{ runner.temp }}/homerail-pr-review-cli-${{ github.run_id }}
           REVIEW_INPUT: ${{ steps.input.outputs.json }}
           REVIEW_PROFILE: ${{ secrets.HOMERAIL_PR_REVIEW_PROFILE }}
         run: |

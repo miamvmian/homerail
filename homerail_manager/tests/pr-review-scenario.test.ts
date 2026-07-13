@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { parse as parseYaml } from "yaml";
 
 import { compileWorkflowSource } from "../src/orchestration/workflow-spec-v1.js";
 import { parseWorkflowSource } from "../src/orchestration/workflow-spec-v1.js";
@@ -152,6 +153,7 @@ describe("PR Review scenario assets", () => {
 
   it("keeps the GitHub adapter thin, advisory, and off untrusted fork PRs", () => {
     const workflow = fs.readFileSync(path.resolve(process.cwd(), "..", ".github", "workflows", "pr-review.yml"), "utf8");
+    const parsed = parseYaml(workflow) as { jobs: { review: { env: Record<string, string>; steps: Array<{ name: string; env?: Record<string, string> }> } } };
     expect(workflow).toContain("pull_request:");
     expect(workflow).toContain("workflow_dispatch:");
     expect(workflow).not.toContain("pull_request_target:");
@@ -164,10 +166,14 @@ describe("PR Review scenario assets", () => {
     expect(workflow).toContain('dag artifact "$RUN_ID" pr-review.md');
     expect(workflow).not.toContain("--output-dir");
     expect(workflow).toContain("$GITHUB_STEP_SUMMARY");
+    expect(parsed.jobs.review.env).not.toHaveProperty("HOMERAIL_HOME");
+    expect(parsed.jobs.review.steps.find((step) => step.name === "Run HomeRail PR Review DAG")?.env?.HOMERAIL_HOME)
+      .toBe("${{ runner.temp }}/homerail-pr-review-cli-${{ github.run_id }}");
   });
 
   it("keeps PR closeout manual, thin, isolated, and unable to merge", () => {
     const workflow = fs.readFileSync(path.resolve(process.cwd(), "..", ".github", "workflows", "pr-closeout.yml"), "utf8");
+    const parsed = parseYaml(workflow) as { jobs: { closeout: { env: Record<string, string>; steps: Array<{ name: string; env?: Record<string, string> }> } } };
     expect(workflow).toContain("workflow_dispatch:");
     expect(workflow).not.toContain("pull_request_target:");
     expect(workflow).toContain("dag run-template pr-closeout");
@@ -177,6 +183,9 @@ describe("PR Review scenario assets", () => {
     expect(workflow.match(/^    env:$/gm)).toHaveLength(1);
     expect(workflow).not.toContain("gh pr merge");
     expect(workflow).toContain("This workflow never merges the pull request.");
+    expect(parsed.jobs.closeout.env).not.toHaveProperty("HOMERAIL_HOME");
+    expect(parsed.jobs.closeout.steps.find((step) => step.name === "Start deterministic closeout")?.env?.HOMERAIL_HOME)
+      .toBe("${{ runner.temp }}/homerail-pr-closeout-cli-${{ github.run_id }}");
   });
 
   it("executes budget, four reviews, synthesis, 2-of-3 quorum, and publication", async () => {

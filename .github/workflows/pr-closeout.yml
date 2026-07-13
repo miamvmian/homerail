@@ -30,7 +30,6 @@ jobs:
     runs-on: [self-hosted, Linux, X64, homerail-live]
     timeout-minutes: 15
     env:
-      HOMERAIL_HOME: ${{ runner.temp }}/homerail-pr-closeout-cli-${{ github.run_id }}
       HOMERAIL_ASSET_DIR: ""
       HOMERAIL_MANAGER_URL: ${{ secrets.HOMERAIL_PR_REVIEW_MANAGER_URL }}
       HOMERAIL_DAG_MUTATION_TOKEN: ${{ secrets.HOMERAIL_DAG_MUTATION_TOKEN }}
@@ -55,6 +54,7 @@ jobs:
 
       - name: Start deterministic closeout
         env:
+          HOMERAIL_HOME: ${{ runner.temp }}/homerail-pr-closeout-cli-${{ github.run_id }}
           CLOSEOUT_PR: ${{ inputs.pr }}
           CLOSEOUT_PHASE: ${{ inputs.phase }}
           VALIDATION_RUN: ${{ inputs.validation_run }}
