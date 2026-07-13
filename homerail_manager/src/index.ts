@@ -4,6 +4,7 @@ import { initEventLogging } from "./persistence/store.js";
 import { recoverAllActiveRuns } from "./runtime/active-runs.js";
 import { recoverStaleVoiceSessions } from "./server/voice-session-registry.js";
 import { markRecoveryComplete } from "./health/index.js";
+import { shutdownHostShellManagerAgents } from "./server/host-shell-manager-agent.js";
 
 initEventLogging();
 
@@ -28,3 +29,17 @@ server.listen(port, host, () => {
     console.error(`voice recovery: reset ${voiceRecovery.recovered.length} stale session(s)`);
   }
 });
+
+let shuttingDown = false;
+function shutdown(): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const forcedExit = setTimeout(() => process.exit(1), 5_000);
+  forcedExit.unref();
+  void shutdownHostShellManagerAgents().finally(() => {
+    server.close(() => process.exit(0));
+  });
+}
+
+process.once("SIGINT", shutdown);
+process.once("SIGTERM", shutdown);

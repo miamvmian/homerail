@@ -975,6 +975,7 @@ export function startManagerAgentServer(port = Number(process.env.MANAGER_AGENT_
         worker_id: process.env.WORKER_ID || process.env.HOMERAIL_WORKER_ID || null,
         project_id: process.env.PROJECT_ID || null,
         fingerprint: process.env.HOMERAIL_MANAGER_AGENT_FINGERPRINT || null,
+        process_id: process.pid,
       });
       return;
     }

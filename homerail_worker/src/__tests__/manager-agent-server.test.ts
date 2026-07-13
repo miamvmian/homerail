@@ -289,6 +289,31 @@ describe("manager-agent server", () => {
     for (const dir of tmpDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it("reports the host process identity used for lifecycle recovery", async () => {
+    vi.stubEnv("HOMERAIL_MANAGER_AGENT_FINGERPRINT", "fingerprint-test");
+    vi.stubEnv("HOMERAIL_WORKER_ID", "manager-agent-host-project-test");
+    vi.stubEnv("PROJECT_ID", "project-test");
+    const server = startManagerAgentServer(0);
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/health`);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        status: "running",
+        service: "manager-agent",
+        fingerprint: "fingerprint-test",
+        process_id: process.pid,
+        project_id: "project-test",
+        worker_id: "manager-agent-host-project-test",
+      });
+    } finally {
+      await close(server);
+    }
+  });
+
   it("does not use regex guards to force objective tools for action-oriented DAG requests", async () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "homerail-manager-agent-workspace-"));
     tmpDirs.push(workspace);
