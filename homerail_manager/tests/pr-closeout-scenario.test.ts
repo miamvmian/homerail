@@ -8,8 +8,10 @@ import { GraphExecutor } from "../src/orchestration/graph-executor.js";
 import { compileWorkflowSource, parseWorkflowSource } from "../src/orchestration/workflow-spec-v1.js";
 import { closeDb } from "../src/persistence/db.js";
 import { listPendingApprovals } from "../src/persistence/dag-runtime-primitives.js";
+import { getRunArtifactBlobPath } from "../src/persistence/run-artifacts.js";
 import { loadRunSnapshot } from "../src/persistence/store.js";
 import { _clearActiveRuns, decideActiveRunApproval, getActiveRun } from "../src/runtime/active-runs.js";
+import { finalizeRunArtifacts } from "../src/runtime/run-artifact-service.js";
 
 function envelope(status: string, phase = "draft") {
   return {
@@ -54,7 +56,14 @@ describe("PR closeout scenario", () => {
     const result = compileWorkflowSource(fs.readFileSync(file, "utf8"));
     expect(result.valid).toBe(true);
     expect(result.diagnostics).toEqual([]);
-    expect(result.summary).toMatchObject({ workflow_id: "pr-closeout", node_count: 7, edge_count: 7 });
+    expect(result.summary).toMatchObject({ workflow_id: "pr-closeout", node_count: 8, edge_count: 8 });
+    expect(result.canonical?.artifacts).toEqual([
+      expect.objectContaining({
+        name: "pr-closeout.json",
+        source: { type: "handoff", node: "artifact_snapshot", port: "snapshot" },
+        contract: "CloseoutEnvelope",
+      }),
+    ]);
     expect(result.canonical?.nodes.every((node) => !node.agent)).toBe(true);
     expect(result.canonical?.nodes.find((node) => node.id === "merge_approval")?.config).toMatchObject({
       proposer_actor: "system:pr-closeout",
@@ -62,7 +71,7 @@ describe("PR closeout scenario", () => {
     });
   });
 
-  it("completes draft closeout without a model or merge mutation", () => {
+  it("completes draft closeout without a model or merge mutation", async () => {
     const dispatcher = new FakeDAGDispatcher();
     const executor = new GraphExecutor(dispatcher);
     executor.createRun("draft-closeout", parseWorkflowSource(fs.readFileSync(file, "utf8")), JSON.stringify(envelope("ready_for_review")));
@@ -74,6 +83,11 @@ describe("PR closeout scenario", () => {
       fromNode: "status_gate",
       port: "ready_for_review",
     }));
+    expect(await finalizeRunArtifacts("draft-closeout", "success")).toEqual([
+      expect.objectContaining({ name: "pr-closeout.json", status: "ready" }),
+    ]);
+    expect(JSON.parse(fs.readFileSync(getRunArtifactBlobPath("draft-closeout", "pr-closeout.json")!, "utf8")))
+      .toMatchObject({ payload: { closeout_status: "ready_for_review" } });
   });
 
   it("pauses a merge candidate for durable human approval", () => {
@@ -107,7 +121,7 @@ describe("PR closeout scenario", () => {
     }));
   });
 
-  it("terminates stale evidence as cancelled instead of completed", () => {
+  it("terminates stale evidence as cancelled instead of completed", async () => {
     const dispatcher = new FakeDAGDispatcher();
     const executor = new GraphExecutor(dispatcher);
     executor.createRun("stale-closeout", parseWorkflowSource(fs.readFileSync(file, "utf8")), JSON.stringify(envelope("stale_evidence")));
@@ -118,5 +132,8 @@ describe("PR closeout scenario", () => {
       fromNode: "status_gate",
       port: "stale",
     }));
+    expect(await finalizeRunArtifacts("stale-closeout", "failure")).toEqual([
+      expect.objectContaining({ name: "pr-closeout.json", status: "ready", publish: "always" }),
+    ]);
   });
 });

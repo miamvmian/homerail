@@ -7,7 +7,6 @@ import { getClient } from "../index.js";
 import {
   manualCloseoutEnvelope,
   resolvePrCloseoutInput,
-  writePrCloseoutEvidence,
 } from "./dag-pr-closeout.js";
 import { orchestrationsDir, resolveTemplatePath } from "./templates.js";
 
@@ -25,11 +24,6 @@ interface RunTemplateOptions {
   wait?: boolean;
   timeout: string;
   interval: string;
-  outputDir?: string;
-}
-
-interface ReviewReportOptions {
-  outputDir: string;
 }
 
 export interface ResolvedPrReviewInput {
@@ -43,32 +37,19 @@ export interface ResolvedPrReviewInput {
   author?: string;
 }
 
-interface PublishedReview {
-  report: Record<string, unknown>;
-  markdown: string;
-  json_path: string;
-  markdown_path: string;
-  quorum: Record<string, unknown>;
-}
-
-interface PrReviewEvidence {
-  run_id: string;
-  run_status: string;
-  runtime_ms: number | null;
-  report: Record<string, unknown>;
-  quorum: Record<string, unknown>;
-  verification: {
-    votes: Record<string, unknown>[];
-    quorum: Record<string, unknown>;
-  };
-  budget: Record<string, unknown>;
-  metrics: Record<string, unknown> | null;
-  artifacts: { json: string; markdown: string };
+interface RunArtifactSummary {
+  name: string;
+  status: string;
+  media_type?: string;
+  required?: boolean;
+  size_bytes?: number;
+  sha256?: string;
 }
 
 const SHA_PATTERN = /^[0-9a-f]{7,64}$/i;
 const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const TERMINAL_ARTIFACT_STATUSES = new Set(["ready", "failed", "skipped"]);
 
 function parseObject(raw: string, label: string): Record<string, unknown> {
   let parsed: unknown;
@@ -177,7 +158,7 @@ async function startTemplateRun(
   template: string,
   input: Record<string, unknown>,
   opts: RunTemplateOptions,
-): Promise<{ runId: string; workflowId: string; response: BaseResponse }> {
+): Promise<{ runId: string; workflowId: string }> {
   const filePath = resolveTemplatePath(orchestrationsDir(), template);
   if (!fs.existsSync(filePath)) throw new Error(`DAG template not found: ${template}`);
   const syncResponse = await client.post<BaseResponse>("/api/dag/workflows/sync", {
@@ -197,7 +178,7 @@ async function startTemplateRun(
   const data = responseData(response);
   const runId = optionalString(data.run_id) ?? optionalString(data.runId);
   if (!runId) throw new Error("Manager did not return run id");
-  return { runId, workflowId, response };
+  return { runId, workflowId };
 }
 
 async function waitForTerminal(
@@ -214,224 +195,60 @@ async function waitForTerminal(
     if (TERMINAL_STATUSES.has(status)) return last;
     await new Promise((resolve) => setTimeout(resolve, intervalSeconds * 1_000));
   }
-  throw new Error(`timed out waiting for PR review run ${runId}; last status: ${String(last.status ?? "unknown")}`);
+  throw new Error(`timed out waiting for DAG run ${runId}; last status: ${String(last.status ?? "unknown")}`);
 }
 
-function parsePublishedReview(value: unknown): PublishedReview | undefined {
-  let parsed = value;
-  if (typeof parsed === "string") {
-    try {
-      parsed = JSON.parse(parsed) as unknown;
-    } catch {
-      return undefined;
-    }
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-  const record = parsed as Record<string, unknown>;
-  if (!record.report || typeof record.markdown !== "string" || !record.quorum) return undefined;
-  return record as unknown as PublishedReview;
-}
-
-function parseRecord(value: unknown): Record<string, unknown> | undefined {
-  let parsed = value;
-  if (typeof parsed === "string") {
-    try {
-      parsed = JSON.parse(parsed) as unknown;
-    } catch {
-      return undefined;
-    }
-  }
-  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-    ? parsed as Record<string, unknown>
-    : undefined;
-}
-
-function handoffNode(raw: Record<string, unknown>): string {
-  return String(raw.fromNode ?? raw.from_node ?? raw.node ?? "");
-}
-
-function assertReportIdentity(report: Record<string, unknown>, budget: Record<string, unknown>): void {
-  const input = budget.input as Record<string, unknown> | undefined;
-  const payload = input?.payload as Record<string, unknown> | undefined;
-  if (!payload) throw new Error("PR review budget handoff has no authoritative input payload");
-  for (const field of ["repo", "pr", "base", "head"] as const) {
-    if (report[field] !== payload[field]) {
-      throw new Error(
-        `PR review published report identity mismatch for ${field}: expected ${String(payload[field])}, received ${String(report[field])}`,
-      );
-    }
-  }
-}
-
-function findingKey(value: Record<string, unknown>): string {
-  return `${String(value.file ?? "")}\u0000${String(value.line ?? "")}\u0000${String(value.title ?? "")}`;
-}
-
-function recordFindings(report: Record<string, unknown>): Record<string, unknown>[] {
-  return Array.isArray(report.findings)
-    ? report.findings.filter((value): value is Record<string, unknown> => Boolean(value && typeof value === "object" && !Array.isArray(value)))
+async function listRunArtifacts(client: HomeRailClient, runId: string): Promise<RunArtifactSummary[]> {
+  const response = await client.get(`/api/runs/${encodeURIComponent(runId)}/artifacts`);
+  const artifacts = responseData(response).artifacts;
+  return Array.isArray(artifacts)
+    ? artifacts.filter((item): item is RunArtifactSummary => Boolean(item && typeof item === "object"))
     : [];
 }
 
-function assertFindingVerification(
-  report: Record<string, unknown>,
-  draft: Record<string, unknown>,
-  votes: Record<string, unknown>[],
-): void {
-  const draftKeys = new Set(recordFindings(draft).map(findingKey));
-  const finalKeys = new Set(recordFindings(report).map(findingKey));
-  const rejectedKeys = new Set<string>();
-  for (const voter of ["evidence", "false_positive"]) {
-    const vote = votes.find((value) => value.voter === voter);
-    const verdicts = vote?.finding_verdicts;
-    if (!Array.isArray(verdicts)) {
-      throw new Error(`PR review ${voter} verifier has no per-finding verdicts`);
-    }
-    const records = verdicts.filter(
-      (value): value is Record<string, unknown> => Boolean(value && typeof value === "object" && !Array.isArray(value)),
-    );
-    const verdictByKey = new Map(records.map((value) => [findingKey(value), value]));
-    for (const key of draftKeys) {
-      const verdict = verdictByKey.get(key);
-      if (!verdict) throw new Error(`PR review ${voter} verifier did not cover a drafted finding`);
-      if (verdict.verdict === "rejected") rejectedKeys.add(key);
-      else if (verdict.verdict !== "confirmed") {
-        throw new Error(`PR review ${voter} verifier returned an invalid finding verdict`);
-      }
-    }
-  }
-  const expectedKeys = new Set([...draftKeys].filter((key) => !rejectedKeys.has(key)));
-  for (const key of finalKeys) {
-    if (rejectedKeys.has(key)) throw new Error("PR review retained a finding rejected by a verifier");
-    if (!expectedKeys.has(key)) throw new Error("PR review published a finding that was not in the verified draft");
-  }
-  for (const key of expectedKeys) {
-    if (!finalKeys.has(key)) throw new Error("PR review refiner removed a finding confirmed by both verifiers");
-  }
-}
-
-function assertQuorumEvidence(
-  report: Record<string, unknown>,
-  published: Record<string, unknown>,
-  persisted: Record<string, unknown>,
-  votes: Record<string, unknown>[],
-): void {
-  const successes = votes.filter((vote) => vote.vote === "accept").length;
-  if (persisted.total !== 3 || persisted.threshold !== 2) {
-    throw new Error("PR review persisted verifier quorum is not 2-of-3");
-  }
-  if (persisted.successes !== successes || persisted.passed !== (successes >= 2)) {
-    throw new Error("PR review persisted verifier quorum disagrees with verifier votes");
-  }
-  for (const field of ["passed", "successes", "total", "threshold"] as const) {
-    if (published[field] !== persisted[field]) {
-      throw new Error(`PR review published quorum mismatch for ${field}`);
-    }
-  }
-  if (persisted.passed === false && report.status !== "inconclusive") {
-    throw new Error("PR review rejected quorum must publish an inconclusive report");
-  }
-}
-
-function runtimeMs(status: Record<string, unknown>): number | null {
-  const created = Date.parse(String(status.created_at ?? ""));
-  const completed = Date.parse(String(status.completed_at ?? ""));
-  return Number.isFinite(created) && Number.isFinite(completed) ? Math.max(0, completed - created) : null;
-}
-
-function markdownWithRuntime(
-  published: PublishedReview,
-  runId: string,
-  status: string,
-  elapsed: number | null,
-  metrics: Record<string, unknown> | null,
-  budget: Record<string, unknown>,
-  votes: Record<string, unknown>[],
-): string {
-  const totals = metrics?.totals as Record<string, unknown> | undefined;
-  const tokens = totals?.tokens as Record<string, unknown> | undefined;
-  const usage = tokens
-    ? `${Number(tokens.input ?? 0) + Number(tokens.output ?? 0)} tokens`
-    : "unavailable";
-  const verifierLines = votes.map((vote) =>
-    `- ${String(vote.voter ?? "unknown")}: ${String(vote.vote ?? "unknown")} (${String(vote.confidence ?? "unknown")})`
-  ).join("\n");
-  return `${published.markdown.trim()}\n\n## HomeRail Run\n\n- Run: \`${runId}\`\n- Status: \`${status}\`\n- Runtime: ${elapsed === null ? "unavailable" : `${Math.round(elapsed / 1000)}s`}\n- Model usage: ${usage}\n- Budget: requested ${String(budget.requested ?? "unknown")}, spent ${String(budget.spent ?? "unknown")}, remaining ${String(budget.remaining ?? "unknown")} of ${String(budget.limit ?? "unknown")}\n\n## Verification Votes\n\n${verifierLines}\n`;
-}
-
-export async function writePrReviewEvidence(
+async function waitForArtifacts(
   client: HomeRailClient,
   runId: string,
-  outputDir: string,
-  knownStatus?: Record<string, unknown>,
-): Promise<PrReviewEvidence> {
-  const status = knownStatus ?? responseData(await client.get(`/api/runs/${encodeURIComponent(runId)}/status`));
-  const handoffResponse = await client.get(`/api/runs/${encodeURIComponent(runId)}/handoffs`);
-  const handoffs = responseData(handoffResponse).handoffs;
-  if (!Array.isArray(handoffs)) throw new Error("Manager returned no persisted handoffs for PR review");
-  const records = handoffs.map((raw) => raw as Record<string, unknown>);
-  const published = handoffs
-    .slice()
-    .reverse()
-    .map((raw) => raw as Record<string, unknown>)
-    .filter((raw) => ["publish", "publish_accepted", "publish_rejected"].includes(handoffNode(raw)))
-    .map((raw) => parsePublishedReview(raw.content))
-    .find((value): value is PublishedReview => Boolean(value));
-  if (!published) throw new Error(`PR review run ${runId} has no published report handoff`);
-  const budget = records
-    .filter((raw) => handoffNode(raw) === "budget")
-    .map((raw) => parseRecord(raw.content))
-    .find((value): value is Record<string, unknown> => Boolean(value?.admitted));
-  if (!budget) throw new Error(`PR review run ${runId} has no admitted budget evidence`);
-  const draft = records
-    .filter((raw) => handoffNode(raw) === "synthesize")
-    .map((raw) => parseRecord(raw.content))
-    .find((value): value is Record<string, unknown> => Boolean(value));
-  if (!draft) throw new Error(`PR review run ${runId} has no synthesized draft evidence`);
-  const voteNodes = new Set(["evidence_vote", "false_positive_vote", "coverage_vote"]);
-  const votes = records
-    .filter((raw) => voteNodes.has(handoffNode(raw)))
-    .map((raw) => parseRecord(raw.content))
-    .filter((value): value is Record<string, unknown> => Boolean(value));
-  if (new Set(votes.map((vote) => vote.voter)).size !== 3) {
-    throw new Error(`PR review run ${runId} does not contain three independent verifier votes`);
+  timeoutSeconds: number,
+  intervalSeconds: number,
+): Promise<RunArtifactSummary[]> {
+  const deadline = Date.now() + timeoutSeconds * 1_000;
+  let last: RunArtifactSummary[] = [];
+  while (Date.now() <= deadline) {
+    last = await listRunArtifacts(client, runId);
+    if (last.length === 0 || last.every((artifact) => TERMINAL_ARTIFACT_STATUSES.has(artifact.status))) return last;
+    await new Promise((resolve) => setTimeout(resolve, intervalSeconds * 1_000));
   }
-  const persistedQuorum = records
-    .filter((raw) => handoffNode(raw) === "verification_quorum")
-    .map((raw) => parseRecord(raw.content))
-    .find((value): value is Record<string, unknown> => Boolean(value));
-  if (!persistedQuorum) throw new Error(`PR review run ${runId} has no persisted verifier quorum`);
-  assertReportIdentity(published.report, budget);
-  assertFindingVerification(published.report, draft, votes);
-  assertQuorumEvidence(published.report, published.quorum, persistedQuorum, votes);
+  const pending = last.filter((artifact) => !TERMINAL_ARTIFACT_STATUSES.has(artifact.status)).map((artifact) => artifact.name);
+  throw new Error(`timed out waiting for DAG artifacts for ${runId}: ${pending.join(", ") || "unknown"}`);
+}
 
-  let metrics: Record<string, unknown> | null = null;
-  try {
-    metrics = responseData(await client.get(`/api/dag-status/${encodeURIComponent(runId)}/metrics`));
-  } catch {
-    // A report remains useful when an older Manager cannot provide metrics.
-  }
-  const runStatus = optionalString(status.status) ?? "unknown";
-  const elapsed = runtimeMs(status);
-  const markdown = markdownWithRuntime(published, runId, runStatus, elapsed, metrics, budget, votes);
-  const target = path.resolve(outputDir);
-  fs.mkdirSync(target, { recursive: true });
-  const jsonPath = path.join(target, "report.json");
-  const markdownPath = path.join(target, "report.md");
-  const evidence: PrReviewEvidence = {
+function printTerminalSummary(
+  runId: string,
+  workflowId: string,
+  status: Record<string, unknown>,
+  artifacts: RunArtifactSummary[],
+  json: boolean,
+): void {
+  const output = {
     run_id: runId,
-    run_status: runStatus,
-    runtime_ms: elapsed,
-    report: published.report,
-    quorum: published.quorum,
-    verification: { votes, quorum: published.quorum },
-    budget,
-    metrics,
-    artifacts: { json: jsonPath, markdown: markdownPath },
+    workflow_id: workflowId,
+    status: String(status.status ?? "unknown"),
+    artifacts,
   };
-  fs.writeFileSync(jsonPath, `${JSON.stringify(evidence, null, 2)}\n`, "utf8");
-  fs.writeFileSync(markdownPath, markdown, "utf8");
-  return evidence;
+  if (json) {
+    console.log(JSON.stringify(output));
+    return;
+  }
+  const lines = [`Run ${runId}: ${output.status}`, `Workflow: ${workflowId}`];
+  if (artifacts.length === 0) {
+    lines.push("Artifacts: none declared");
+  } else {
+    lines.push("Artifacts:");
+    for (const artifact of artifacts) lines.push(`  ${artifact.status.padEnd(8)} ${artifact.name}`);
+    lines.push(`Retrieve with: hr dag artifact ${runId} <name> --output <path>`);
+  }
+  console.log(lines.join("\n"));
 }
 
 export function registerDagRunTemplateCommands(dag: Command, program: Command): void {
@@ -442,10 +259,9 @@ export function registerDagRunTemplateCommands(dag: Command, program: Command): 
     .option("--profile <profile>", "Runtime profile id")
     .option("--setting-id <id>", "Database LLM setting id")
     .option("--run-id <id>", "Explicit run id")
-    .option("--wait", "Wait for terminal status and materialize scenario evidence", false)
+    .option("--wait", "Wait for terminal status and declared artifacts", false)
     .option("--timeout <sec>", "Wait timeout in seconds", "1800")
     .option("--interval <sec>", "Status poll interval in seconds", "2")
-    .option("--output-dir <path>", "Evidence output directory")
     .action(async (template: string, opts: RunTemplateOptions) => {
       const global = program.opts<GlobalOpts>();
       try {
@@ -463,64 +279,11 @@ export function registerDagRunTemplateCommands(dag: Command, program: Command): 
           console.log(global.json ? JSON.stringify(output) : `Run started: ${started.runId}\nWorkflow: ${started.workflowId}`);
           return;
         }
-        const status = await waitForTerminal(
-          client,
-          started.runId,
-          positiveNumber(opts.timeout, "--timeout"),
-          positiveNumber(opts.interval, "--interval"),
-        );
-        if (normalizedTemplate === "pr-closeout") {
-          const evidence = await writePrCloseoutEvidence(
-            client,
-            started.runId,
-            opts.outputDir ?? path.join("artifacts", "pr-closeout"),
-            status,
-          );
-          console.log(global.json ? JSON.stringify(evidence) : fs.readFileSync((evidence.artifacts as { markdown: string }).markdown, "utf8"));
-          return;
-        }
-        if (normalizedTemplate !== "pr-review") {
-          console.log(global.json ? JSON.stringify(status) : `Run ${started.runId}: ${String(status.status ?? "unknown")}`);
-          return;
-        }
-        const evidence = await writePrReviewEvidence(
-          client,
-          started.runId,
-          opts.outputDir ?? path.join("artifacts", "pr-review"),
-          status,
-        );
-        console.log(global.json ? JSON.stringify(evidence) : fs.readFileSync(evidence.artifacts.markdown, "utf8"));
-      } catch (error) {
-        console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
-        process.exitCode = 1;
-      }
-    });
-
-  dag
-    .command("review-report <runId>")
-    .description("Materialize Markdown and JSON evidence for a completed PR Review run")
-    .option("--output-dir <path>", "Evidence output directory", path.join("artifacts", "pr-review"))
-    .action(async (runId: string, opts: ReviewReportOptions) => {
-      const global = program.opts<GlobalOpts>();
-      try {
-        const evidence = await writePrReviewEvidence(getClient(global), runId, opts.outputDir);
-        console.log(global.json ? JSON.stringify(evidence) : fs.readFileSync(evidence.artifacts.markdown, "utf8"));
-      } catch (error) {
-        console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
-        process.exitCode = 1;
-      }
-    });
-
-  dag
-    .command("closeout-report <runId>")
-    .description("Materialize Markdown and JSON evidence for a terminal PR Closeout run")
-    .option("--output-dir <path>", "Evidence output directory", path.join("artifacts", "pr-closeout"))
-    .action(async (runId: string, opts: ReviewReportOptions) => {
-      const global = program.opts<GlobalOpts>();
-      try {
-        const evidence = await writePrCloseoutEvidence(getClient(global), runId, opts.outputDir);
-        const artifacts = evidence.artifacts as { markdown: string };
-        console.log(global.json ? JSON.stringify(evidence) : fs.readFileSync(artifacts.markdown, "utf8"));
+        const timeout = positiveNumber(opts.timeout, "--timeout");
+        const interval = positiveNumber(opts.interval, "--interval");
+        const status = await waitForTerminal(client, started.runId, timeout, interval);
+        const artifacts = await waitForArtifacts(client, started.runId, timeout, interval);
+        printTerminalSummary(started.runId, started.workflowId, status, artifacts, Boolean(global.json));
       } catch (error) {
         console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
         process.exitCode = 1;

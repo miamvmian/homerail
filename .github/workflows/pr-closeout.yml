@@ -70,9 +70,13 @@ jobs:
           if (process.env.VALIDATION_RUN) input.validation_runs = [process.env.VALIDATION_RUN]
           fs.writeFileSync('artifacts/pr-closeout/input.json', JSON.stringify(input))
           NODE
-          node homerail_cli/dist/cli.js --json dag run-template pr-closeout \
-            --input "$(cat artifacts/pr-closeout/input.json)" \
-            > artifacts/pr-closeout/command.json
+          args=(dag run-template pr-closeout --input "$(cat artifacts/pr-closeout/input.json)")
+          if [ "$CLOSEOUT_PHASE" = "draft" ]; then args+=(--wait --timeout 600); fi
+          node homerail_cli/dist/cli.js --json "${args[@]}" > artifacts/pr-closeout/command.json
+          if [ "$CLOSEOUT_PHASE" = "draft" ]; then
+            RUN_ID="$(node -e 'const fs=require("fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).run_id)' artifacts/pr-closeout/command.json)"
+            node homerail_cli/dist/cli.js dag artifact "$RUN_ID" pr-closeout.json --output artifacts/pr-closeout/pr-closeout.json
+          fi
 
       - name: Publish closeout summary
         if: always()
@@ -81,7 +85,9 @@ jobs:
           import fs from 'node:fs'
           const file = 'artifacts/pr-closeout/command.json'
           const command = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {}
-          const snapshot = command.input?.payload ?? {}
+          const artifactFile = 'artifacts/pr-closeout/pr-closeout.json'
+          const artifact = fs.existsSync(artifactFile) ? JSON.parse(fs.readFileSync(artifactFile, 'utf8')) : {}
+          const snapshot = artifact.payload ?? command.input?.payload ?? {}
           const lines = [
             '# HomeRail PR Closeout',
             '',

@@ -3,11 +3,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { HomeRailClient } from "../src/client.js";
 import {
   manualRunEnvelope,
   resolvePrReviewInput,
-  writePrReviewEvidence,
 } from "../src/commands/dag-run-template.js";
 import { createProgram } from "../src/index.js";
 import { orchestrationsDir, resolveTemplatePath } from "../src/commands/templates.js";
@@ -136,6 +134,52 @@ describe("PR Review run-template", () => {
     });
   });
 
+  it("waits for declared artifacts without materializing scenario-specific files", async () => {
+    const assetRoot = path.join(tmpDir, "asset");
+    fs.mkdirSync(path.join(assetRoot, "orchestrations"), { recursive: true });
+    fs.writeFileSync(path.join(assetRoot, "orchestrations", "pr-review.yaml.template"), "api_version: homerail.ai/v1\n");
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      const target = String(url);
+      if (target.endsWith("/api/dag/workflows/sync")) {
+        return response({ success: true, data: { workflow: { workflow_id: "pr-review" } } });
+      }
+      if (target.endsWith("/api/runs/create-and-run")) {
+        return response({ success: true, data: { run_id: "review-run-artifacts" } });
+      }
+      if (target.endsWith("/api/runs/review-run-artifacts/status")) {
+        return response({ success: true, data: { status: "completed" } });
+      }
+      if (target.endsWith("/api/runs/review-run-artifacts/artifacts")) {
+        return response({ success: true, data: { artifacts: [
+          { name: "pr-review.json", status: "ready", media_type: "application/json", sha256: "a".repeat(64) },
+          { name: "pr-review.md", status: "ready", media_type: "text/markdown", sha256: "b".repeat(64) },
+        ] } });
+      }
+      throw new Error(`unexpected URL: ${target}`);
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await createProgram().parseAsync([
+      "node", "hr", "--json", "dag", "run-template", "pr-review",
+      "--input", JSON.stringify({
+        repo: "xiaotianfotos/homerail",
+        pr: 25,
+        base: "a".repeat(40),
+        head: "b".repeat(40),
+      }),
+      "--wait", "--interval", "0.001",
+    ]);
+
+    expect(JSON.parse(String(log.mock.calls[0][0]))).toMatchObject({
+      run_id: "review-run-artifacts",
+      status: "completed",
+      artifacts: [
+        { name: "pr-review.json", status: "ready" },
+        { name: "pr-review.md", status: "ready" },
+      ],
+    });
+  });
+
   it("isolates template discovery by HOMERAIL_HOME", () => {
     const firstHome = path.join(tmpDir, "first-home");
     const secondHome = path.join(tmpDir, "second-home");
@@ -153,205 +197,5 @@ describe("PR Review run-template", () => {
     expect(fs.readFileSync(first, "utf8")).toBe("first");
     expect(fs.readFileSync(second, "utf8")).toBe("second");
     expect(first).not.toBe(second);
-  });
-
-  it("materializes published handoff and metrics as JSON and Markdown", async () => {
-    const published = {
-      report: {
-        repo: "xiaotianfotos/homerail",
-        pr: 25,
-        base: "a".repeat(40),
-        head: "b".repeat(40),
-        status: "findings",
-        confidence: "high",
-        actionable_count: 1,
-        findings: [{ title: "Race", file: "src/run.ts", line: 42 }],
-      },
-      markdown: "# HomeRail PR Review\n\nResult: 1 actionable finding",
-      json_path: "artifacts/pr-review/report.json",
-      markdown_path: "artifacts/pr-review/report.md",
-      quorum: { passed: true, successes: 2, total: 3, threshold: 2 },
-    };
-    const client = {
-      async get(url: string) {
-        if (url.endsWith("/status")) {
-          return { data: { status: "completed", created_at: "2026-07-12T00:00:00Z", completed_at: "2026-07-12T00:04:32Z" } };
-        }
-        if (url.endsWith("/handoffs")) {
-          return { data: { handoffs: [
-            {
-              fromNode: "budget",
-              port: "admitted",
-              content: {
-                admitted: true,
-                requested: 8,
-                spent: 8,
-                remaining: 92,
-                limit: 100,
-                input: { payload: {
-                  repo: "xiaotianfotos/homerail",
-                  pr: 25,
-                  base: "a".repeat(40),
-                  head: "b".repeat(40),
-                } },
-              },
-            },
-            { fromNode: "synthesize", port: "drafted", content: published.report },
-            { fromNode: "evidence_vote", port: "voted", content: { voter: "evidence", vote: "accept", confidence: "high", evidence: "grounded", finding_verdicts: [{ title: "Race", file: "src/run.ts", line: 42, verdict: "confirmed", reason: "reproduced" }] } },
-            { fromNode: "false_positive_vote", port: "voted", content: { voter: "false_positive", vote: "accept", confidence: "high", evidence: "confirmed", finding_verdicts: [{ title: "Race", file: "src/run.ts", line: 42, verdict: "confirmed", reason: "not disproven" }] } },
-            { fromNode: "coverage_vote", port: "voted", content: { voter: "coverage", vote: "reject", confidence: "high", evidence: "incomplete", finding_verdicts: [] } },
-            { fromNode: "verification_quorum", port: "accepted", content: { passed: true, successes: 2, total: 3, threshold: 2 } },
-            { fromNode: "publish", port: "published", content: published },
-          ] } };
-        }
-        if (url.endsWith("/metrics")) {
-          return { data: { totals: { tokens: { input: 100, output: 50 } } } };
-        }
-        throw new Error(`unexpected URL: ${url}`);
-      },
-    } as HomeRailClient;
-
-    const evidence = await writePrReviewEvidence(client, "review-run-25", tmpDir);
-
-    expect(evidence).toMatchObject({
-      run_id: "review-run-25",
-      run_status: "completed",
-      runtime_ms: 272000,
-      quorum: { passed: true },
-      verification: { votes: expect.arrayContaining([expect.objectContaining({ voter: "evidence" })]) },
-      budget: { requested: 8, spent: 8 },
-    });
-    expect(JSON.parse(fs.readFileSync(path.join(tmpDir, "report.json"), "utf8"))).toMatchObject({
-      report: { actionable_count: 1 },
-      metrics: { totals: { tokens: { input: 100, output: 50 } } },
-      budget: { remaining: 92 },
-    });
-    expect(fs.readFileSync(path.join(tmpDir, "report.md"), "utf8"))
-      .toContain("Run: `review-run-25`");
-    expect(fs.readFileSync(path.join(tmpDir, "report.md"), "utf8"))
-      .toContain("Runtime: 272s");
-    expect(fs.readFileSync(path.join(tmpDir, "report.md"), "utf8"))
-      .toContain("false_positive: accept");
-  });
-
-  it("rejects a published report whose immutable PR identity drifted", async () => {
-    const client = {
-      async get(url: string) {
-        if (url.endsWith("/status")) return { data: { status: "completed" } };
-        if (url.endsWith("/handoffs")) return { data: { handoffs: [
-          { fromNode: "budget", content: { admitted: true, input: { payload: {
-            repo: "xiaotianfotos/homerail", pr: 25, base: "a".repeat(40), head: "b".repeat(40),
-          } } } },
-          { fromNode: "synthesize", content: { findings: [] } },
-          { fromNode: "evidence_vote", content: { voter: "evidence", finding_verdicts: [] } },
-          { fromNode: "false_positive_vote", content: { voter: "false_positive", finding_verdicts: [] } },
-          { fromNode: "coverage_vote", content: { voter: "coverage", finding_verdicts: [] } },
-          { fromNode: "verification_quorum", content: { passed: false, successes: 0, total: 3, threshold: 2 } },
-          { fromNode: "publish", content: {
-            report: { repo: "owner/name", pr: 25, base: "", head: "" },
-            markdown: "report",
-            json_path: "artifacts/pr-review/report.json",
-            markdown_path: "artifacts/pr-review/report.md",
-            quorum: {},
-          } },
-        ] } };
-        if (url.endsWith("/metrics")) return { data: {} };
-        throw new Error(`unexpected URL: ${url}`);
-      },
-    } as HomeRailClient;
-
-    await expect(writePrReviewEvidence(client, "review-run-drift", tmpDir))
-      .rejects.toThrow("identity mismatch for repo");
-  });
-
-  it("rejects a published quorum that disagrees with persisted verifier votes", async () => {
-    const report = {
-      repo: "xiaotianfotos/homerail", pr: 25, base: "a".repeat(40), head: "b".repeat(40),
-      status: "pass", findings: [],
-    };
-    const vote = (voter: string) => ({ voter, vote: "accept", confidence: "high", evidence: "ok", finding_verdicts: [] });
-    const client = {
-      async get(url: string) {
-        if (url.endsWith("/status")) return { data: { status: "completed" } };
-        if (url.endsWith("/handoffs")) return { data: { handoffs: [
-          { fromNode: "budget", content: { admitted: true, input: { payload: {
-            repo: report.repo, pr: report.pr, base: report.base, head: report.head,
-          } } } },
-          { fromNode: "synthesize", content: report },
-          { fromNode: "evidence_vote", content: vote("evidence") },
-          { fromNode: "false_positive_vote", content: vote("false_positive") },
-          { fromNode: "coverage_vote", content: vote("coverage") },
-          { fromNode: "verification_quorum", content: { passed: true, successes: 3, total: 3, threshold: 2 } },
-          { fromNode: "publish", content: {
-            report, markdown: "report", quorum: { passed: true, successes: 1, total: 1, threshold: 1 },
-          } },
-        ] } };
-        if (url.endsWith("/metrics")) return { data: {} };
-        throw new Error(`unexpected URL: ${url}`);
-      },
-    } as HomeRailClient;
-
-    await expect(writePrReviewEvidence(client, "review-run-quorum-drift", tmpDir))
-      .rejects.toThrow("published quorum mismatch");
-  });
-
-  it("requires an inconclusive report when verifier quorum fails", async () => {
-    const report = {
-      repo: "xiaotianfotos/homerail", pr: 25, base: "a".repeat(40), head: "b".repeat(40),
-      status: "pass", findings: [],
-    };
-    const vote = (voter: string, decision: string) => ({
-      voter, vote: decision, confidence: "high", evidence: "checked", finding_verdicts: [],
-    });
-    const quorum = { passed: false, successes: 1, total: 3, threshold: 2 };
-    const client = {
-      async get(url: string) {
-        if (url.endsWith("/status")) return { data: { status: "cancelled" } };
-        if (url.endsWith("/handoffs")) return { data: { handoffs: [
-          { fromNode: "budget", content: { admitted: true, input: { payload: {
-            repo: report.repo, pr: report.pr, base: report.base, head: report.head,
-          } } } },
-          { fromNode: "synthesize", content: report },
-          { fromNode: "evidence_vote", content: vote("evidence", "reject") },
-          { fromNode: "false_positive_vote", content: vote("false_positive", "reject") },
-          { fromNode: "coverage_vote", content: vote("coverage", "accept") },
-          { fromNode: "verification_quorum", content: quorum },
-          { fromNode: "publish", content: { report, markdown: "report", quorum } },
-        ] } };
-        if (url.endsWith("/metrics")) return { data: {} };
-        throw new Error(`unexpected URL: ${url}`);
-      },
-    } as HomeRailClient;
-
-    await expect(writePrReviewEvidence(client, "review-run-not-inconclusive", tmpDir))
-      .rejects.toThrow("rejected quorum must publish an inconclusive report");
-  });
-
-  it("rejects a published finding that a verifier disproved", async () => {
-    const report = {
-      repo: "xiaotianfotos/homerail", pr: 25, base: "a".repeat(40), head: "b".repeat(40),
-      findings: [{ title: "False alarm", file: "src/run.ts", line: 7 }],
-    };
-    const client = {
-      async get(url: string) {
-        if (url.endsWith("/status")) return { data: { status: "completed" } };
-        if (url.endsWith("/handoffs")) return { data: { handoffs: [
-          { fromNode: "budget", content: { admitted: true, input: { payload: {
-            repo: report.repo, pr: report.pr, base: report.base, head: report.head,
-          } } } },
-          { fromNode: "synthesize", content: report },
-          { fromNode: "evidence_vote", content: { voter: "evidence", finding_verdicts: [{ ...report.findings[0], verdict: "confirmed", reason: "grounded" }] } },
-          { fromNode: "false_positive_vote", content: { voter: "false_positive", finding_verdicts: [{ ...report.findings[0], verdict: "rejected", reason: "unreachable" }] } },
-          { fromNode: "coverage_vote", content: { voter: "coverage", finding_verdicts: [] } },
-          { fromNode: "verification_quorum", content: { passed: true, successes: 2, total: 3, threshold: 2 } },
-          { fromNode: "publish", content: { report, markdown: "report", quorum: {} } },
-        ] } };
-        if (url.endsWith("/metrics")) return { data: {} };
-        throw new Error(`unexpected URL: ${url}`);
-      },
-    } as HomeRailClient;
-
-    await expect(writePrReviewEvidence(client, "review-run-false-positive", tmpDir))
-      .rejects.toThrow("retained a finding rejected by a verifier");
   });
 });

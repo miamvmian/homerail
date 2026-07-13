@@ -167,6 +167,27 @@ artifacts:
       timeout_ms: 120000
 ```
 
+When a handoff object contains both machine-readable JSON and rendered text,
+select a nested value with an RFC 6901 JSON Pointer instead of adding a
+scenario-specific export command:
+
+```yaml
+artifacts:
+  - name: review.md
+    source:
+      type: handoff
+      node: publish
+      port: published
+      json_pointer: /markdown
+    media_type: text/markdown
+    required: true
+    publish: always
+```
+
+Pointers are evaluated only against the validated handoff value. Missing or
+invalid paths fail that artifact, and selected JSON values are validated against
+the artifact contract when one is declared.
+
 Artifact names are flat safe filenames. Workspace paths must be normalized
 relative POSIX paths; absolute paths, `..`, backslashes, symbolic links, and
 non-file/directory entries are rejected. `publish` is `success`, `failure`, or

@@ -103,17 +103,20 @@ jobs:
           REVIEW_PROFILE: ${{ secrets.HOMERAIL_PR_REVIEW_PROFILE }}
         run: |
           mkdir -p artifacts/pr-review
-          args=(dag run-template pr-review --input "$REVIEW_INPUT" --wait --timeout 3300 --output-dir artifacts/pr-review)
+          args=(dag run-template pr-review --input "$REVIEW_INPUT" --wait --timeout 3300)
           if [ -n "$REVIEW_PROFILE" ]; then args+=(--profile "$REVIEW_PROFILE"); fi
           node homerail_cli/dist/cli.js --json "${args[@]}" > artifacts/pr-review/command.json
+          RUN_ID="$(node -e 'const fs=require("fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).run_id)' artifacts/pr-review/command.json)"
+          node homerail_cli/dist/cli.js dag artifact "$RUN_ID" pr-review.json --output artifacts/pr-review/pr-review.json
+          node homerail_cli/dist/cli.js dag artifact "$RUN_ID" pr-review.md --output artifacts/pr-review/pr-review.md
 
       - name: Publish non-blocking Check summary
         if: always()
         env:
           STEP_OUTCOME: ${{ steps.review.outcome }}
         run: |
-          if [ -s artifacts/pr-review/report.md ]; then
-            cat artifacts/pr-review/report.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -s artifacts/pr-review/pr-review.md ]; then
+            cat artifacts/pr-review/pr-review.md >> "$GITHUB_STEP_SUMMARY"
           else
             {
               echo '# HomeRail PR Review'

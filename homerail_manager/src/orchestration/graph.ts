@@ -101,6 +101,7 @@ export interface DAGHandoffArtifactDeclaration {
     type: "handoff";
     node: string;
     port: string;
+    json_pointer?: string;
   };
   media_type: "application/json" | "text/markdown" | "text/plain";
   contract?: string;

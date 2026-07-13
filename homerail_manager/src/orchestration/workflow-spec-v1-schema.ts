@@ -345,6 +345,10 @@ const HandoffArtifact = Type.Object({
     type: Type.Literal("handoff"),
     node: Identifier,
     port: Identifier,
+    json_pointer: Type.Optional(Type.String({
+      maxLength: 1024,
+      pattern: "^(?:/(?:[^~/]|~[01])*)*$",
+    })),
   }, { additionalProperties: false }),
   media_type: Type.Union([
     Type.Literal("application/json"),

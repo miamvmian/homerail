@@ -1,6 +1,3 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
-
 import type { HomeRailClient } from "../client.js";
 
 const SHA_PATTERN = /^[0-9a-f]{7,64}$/i;
@@ -412,57 +409,4 @@ export function manualCloseoutEnvelope(input: ResolvedPrCloseoutInput): Record<s
     fire_key: `pr-closeout:${input.repo}#${input.pr}:${input.head}:${input.phase}`,
     payload: input,
   };
-}
-
-export async function writePrCloseoutEvidence(
-  client: HomeRailClient,
-  runId: string,
-  outputDir: string,
-  status?: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
-  const runStatus = status ?? responseData(await client.get(`/api/runs/${encodeURIComponent(runId)}/status`));
-  const handoffData = responseData(await client.get(`/api/runs/${encodeURIComponent(runId)}/handoffs`));
-  const handoffs = Array.isArray(handoffData.handoffs) ? handoffData.handoffs as Record<string, unknown>[] : [];
-  const routed = handoffs.find((handoff) => String(handoff.fromNode ?? handoff.from_node ?? "") === "status_gate");
-  const envelope = parseRecord(routed?.content);
-  const snapshot = parseRecord(envelope?.payload) ?? envelope;
-  if (!snapshot || !optionalString(snapshot.closeout_status)) {
-    throw new Error(`PR closeout run ${runId} has no authoritative status handoff`);
-  }
-  const approval = handoffs
-    .filter((handoff) => String(handoff.fromNode ?? handoff.from_node ?? "") === "merge_approval")
-    .map((handoff) => parseRecord(handoff.content))
-    .find(Boolean) ?? null;
-  const evidence = {
-    run_id: runId,
-    run_status: String(runStatus.status ?? "unknown"),
-    closeout_status: snapshot.closeout_status,
-    repo: snapshot.repo,
-    pr: snapshot.pr,
-    base: snapshot.base,
-    head: snapshot.head,
-    phase: snapshot.phase,
-    blockers: snapshot.blockers,
-    validation_evidence: snapshot.evidence,
-    github: snapshot.github,
-    approval,
-    merge_performed: false,
-  };
-  const blockers = Array.isArray(snapshot.blockers) ? snapshot.blockers as Record<string, unknown>[] : [];
-  const markdown = `# HomeRail PR Closeout\n\n` +
-    `- PR: ${String(snapshot.repo)}#${String(snapshot.pr)}\n` +
-    `- Head: \`${String(snapshot.head)}\`\n` +
-    `- Phase: \`${String(snapshot.phase)}\`\n` +
-    `- Result: **${String(snapshot.closeout_status)}**\n` +
-    `- Run: \`${runId}\`\n` +
-    `- Merge performed: no\n\n` +
-    `## Blockers\n\n` +
-    (blockers.length === 0 ? "None.\n" : blockers.map((item) => `- \`${String(item.code)}\`: ${String(item.message)}`).join("\n") + "\n");
-  const target = path.resolve(outputDir);
-  fs.mkdirSync(target, { recursive: true });
-  const jsonPath = path.join(target, "closeout.json");
-  const markdownPath = path.join(target, "closeout.md");
-  fs.writeFileSync(jsonPath, `${JSON.stringify(evidence, null, 2)}\n`, "utf8");
-  fs.writeFileSync(markdownPath, markdown, "utf8");
-  return { ...evidence, artifacts: { json: jsonPath, markdown: markdownPath } };
 }

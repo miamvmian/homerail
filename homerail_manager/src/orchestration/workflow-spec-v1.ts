@@ -325,7 +325,7 @@ function semanticDiagnostics(context: SourceContext, workflow: WorkflowSpecV1): 
       if (artifact.contract && !contracts[artifact.contract]) {
         add(`${artifactPath}/contract`, "DAG_SEMANTIC_UNKNOWN_CONTRACT", `unknown artifact contract '${artifact.contract}'`);
       }
-      if (artifact.contract && sourcePort && sourcePort.contract !== artifact.contract) {
+      if (artifact.contract && sourcePort && !artifact.source.json_pointer && sourcePort.contract !== artifact.contract) {
         add(
           `${artifactPath}/contract`,
           "DAG_SEMANTIC_ARTIFACT_CONTRACT_MISMATCH",
@@ -737,6 +737,9 @@ function canonicalArtifact(artifact: WorkflowSpecV1Artifact): DAGArtifactDeclara
         type: "handoff",
         node: artifact.source.node,
         port: artifact.source.port,
+        ...(artifact.source.json_pointer !== undefined
+          ? { json_pointer: artifact.source.json_pointer }
+          : {}),
       },
       media_type: artifact.media_type,
       ...(artifact.contract ? { contract: artifact.contract } : {}),

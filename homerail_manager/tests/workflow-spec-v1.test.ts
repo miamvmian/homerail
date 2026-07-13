@@ -220,6 +220,38 @@ describe("WorkflowSpec v1", () => {
     ]);
   });
 
+  it("preserves a bounded handoff JSON pointer for nested text artifacts", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.artifacts = [{
+      name: "summary.md",
+      source: {
+        type: "handoff",
+        node: "execute",
+        port: "result",
+        json_pointer: "/details/summary",
+      },
+      media_type: "text/markdown",
+      required: true,
+      publish: "always",
+    }];
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid, result.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(result.canonical?.artifacts).toEqual([{
+      name: "summary.md",
+      source: {
+        type: "handoff",
+        node: "execute",
+        port: "result",
+        json_pointer: "/details/summary",
+      },
+      media_type: "text/markdown",
+      required: true,
+      publish: "always",
+    }]);
+  });
+
   it("rejects unsafe, duplicate, and contract-invalid artifact declarations", () => {
     const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
     workflow.spec.artifacts = [

@@ -43,7 +43,30 @@ spec:
               maxItems: 100
               items: { type: object, additionalProperties: true }
 
+  artifacts:
+    - name: pr-closeout.json
+      source: { type: handoff, node: artifact_snapshot, port: snapshot }
+      media_type: application/json
+      contract: CloseoutEnvelope
+      required: true
+      publish: always
+
   nodes:
+    artifact_snapshot:
+      kind: condition
+      inputs:
+        snapshot: { contract: CloseoutEnvelope }
+      outputs:
+        snapshot: { contract: CloseoutEnvelope }
+      config:
+        field: payload.closeout_status
+        routes:
+          ready_for_review: snapshot
+          ready_for_human_merge_candidate: snapshot
+          blocked: snapshot
+          stale_evidence: snapshot
+        default: snapshot
+
     status_gate:
       kind: condition
       inputs:
@@ -106,7 +129,8 @@ spec:
         snapshot: { contract: CloseoutEnvelope }
 
   edges:
-    - { from: $run.input, to: status_gate.snapshot }
+    - { from: $run.input, to: artifact_snapshot.snapshot }
+    - { from: artifact_snapshot.snapshot, to: status_gate.snapshot }
     - { from: status_gate.ready_for_review, to: ready_for_review.snapshot }
     - { from: status_gate.merge_candidate, to: merge_approval.proposal }
     - { from: merge_approval.approved, to: ready_for_human_merge.snapshot }

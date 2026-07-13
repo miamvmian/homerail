@@ -144,6 +144,30 @@ describe("run artifacts", () => {
     expect(fs.readFileSync(blobPath!, "utf8")).toBe("# Diagnosis\n\nEverything is grounded.\n");
   });
 
+  it("selects a nested handoff field with an RFC 6901 JSON pointer", async () => {
+    const parsed = artifactDag();
+    parsed.meta.contracts = undefined;
+    parsed.meta.artifacts = [{
+      name: "report.md",
+      source: { type: "handoff", node: "execute", port: "reported", json_pointer: "/rendered~1markdown" },
+      media_type: "text/markdown",
+      required: true,
+      publish: "always",
+    }];
+    delete parsed.graph.nodes[0]?.extra;
+    createActiveRun("artifact-pointer-run", parsed);
+    handoffActiveRun("artifact-pointer-run", "execute", "reported", {
+      status: "ok",
+      details: {},
+      "rendered/markdown": "# Verified review",
+    });
+
+    await finalizeRunArtifacts("artifact-pointer-run", "success");
+
+    const blobPath = getRunArtifactBlobPath("artifact-pointer-run", "report.md");
+    expect(fs.readFileSync(blobPath!, "utf8")).toBe("# Verified review\n");
+  });
+
   it("serializes a raw string contract as a valid JSON string artifact", async () => {
     const parsed = artifactDag();
     parsed.meta.contracts = { Text: { type: "string" } };

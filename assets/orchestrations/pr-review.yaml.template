@@ -199,20 +199,79 @@ spec:
     PublishedReview:
       type: object
       additionalProperties: false
-      required: [report, markdown, json_path, markdown_path, quorum]
+      required: [report, markdown, quorum]
       properties:
         report: { type: object }
         markdown: { type: string, minLength: 1, maxLength: 100000 }
-        json_path: { type: string, const: "artifacts/pr-review/report.json" }
-        markdown_path: { type: string, const: "artifacts/pr-review/report.md" }
         quorum:
           type: object
+          additionalProperties: false
           required: [passed, successes, total, threshold]
           properties:
             passed: { type: boolean }
-            successes: { type: integer }
-            total: { type: integer }
-            threshold: { type: integer }
+            successes: { type: integer, minimum: 0, maximum: 3 }
+            total: { type: integer, const: 3 }
+            threshold: { type: integer, const: 2 }
+      allOf:
+        - if:
+            properties:
+              quorum:
+                type: object
+                required: [successes]
+                properties:
+                  successes: { type: integer, maximum: 1 }
+          then:
+            properties:
+              quorum:
+                type: object
+                required: [passed]
+                properties:
+                  passed: { const: false }
+        - if:
+            properties:
+              quorum:
+                type: object
+                required: [successes]
+                properties:
+                  successes: { type: integer, minimum: 2 }
+          then:
+            properties:
+              quorum:
+                type: object
+                required: [passed]
+                properties:
+                  passed: { const: true }
+        - if:
+            properties:
+              quorum:
+                type: object
+                required: [passed]
+                properties:
+                  passed: { const: false }
+          then:
+            properties:
+              report:
+                type: object
+                required: [status]
+                properties:
+                  status: { const: inconclusive }
+
+  artifacts:
+    - name: pr-review.json
+      source: { type: handoff, node: publish, port: published }
+      media_type: application/json
+      contract: PublishedReview
+      required: true
+      publish: always
+    - name: pr-review.md
+      source:
+        type: handoff
+        node: publish
+        port: published
+        json_pointer: /markdown
+      media_type: text/markdown
+      required: true
+      publish: always
 
   agents:
     preparer:
@@ -439,9 +498,9 @@ spec:
         the authoritative verifier quorum is exactly input.quorum.values[0].
         Copy passed, successes, total, and threshold from that inner object, not
         from the outer merge wrapper. Publish without
-        changing findings. The persisted handoff is the authoritative artifact;
-        the CLI materializes it as JSON and Markdown. Do not call Bash, Write,
-        Edit, or MultiEdit. Markdown must include
+        changing findings. The persisted handoff is materialized by Manager as
+        the declared pr-review.json and pr-review.md artifacts. Do not call Bash,
+        Write, Edit, or MultiEdit. Markdown must include
         result, confidence, actionable finding count, repo, PR, base, head,
         findings with file and line, reviewer summaries, quorum result, and the
         HomeRail run id available in runtime context. When the inner quorum
@@ -450,7 +509,7 @@ spec:
         report.status to inconclusive and explain that verification did not
         reach consensus. Do not end with prose. Your final action MUST call
         handoff on published with exactly this shape and no extra keys:
-        {"report":{},"markdown":"text","json_path":"artifacts/pr-review/report.json","markdown_path":"artifacts/pr-review/report.md","quorum":{"passed":true,"successes":2,"total":3,"threshold":2}}
+        {"report":{},"markdown":"text","quorum":{"passed":true,"successes":2,"total":3,"threshold":2}}
         If input:correction exists, do not re-analyze or call any tool except
         handoff; immediately resubmit the existing publication in the exact shape.
 

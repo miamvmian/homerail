@@ -44,14 +44,14 @@ be supplied by an event payload.
 7. A branch-merge join normalizes either quorum outcome into one path. A
    refiner removes findings specifically rejected by an evidence or
    false-positive verdict and recomputes the report.
-8. A publisher persists the final handoff and the CLI materializes Markdown and
-   JSON evidence. Failed quorum produces an `inconclusive` report instead of a
-   false clean result.
+8. A publisher persists the final handoff and Manager materializes the declared
+   Markdown and JSON artifacts. Failed quorum produces an `inconclusive` report
+   instead of a false clean result.
 
 ## Outputs
 
-- `artifacts/pr-review/report.json`
-- `artifacts/pr-review/report.md`
+- `pr-review.json`
+- `pr-review.md`
 - four independent reviewer handoffs
 - three independent verification votes
 - per-finding evidence and false-positive verdicts
@@ -66,11 +66,11 @@ submit a GitHub review, approve a PR, or merge code.
 
 `.github/workflows/pr-review.yml` is intentionally thin. It converts GitHub
 event fields into the public CLI input, calls `hr dag run-template ... --wait`,
-uploads the generated evidence, and copies `report.md` into the GitHub Check
-summary. The CLI refuses to export a report when immutable PR identity drifts,
-a verifier omits a final finding, or a rejected finding remains in the final
-report. It also requires the final finding set to equal the draft minus rejected
-findings and verifies the published quorum against the three persisted votes.
+downloads the two declared artifacts through the generic run-artifact commands,
+uploads them as CI evidence, and copies `pr-review.md` into the GitHub Check
+summary. Workflow contracts, per-finding verification, and the deterministic
+quorum remain authoritative; the adapter does not reconstruct a report from
+raw handoffs.
 The review step uses `continue-on-error`, so findings or an inconclusive run do
 not block merging.
 

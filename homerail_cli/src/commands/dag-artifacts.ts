@@ -19,6 +19,7 @@ export interface RunArtifact {
     type: "handoff" | "workspace";
     node?: string;
     port?: string;
+    json_pointer?: string;
     path?: string;
     produced_by?: string;
   };
@@ -36,7 +37,9 @@ interface ArtifactListResponse {
 }
 
 function sourceLabel(artifact: RunArtifact): string {
-  if (artifact.source.type === "handoff") return `${artifact.source.node}.${artifact.source.port}`;
+  if (artifact.source.type === "handoff") {
+    return `${artifact.source.node}.${artifact.source.port}${artifact.source.json_pointer ?? ""}`;
+  }
   return `${artifact.source.path} (${artifact.source.produced_by})`;
 }
 

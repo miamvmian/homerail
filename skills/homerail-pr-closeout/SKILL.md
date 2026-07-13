@@ -39,4 +39,8 @@ workflow may pause at `merge_approval`. Return the real run id and the exact
 blocker list or pending approval hash. Only `human:owner` may decide that
 approval, and the user still merges manually.
 
+After a terminal decision, consume the declared `pr-closeout.json` artifact
+with `hr dag artifact <run-id> pr-closeout.json --output pr-closeout.json`.
+Never reconstruct closeout evidence by scraping handoffs.
+
 Read `docs/scenarios/pr-closeout.md` for the full evidence contract.

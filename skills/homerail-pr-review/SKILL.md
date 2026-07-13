@@ -37,8 +37,14 @@ hr dag run-template pr-review \
 ```
 
 The CLI resolves omitted base/head metadata from GitHub, validates the final
-input contract, syncs the tracked Asset, and starts the run. Add `--wait` and
-`--output-dir artifacts/pr-review` for CI or unattended operation.
+input contract, syncs the tracked Asset, and starts the run. Add `--wait` for CI
+or unattended operation, then retrieve fixed outputs with:
+
+```bash
+hr dag artifacts <run-id>
+hr dag artifact <run-id> pr-review.json --output pr-review.json
+hr dag artifact <run-id> pr-review.md --output pr-review.md
+```
 
 ## Evidence Contract
 
@@ -50,11 +56,10 @@ A useful run contains:
 - one machine-readable verdict per final finding from both the evidence and
   false-positive verifiers;
 - a deterministic two-of-three quorum payload;
-- `artifacts/pr-review/report.json` and `report.md`;
+- declared `pr-review.json` and `pr-review.md` artifacts;
 - Manager audit and metrics records for the run.
 
 Treat a cancelled run with a published report as `inconclusive`, not as a clean
-review. Infrastructure or contract failures are errors and must not be rendered
-as zero findings. Evidence export must fail if a published finding was rejected
-by either per-finding verifier, omitted from either verifier's coverage, or the
-published quorum disagrees with the three persisted votes.
+review. Infrastructure, contract, or artifact failures are errors and must not
+be rendered as zero findings. Do not reconstruct a report by scraping raw
+handoffs; consume only the Manager-validated declared artifacts.

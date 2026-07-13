@@ -1,10 +1,6 @@
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
-import type { HomeRailClient } from "../src/client.js";
-import { resolvePrCloseoutInput, writePrCloseoutEvidence } from "../src/commands/dag-pr-closeout.js";
+import { resolvePrCloseoutInput } from "../src/commands/dag-pr-closeout.js";
 
 function response(body: unknown, status = 200): Response {
   return {
@@ -228,44 +224,4 @@ describe("PR closeout input", () => {
     }));
   });
 
-  it("materializes the authoritative route handoff and states that no merge occurred", async () => {
-    const output = fs.mkdtempSync(path.join(os.tmpdir(), "homerail-closeout-report-"));
-    const snapshot = {
-      repo: "xiaotianfotos/homerail",
-      pr: 26,
-      base: "a".repeat(40),
-      head: "b".repeat(40),
-      phase: "draft",
-      closeout_status: "ready_for_review",
-      blockers: [],
-      evidence: [{ source: "local", name: "CI", head: "b".repeat(40), status: "passed", fresh: true }],
-      github: { draft: true },
-    };
-    const client = {
-      async get(url: string) {
-        if (url.endsWith("/status")) return { data: { status: "completed" } };
-        if (url.endsWith("/handoffs")) {
-          return { data: { handoffs: [{
-            fromNode: "status_gate",
-            port: "ready_for_review",
-            content: { trigger_id: "manual", trigger_type: "manual", fire_key: "key", payload: snapshot },
-          }] } };
-        }
-        throw new Error(`unexpected Manager URL: ${url}`);
-      },
-    } as HomeRailClient;
-
-    try {
-      const evidence = await writePrCloseoutEvidence(client, "closeout-run-26", output);
-      expect(evidence).toMatchObject({
-        closeout_status: "ready_for_review",
-        merge_performed: false,
-        head: "b".repeat(40),
-      });
-      expect(fs.readFileSync(path.join(output, "closeout.md"), "utf8")).toContain("Merge performed: no");
-      expect(JSON.parse(fs.readFileSync(path.join(output, "closeout.json"), "utf8"))).toMatchObject({ merge_performed: false });
-    } finally {
-      fs.rmSync(output, { recursive: true, force: true });
-    }
-  });
 });

@@ -35,8 +35,13 @@ hr dag run-template pr-closeout --wait \
       "platform":"macos",
       "command":"npm run ci"
     }]
-  }' \
-  --output-dir artifacts/pr-closeout
+  }'
+```
+
+The terminal run declares `pr-closeout.json`. Retrieve it generically:
+
+```bash
+hr dag artifact <run-id> pr-closeout.json --output pr-closeout.json
 ```
 
 Operator-attested local evidence can only establish `ready_for_review`. It is
@@ -70,7 +75,8 @@ hr dag decide <run-id> merge_approval \
   --decision approved \
   --actor human:owner \
   --proposal-hash <hash>
-hr dag closeout-report <run-id>
+hr dag artifacts <run-id>
+hr dag artifact <run-id> pr-closeout.json --output pr-closeout.json
 ```
 
 Approval is hash-bound, survives Manager restart, expires after seven days,

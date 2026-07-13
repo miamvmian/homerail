@@ -5,10 +5,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { compileWorkflowSource } from "../src/orchestration/workflow-spec-v1.js";
 import { parseWorkflowSource } from "../src/orchestration/workflow-spec-v1.js";
+import { validateJsonContract } from "../src/orchestration/json-contract.js";
 import { FakeDAGDispatcher } from "../src/orchestration/dag-dispatcher.js";
 import { GraphExecutor } from "../src/orchestration/graph-executor.js";
 import { closeDb } from "../src/persistence/db.js";
 import { loadRunSnapshot } from "../src/persistence/store.js";
+import { getRunArtifactBlobPath } from "../src/persistence/run-artifacts.js";
 import {
   _clearActiveRuns,
   getActiveRun,
@@ -21,6 +23,7 @@ import {
   ensureManagerSkillsInstalled,
   readManagerSkill,
 } from "../src/server/manager-skills.js";
+import { finalizeRunArtifacts } from "../src/runtime/run-artifact-service.js";
 
 describe("PR Review scenario assets", () => {
   let oldHome: string | undefined;
@@ -55,6 +58,18 @@ describe("PR Review scenario assets", () => {
     expect(result.valid).toBe(true);
     expect(result.diagnostics).toEqual([]);
     expect(result.summary).toMatchObject({ workflow_id: "pr-review", node_count: 31, edge_count: 40 });
+    expect(result.canonical?.artifacts).toEqual([
+      expect.objectContaining({
+        name: "pr-review.json",
+        source: { type: "handoff", node: "publish", port: "published" },
+        contract: "PublishedReview",
+      }),
+      expect.objectContaining({
+        name: "pr-review.md",
+        source: { type: "handoff", node: "publish", port: "published", json_pointer: "/markdown" },
+        media_type: "text/markdown",
+      }),
+    ]);
     const nodes = result.canonical?.nodes ?? [];
     expect(nodes.filter((node) => node.id.endsWith("_review")).map((node) => node.id).sort()).toEqual([
       "frontend_review",
@@ -99,6 +114,31 @@ describe("PR Review scenario assets", () => {
     expect(nodes.find((node) => node.id === "synthesize")?.inputs).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: "context" }),
     ]));
+
+    const publishedContract = parseWorkflowSource(source).meta.contracts?.PublishedReview;
+    const publication = {
+      report: { status: "pass" },
+      markdown: "# Review",
+      quorum: { passed: true, successes: 2, total: 3, threshold: 2 },
+    };
+    expect(validateJsonContract(publishedContract, publication)).toMatchObject({ valid: true });
+    expect(validateJsonContract(publishedContract, {
+      ...publication,
+      quorum: { passed: true, successes: 1, total: 3, threshold: 2 },
+    })).toMatchObject({ valid: false });
+    expect(validateJsonContract(publishedContract, {
+      ...publication,
+      quorum: { passed: false, successes: 2, total: 3, threshold: 2 },
+    })).toMatchObject({ valid: false });
+    expect(validateJsonContract(publishedContract, {
+      ...publication,
+      quorum: { passed: false, successes: 1, total: 3, threshold: 2 },
+    })).toMatchObject({ valid: false });
+    expect(validateJsonContract(publishedContract, {
+      ...publication,
+      report: { status: "inconclusive" },
+      quorum: { passed: false, successes: 1, total: 3, threshold: 2 },
+    })).toMatchObject({ valid: true });
   });
 
   it("installs Manager guidance and lists tracked template assets", async () => {
@@ -120,6 +160,9 @@ describe("PR Review scenario assets", () => {
     expect(workflow.match(/continue-on-error: true/g)).toHaveLength(2);
     expect(workflow.match(/^    env:$/gm)).toHaveLength(1);
     expect(workflow).toContain("dag run-template pr-review");
+    expect(workflow).toContain('dag artifact "$RUN_ID" pr-review.json');
+    expect(workflow).toContain('dag artifact "$RUN_ID" pr-review.md');
+    expect(workflow).not.toContain("--output-dir");
     expect(workflow).toContain("$GITHUB_STEP_SUMMARY");
   });
 
@@ -128,13 +171,15 @@ describe("PR Review scenario assets", () => {
     expect(workflow).toContain("workflow_dispatch:");
     expect(workflow).not.toContain("pull_request_target:");
     expect(workflow).toContain("dag run-template pr-closeout");
+    expect(workflow).toContain('dag artifact "$RUN_ID" pr-closeout.json');
+    expect(workflow).not.toContain("closeout-report");
     expect(workflow).toContain("HOMERAIL_HOME: ${{ runner.temp }}/homerail-pr-closeout-cli-${{ github.run_id }}");
     expect(workflow.match(/^    env:$/gm)).toHaveLength(1);
     expect(workflow).not.toContain("gh pr merge");
     expect(workflow).toContain("This workflow never merges the pull request.");
   });
 
-  it("executes budget, four reviews, synthesis, 2-of-3 quorum, and publication", () => {
+  it("executes budget, four reviews, synthesis, 2-of-3 quorum, and publication", async () => {
     const source = fs.readFileSync(
       path.resolve(process.cwd(), "..", "assets", "orchestrations", "pr-review.yaml.template"),
       "utf8",
@@ -222,8 +267,6 @@ describe("PR Review scenario assets", () => {
     handoffActiveRun("pr-review-runtime", "publish", "published", {
       report,
       markdown: "# HomeRail PR Review\n\nNo actionable findings.",
-      json_path: "artifacts/pr-review/report.json",
-      markdown_path: "artifacts/pr-review/report.md",
       quorum: { passed: true, successes: 2, total: 3, threshold: 2 },
     });
     executor.tick("pr-review-runtime");
@@ -233,5 +276,14 @@ describe("PR Review scenario assets", () => {
       fromNode: "publish",
       port: "published",
     }));
+
+    expect(await finalizeRunArtifacts("pr-review-runtime", "success")).toEqual([
+      expect.objectContaining({ name: "pr-review.json", status: "ready" }),
+      expect.objectContaining({ name: "pr-review.md", status: "ready" }),
+    ]);
+    expect(JSON.parse(fs.readFileSync(getRunArtifactBlobPath("pr-review-runtime", "pr-review.json")!, "utf8")))
+      .toMatchObject({ report: { status: "pass" }, quorum: { passed: true, successes: 2 } });
+    expect(fs.readFileSync(getRunArtifactBlobPath("pr-review-runtime", "pr-review.md")!, "utf8"))
+      .toBe("# HomeRail PR Review\n\nNo actionable findings.\n");
   });
 });

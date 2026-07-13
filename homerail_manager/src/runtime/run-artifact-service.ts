@@ -72,6 +72,35 @@ function jsonArtifactValue(content: unknown, schema: unknown): unknown {
   }
 }
 
+function handoffArtifactValue(content: unknown, pointer: string | undefined): unknown {
+  if (pointer === undefined || pointer === "") return content;
+  let current = content;
+  if (typeof current === "string") {
+    try {
+      current = JSON.parse(current) as unknown;
+    } catch {
+      throw new Error(`artifact JSON pointer '${pointer}' requires structured handoff content`);
+    }
+  }
+  for (const rawToken of pointer.slice(1).split("/")) {
+    const token = rawToken.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (Array.isArray(current)) {
+      if (!/^(?:0|[1-9][0-9]*)$/.test(token)) {
+        throw new Error(`artifact JSON pointer '${pointer}' has an invalid array index '${token}'`);
+      }
+      const index = Number(token);
+      if (index >= current.length) throw new Error(`artifact JSON pointer '${pointer}' did not resolve`);
+      current = current[index];
+      continue;
+    }
+    if (!current || typeof current !== "object" || !Object.prototype.hasOwnProperty.call(current, token)) {
+      throw new Error(`artifact JSON pointer '${pointer}' did not resolve`);
+    }
+    current = (current as Record<string, unknown>)[token];
+  }
+  return current;
+}
+
 function emitRecord(type: "pending" | "ready" | "failed" | "skipped", record: RunArtifactRecord): void {
   emit(`dag:artifact_${type}`, {
     runId: record.run_id,
@@ -103,16 +132,17 @@ function materializeHandoffArtifact(
     .at(-1);
   if (!handoff) throw new Error(`handoff ${declaration.source.node}.${declaration.source.port} was not produced`);
 
+  const content = handoffArtifactValue(handoff.content, declaration.source.json_pointer);
   let bytes: Buffer;
   if (declaration.media_type === "application/json") {
     const schema = declaration.contract ? contractsForRun(runId)[declaration.contract] : undefined;
-    const value = jsonArtifactValue(handoff.content, schema);
+    const value = jsonArtifactValue(content, schema);
     bytes = Buffer.from(`${JSON.stringify(deepSortJson(value), null, 2)}\n`, "utf8");
   } else {
-    if (typeof handoff.content !== "string") {
+    if (typeof content !== "string") {
       throw new Error(`${declaration.media_type} handoff content must be a string`);
     }
-    bytes = Buffer.from(handoff.content.endsWith("\n") ? handoff.content : `${handoff.content}\n`, "utf8");
+    bytes = Buffer.from(content.endsWith("\n") ? content : `${content}\n`, "utf8");
   }
 
   const record = writeRunArtifactBytes(runId, declaration.name, bytes);

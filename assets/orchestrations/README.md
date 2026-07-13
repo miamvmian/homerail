@@ -129,12 +129,13 @@ review with runtime, security, tests, and frontend specialists plus independent
 ```bash
 hr dag run-template pr-review \
   --input '{"repo":"xiaotianfotos/homerail","pr":25}' \
-  --wait --output-dir artifacts/pr-review
+  --wait
 ```
 
 The CLI resolves immutable base/head SHAs, syncs the tracked WorkflowSpec, and
-writes `report.json` and `report.md`. The workflow never commits, approves, or
-merges a pull request.
+waits for its declared `pr-review.json` and `pr-review.md` artifacts. Retrieve
+either output with `hr dag artifact <run-id> <name> --output <path>`. The
+workflow never commits, approves, or merges a pull request.
 
 ## Scorecard Policy
 
