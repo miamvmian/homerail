@@ -1094,6 +1094,12 @@ async function submitVoiceWorkspaceToManagerAgent(
     .map((item) => shortText(String(item || "").trim(), 120))
     .filter((item) => item && !alreadyStreamed.has(item))
     .slice(0, 6);
+  const agentErrors = Array.isArray(result.agent_errors)
+    ? result.agent_errors.map((item) => shortText(String(item || "").trim(), 500)).filter(Boolean).slice(0, 10)
+    : [];
+  for (const error of agentErrors) {
+    appendDebugEvent(workspace, "manager_agent_warning", error, "warning");
+  }
   const runId = typeof result.run_id === "string" && result.run_id.trim() ? result.run_id.trim() : undefined;
   const runIds = Array.isArray(result.run_ids)
     ? result.run_ids.map((item) => String(item || "").trim()).filter(Boolean)
@@ -1143,6 +1149,7 @@ async function submitVoiceWorkspaceToManagerAgent(
       effective_config: objectValue(result.effective_config) ?? null,
       tool_calls: Array.isArray(result.tool_calls) ? result.tool_calls : [],
       tool_results: Array.isArray(result.tool_results) ? result.tool_results : [],
+      agent_errors: agentErrors,
     },
     manager_status: managerStatus(workspace),
   };

@@ -960,6 +960,7 @@ async function handleChat(body: ChatRequest): Promise<Record<string, unknown>> {
     },
     tool_calls: toolCalls,
     tool_results: toolResults,
+    ...(agentErrors.length ? { agent_errors: agentErrors } : {}),
     commentary_texts: state.voiceSurface.commentaryTexts,
     project_id: body.project_id ?? process.env.PROJECT_ID ?? null,
   };

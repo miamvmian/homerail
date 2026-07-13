@@ -22,6 +22,7 @@ import {
   _loadVoiceUiRulesForTest,
   _managerRestUrlForTest,
   _renderVoiceMemoForTest,
+  _setHostCodexAgentEventRunnerForTest,
   _setHostCodexManagerAgentRunnerForTest,
   _systemPromptForTest,
   _voiceMemoPathForTest,
@@ -97,6 +98,7 @@ describe("/api/manager/chat", () => {
     _clearAllSessions();
     _clearNodes();
     clearLlmSettings();
+    _setHostCodexAgentEventRunnerForTest();
     _setHostCodexManagerAgentRunnerForTest();
     await close(server);
     if (oldHome === undefined) delete process.env.HOMERAIL_HOME;
@@ -1001,6 +1003,7 @@ describe("/api/manager/chat", () => {
         objective: { required: false, satisfied: true, tool_calls: [] },
         tool_calls: [],
         tool_results: [],
+        agent_errors: ["harness stream ended after completing the response"],
         worker_id: "host-codex",
         container_name: null,
       };
@@ -1025,6 +1028,7 @@ describe("/api/manager/chat", () => {
         text: string;
         worker_id: string;
         container_name: string | null;
+        agent_errors: string[];
         runtime_placement: string;
         manager_agent_config: { agent_type: string; runtime_placement: string };
       };
@@ -1035,6 +1039,7 @@ describe("/api/manager/chat", () => {
     expect(body.data.text).toBe("host codex handled");
     expect(body.data.worker_id).toBe("host-codex");
     expect(body.data.container_name).toBeNull();
+    expect(body.data.agent_errors).toEqual(["harness stream ended after completing the response"]);
     expect(body.data.runtime_placement).toBe("host");
     expect(body.data.manager_agent_config.agent_type).toBe("codex_appserver");
     expect(body.data.manager_agent_config.runtime_placement).toBe("host");
@@ -1044,6 +1049,45 @@ describe("/api/manager/chat", () => {
       id: "homerail-dag-patterns",
       source: "home",
     }));
+  });
+
+  it("returns host Codex harness failures as structured errors instead of assistant text", async () => {
+    _setHostCodexAgentEventRunnerForTest(async function* () {
+      yield { type: "error", message: "provider rejected the configured credential" };
+      yield { type: "done" };
+    });
+    const port = await listen(server);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const saved = await fetch(`${baseUrl}/api/manager-agent/config`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ harness: "codex_appserver", model_name: "gpt-5.5" }),
+    });
+    expect(saved.status).toBe(200);
+
+    const response = await fetch(`${baseUrl}/api/manager/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "hello", project_id: "p-host-codex-error" }),
+    });
+    const body = await response.json() as {
+      success: boolean;
+      error?: string;
+      data?: Record<string, unknown>;
+    };
+
+    expect(response.status).toBe(503);
+    expect(body.success).toBe(false);
+    expect(body.error).toContain("Host Codex Manager Agent 响应错误");
+    expect(body.data).toMatchObject({
+      code: "agent_execution_failed",
+      errors: ["provider rejected the configured credential"],
+      observed_tool_calls: [],
+      run_ids: [],
+      worker_id: "host-codex",
+      project_id: "p-host-codex-error",
+    });
+    expect(JSON.stringify(body)).not.toContain("[ERROR]");
   });
 
   it("normalizes container-only manager URLs for host Codex tools", () => {
