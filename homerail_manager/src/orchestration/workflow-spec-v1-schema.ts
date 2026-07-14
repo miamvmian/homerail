@@ -1,8 +1,9 @@
 import { Type, type Static, type TSchema } from "@sinclair/typebox";
+import { AGENT_BUILTIN_TOOL_NAMES, DAG_AGENT_TOOL_NAMES } from "homerail-protocol";
 
 export const WORKFLOW_API_VERSION = "homerail.ai/v1" as const;
 export const WORKFLOW_KIND = "Workflow" as const;
-export const WORKFLOW_COMPILER_VERSION = "2" as const;
+export const WORKFLOW_COMPILER_VERSION = "4" as const;
 
 const IDENTIFIER_PATTERN = "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$";
 const PORT_REFERENCE_PATTERN = "^(?:\\$run\\.input|[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*\\.[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*)$";
@@ -17,6 +18,12 @@ const ContractIdentifier = Type.String({
   minLength: 1,
   maxLength: 64,
   pattern: "^[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)*$",
+});
+
+const ArtifactName = Type.String({
+  minLength: 1,
+  maxLength: 128,
+  pattern: "^[A-Za-z0-9][A-Za-z0-9._-]*$",
 });
 
 const JsonPropertyName = Type.String({
@@ -61,6 +68,11 @@ const ContractSchema = Type.Recursive((This) => Type.Object({
   properties: Type.Optional(Type.Record(JsonPropertyName, This, { maxProperties: 128 })),
   items: Type.Optional(This),
   oneOf: Type.Optional(Type.Array(This, { minItems: 2, maxItems: 8 })),
+  allOf: Type.Optional(Type.Array(This, { minItems: 1, maxItems: 8 })),
+  if: Type.Optional(This),
+  then: Type.Optional(This),
+  else: Type.Optional(This),
+  contains: Type.Optional(This),
   minItems: Type.Optional(Type.Integer({ minimum: 0, maximum: 10_000 })),
   maxItems: Type.Optional(Type.Integer({ minimum: 0, maximum: 10_000 })),
   minLength: Type.Optional(Type.Integer({ minimum: 0, maximum: 1_000_000 })),
@@ -107,11 +119,29 @@ const WorkspaceAccess = Type.Object({
   max_snapshot_files: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
 }, { additionalProperties: false });
 
+const AgentBuiltinToolName = Type.Union(
+  AGENT_BUILTIN_TOOL_NAMES.map((name) => Type.Literal(name)),
+);
+
+const DagAgentToolName = Type.Union(
+  DAG_AGENT_TOOL_NAMES.map((name) => Type.Literal(name)),
+);
+
 const AgentNode = Type.Object({
   kind: Type.Literal("agent"),
   agent: Identifier,
   advisors: Type.Optional(Type.Array(AdvisorBinding, { uniqueItems: true, maxItems: 16 })),
   workspace_access: Type.Optional(WorkspaceAccess),
+  allowed_builtin_tools: Type.Optional(Type.Array(AgentBuiltinToolName, {
+    uniqueItems: true,
+    maxItems: AGENT_BUILTIN_TOOL_NAMES.length,
+    description: "Exact allowlist for backend-provided shell and file tools; an empty list disables them.",
+  })),
+  allowed_dag_tools: Type.Optional(Type.Array(DagAgentToolName, {
+    uniqueItems: true,
+    maxItems: DAG_AGENT_TOOL_NAMES.length,
+    description: "Exact allowlist for HomeRail DAG tools.",
+  })),
   ...NodeBase,
 }, { additionalProperties: false });
 
@@ -122,8 +152,16 @@ const CommandNode = Type.Object({
     input: Type.Optional(Identifier),
     command: Type.Optional(Type.Array(Type.String({ maxLength: 16_384 }), { minItems: 1, maxItems: 256 })),
     command_field: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
-    stdin_field: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
-    cwd: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })),
+    stdin_field: Type.Optional(Type.String({
+      minLength: 1,
+      maxLength: 256,
+      description: "Selected-input field, $ for its root, or $inputs for the complete named input-port map.",
+    })),
+    cwd: Type.Optional(Type.String({
+      minLength: 1,
+      maxLength: 1024,
+      description: "Manager-relative directory, or $run_workspace[/path] for the contained run-scoped workspace.",
+    })),
     timeout_ms: Type.Integer({ minimum: 100, maximum: 3_600_000 }),
     success_exit_codes: Type.Optional(Type.Array(Type.Integer({ minimum: 0, maximum: 255 }), {
       minItems: 1,
@@ -134,6 +172,7 @@ const CommandNode = Type.Object({
     failure_port: Identifier,
     capture_limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1_000_000 })),
     parse_stdout: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json"), Type.Literal("number")])),
+    result_payload: Type.Optional(Type.Union([Type.Literal("envelope"), Type.Literal("value")])),
   }, { additionalProperties: false }),
 }, { additionalProperties: false });
 
@@ -318,6 +357,56 @@ const FeedbackEdge = Type.Object({
 
 const WorkflowEdge = Type.Union([DataEdge, FeedbackEdge]);
 
+const ArtifactBase = {
+  name: ArtifactName,
+  required: Type.Optional(Type.Boolean()),
+  publish: Type.Optional(Type.Union([
+    Type.Literal("success"),
+    Type.Literal("failure"),
+    Type.Literal("always"),
+  ])),
+};
+
+const HandoffArtifact = Type.Object({
+  ...ArtifactBase,
+  source: Type.Object({
+    type: Type.Literal("handoff"),
+    node: Identifier,
+    port: Identifier,
+    json_pointer: Type.Optional(Type.String({
+      maxLength: 1024,
+      pattern: "^(?:/(?:[^~/]|~[01])*)*$",
+    })),
+  }, { additionalProperties: false }),
+  media_type: Type.Union([
+    Type.Literal("application/json"),
+    Type.Literal("text/markdown"),
+    Type.Literal("text/plain"),
+  ]),
+  contract: Type.Optional(ContractIdentifier),
+}, { additionalProperties: false });
+
+const WorkspaceArtifact = Type.Object({
+  ...ArtifactBase,
+  source: Type.Object({
+    type: Type.Literal("workspace"),
+    path: Type.String({ minLength: 1, maxLength: 1024 }),
+    produced_by: Identifier,
+  }, { additionalProperties: false }),
+  archive: Type.Object({
+    format: Type.Literal("tar.gz"),
+    deterministic: Type.Optional(Type.Literal(true)),
+  }, { additionalProperties: false }),
+  limits: Type.Optional(Type.Object({
+    max_files: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+    max_uncompressed_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_737_418_240 })),
+    max_compressed_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_737_418_240 })),
+    timeout_ms: Type.Optional(Type.Integer({ minimum: 1_000, maximum: 3_600_000 })),
+  }, { additionalProperties: false })),
+}, { additionalProperties: false });
+
+const WorkflowArtifact = Type.Union([HandoffArtifact, WorkspaceArtifact]);
+
 export const WorkflowSpecV1Schema = Type.Object({
   api_version: Type.Literal(WORKFLOW_API_VERSION),
   kind: Type.Literal(WORKFLOW_KIND),
@@ -333,6 +422,7 @@ export const WorkflowSpecV1Schema = Type.Object({
       mode: Type.Union([Type.Literal("isolated"), Type.Literal("shared")]),
     }, { additionalProperties: false })),
     contracts: Type.Optional(Type.Record(ContractIdentifier, ContractSchema, { maxProperties: 128 })),
+    artifacts: Type.Optional(Type.Array(WorkflowArtifact, { maxItems: 128 })),
     triggers: Type.Optional(Type.Record(Identifier, Type.Union([
       Type.Object({
         type: Type.Literal("interval"),
@@ -387,6 +477,7 @@ export const WorkflowSpecV1Schema = Type.Object({
 export type WorkflowSpecV1 = Static<typeof WorkflowSpecV1Schema>;
 export type WorkflowSpecV1Node = Static<typeof WorkflowNode>;
 export type WorkflowSpecV1Edge = Static<typeof WorkflowEdge>;
+export type WorkflowSpecV1Artifact = Static<typeof WorkflowArtifact>;
 export type WorkflowContractSchema = Static<typeof ContractSchema>;
 
 export function publicWorkflowSpecV1Schema(): TSchema {

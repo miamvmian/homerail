@@ -67,6 +67,17 @@ function assertAgentRuntimeProtocol(agentBackend: string | undefined, protocol: 
   }
 }
 
+function assertBuiltinToolPolicySupported(agentBackend: string | undefined, allowedTools: unknown): void {
+  if (allowedTools === undefined) return;
+  const backend = normalizeManagerAgentRuntimeAgentType(
+    agentBackend ?? process.env.AGENT_BACKEND ?? "claude-sdk",
+  );
+  if (backend === "claude-sdk" || backend === "deterministic") return;
+  throw new Error(
+    `allowed_builtin_tools is not enforced by agent backend '${backend ?? "unknown"}'`,
+  );
+}
+
 async function runAdvisorCall(
   advisor: DagAdvisorConfig,
   question: string,
@@ -184,9 +195,31 @@ export async function runPrompt(
   // Create DAG tools state
   const dagState = createDagToolsState(job.dagConfig, job.runId, wsSend);
   const workspace = process.env.WORKSPACE ?? process.cwd();
-  const dagTools = createDagTools(dagState, {
+  const correctionOnly = /(?:^|\n)## input:correction(?:\r?\n|$)/.test(job.task);
+  const allDagTools = createDagTools(dagState, {
     advisorRunner: (advisor, question) => runAdvisorCall(advisor, question, workspace, deps.abortSignal),
   });
+  const allowedDagTools = job.dagConfig.allowed_dag_tools === undefined
+    ? undefined
+    : new Set<string>(job.dagConfig.allowed_dag_tools);
+  const selectedDagTools = allowedDagTools === undefined
+    ? allDagTools
+    : allDagTools.filter((tool) => allowedDagTools.has(tool.name));
+  const dagTools = correctionOnly
+    ? allDagTools.filter((tool) => tool.name === "handoff")
+    : selectedDagTools;
+  const effectiveSystemPrompt = correctionOnly
+    ? [
+        "DAG CONTRACT CORRECTION MODE.",
+        "The previous turn did not produce a contract-valid handoff.",
+        `The active DAG run_id is ${job.runId}. Copy it exactly when the output contract requires it.`,
+        "Your only permitted action is one call to the handoff tool.",
+        "Do not emit prose or tool-like markup. Do not call, describe, or simulate any other tool.",
+        "Use the correction message and original inputs to preserve completed work and satisfy the exact output schema.",
+        "The original node instructions follow only for output schema and evidence context:",
+        job.systemPrompt ?? "",
+      ].join("\n")
+    : job.systemPrompt;
   const unregisterInboxHandler = deps.registerInboxHandler?.((content) => {
     deliverInbox(dagState, content);
   });
@@ -259,9 +292,10 @@ export async function runPrompt(
       });
     }
     assertAgentRuntimeProtocol(agentBackend, job.llmProtocol);
+    assertBuiltinToolPolicySupported(agentBackend, job.dagConfig.allowed_builtin_tools);
     const agent = createAgentClient(agentBackend);
     const context: AgentRunContext = {
-      systemPrompt: job.systemPrompt,
+      systemPrompt: effectiveSystemPrompt,
       provider: job.llmProvider,
       protocol: job.llmProtocol,
       model: job.dagConfig.model,
@@ -270,6 +304,8 @@ export async function runPrompt(
       workspace,
       sessionId: job.dagConfig.session_id ?? job.runId,
       abortSignal: deps.abortSignal,
+      handoffOnly: correctionOnly,
+      allowedBuiltinTools: job.dagConfig.allowed_builtin_tools,
     };
     try {
       saveSession({

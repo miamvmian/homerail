@@ -122,6 +122,73 @@ edges:
     unsubscribe();
   });
 
+  it("can hand off only a successfully parsed command value", () => {
+    const parsed = parseWorkflowSource(yaml("command-value-payload", `
+contracts:
+  Result:
+    type: object
+    additionalProperties: false
+    required: [verdict]
+    properties: { verdict: { const: pass } }
+agents: {}
+nodes:
+  check:
+    kind: command
+    outputs: { passed: { contract: Result } }
+    config:
+      command: [node, -e, "process.stdout.write(JSON.stringify({verdict:'pass'}))"]
+      timeout_ms: 5000
+      success_port: passed
+      failure_port: passed
+      parse_stdout: json
+      result_payload: value
+  done: { kind: terminal, outcome: success, inputs: { result: { contract: Result } } }
+edges:
+  - { from: check.passed, to: done.result }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun("command-value-payload-run", parsed);
+
+    expect(executor.tick("command-value-payload-run")).toBe(1);
+    expect(getActiveRun("command-value-payload-run")?.status).toBe("completed");
+    expect(loadRunSnapshot("command-value-payload-run")?.handoffs.find((handoff) => handoff.fromNode === "check")?.content)
+      .toEqual({ verdict: "pass" });
+  });
+
+  it("preserves the command evidence envelope when value projection fails", () => {
+    const parsed = parseWorkflowSource(yaml("command-value-failure", `
+agents: {}
+nodes:
+  check:
+    kind: command
+    outputs: { passed: {}, failed: {} }
+    config:
+      command: [node, -e, "process.stdout.write(JSON.stringify({verdict:'unknown'}));process.exit(7)"]
+      timeout_ms: 5000
+      success_port: passed
+      failure_port: failed
+      parse_stdout: json
+      result_payload: value
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: check.passed, to: done.result }
+  - { from: check.failed, to: failed.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun("command-value-failure-run", parsed);
+
+    expect(executor.tick("command-value-failure-run")).toBe(1);
+    expect(getActiveRun("command-value-failure-run")?.status).toBe("failed");
+    expect(loadRunSnapshot("command-value-failure-run")?.handoffs.find((handoff) => handoff.fromNode === "check")?.content)
+      .toMatchObject({
+        ok: false,
+        exit_code: 7,
+        value: { verdict: "unknown" },
+        parse_failed: false,
+      });
+  });
+
   it("selects an authoritative command input while other ports gate readiness", () => {
     const parsed = parseWorkflowSource(yaml("command-selected-input", `
 agents:
@@ -157,6 +224,144 @@ edges:
     });
     expect(executor.tick("command-selected-input-run")).toBeGreaterThan(0);
     expect(getActiveRun("command-selected-input-run")?.status).toBe("completed");
+  });
+
+  it("runs a deterministic command inside the contained run workspace with all named inputs", () => {
+    const runId = "command-run-workspace";
+    const source = path.join(tmpHome, "workspace", runId, "source");
+    fs.mkdirSync(source, { recursive: true });
+    fs.writeFileSync(path.join(source, "marker.txt"), "workspace-ok", "utf8");
+    const parsed = parseWorkflowSource(yaml("command-run-workspace", `
+contracts:
+  Payload: { type: object }
+agents: {}
+nodes:
+  check:
+    kind: command
+    inputs: { left: { contract: Payload }, right: { contract: Payload } }
+    outputs: { passed: {}, failed: {} }
+    config:
+      command: [node, -e, "const fs=require('fs');let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.stringify({marker:fs.readFileSync('marker.txt','utf8'),ports:Object.keys(JSON.parse(s)).sort()})))"]
+      stdin_field: $inputs
+      cwd: $run_workspace/source
+      timeout_ms: 5000
+      success_port: passed
+      failure_port: failed
+      parse_stdout: json
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: $run.input, to: check.left }
+  - { from: $run.input, to: check.right }
+  - { from: check.passed, to: done.result }
+  - { from: check.failed, to: failed.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun(runId, parsed, JSON.stringify({ value: 3 }));
+    expect(executor.tick(runId)).toBe(1);
+    expect(getActiveRun(runId)?.status).toBe("completed");
+    expect(loadRunSnapshot(runId)?.handoffs.find((handoff) => handoff.fromNode === "check")?.content)
+      .toMatchObject({
+        ok: true,
+        cwd: "$run_workspace/source",
+        value: { marker: "workspace-ok", ports: ["left", "right"] },
+        input: { left: [{ value: 3 }], right: [{ value: 3 }] },
+      });
+  });
+
+  it("rejects a run-workspace command cwd that escapes containment", () => {
+    const runId = "command-run-workspace-escape";
+    fs.mkdirSync(path.join(tmpHome, "workspace", runId), { recursive: true });
+    const parsed = parseWorkflowSource(yaml("command-run-workspace-escape", `
+agents: {}
+nodes:
+  check:
+    kind: command
+    outputs: { passed: {}, failed: {} }
+    config:
+      command: [node, -e, process.exit(0)]
+      cwd: $run_workspace/../outside
+      timeout_ms: 5000
+      success_port: passed
+      failure_port: failed
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: check.passed, to: done.result }
+  - { from: check.failed, to: failed.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun(runId, parsed);
+    expect(executor.tick(runId)).toBe(1);
+    expect(getActiveRun(runId)?.status).toBe("failed");
+    expect(loadRunSnapshot(runId)?.handoffs.find((handoff) => handoff.fromNode === "check")?.content)
+      .toMatchObject({ ok: false, error: "command cwd escapes run workspace" });
+  });
+
+  it("rejects a run workspace symlink that resolves outside the workspace root", () => {
+    const runId = "command-run-workspace-root-symlink";
+    const workspaceRoot = path.join(tmpHome, "workspace");
+    const outside = path.join(tmpHome, "outside-run-workspace");
+    fs.mkdirSync(workspaceRoot, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.symlinkSync(outside, path.join(workspaceRoot, runId), "dir");
+    const parsed = parseWorkflowSource(yaml(runId, `
+agents: {}
+nodes:
+  check:
+    kind: command
+    outputs: { passed: {}, failed: {} }
+    config:
+      command: [node, -e, process.exit(0)]
+      cwd: $run_workspace
+      timeout_ms: 5000
+      success_port: passed
+      failure_port: failed
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: check.passed, to: done.result }
+  - { from: check.failed, to: failed.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun(runId, parsed);
+    expect(executor.tick(runId)).toBe(1);
+    expect(getActiveRun(runId)?.status).toBe("failed");
+    expect(loadRunSnapshot(runId)?.handoffs.find((handoff) => handoff.fromNode === "check")?.content)
+      .toMatchObject({ ok: false, error: "command run workspace resolves outside workspace root" });
+  });
+
+  it("rejects a run-workspace cwd symlink that resolves outside its run", () => {
+    const runId = "command-run-workspace-cwd-symlink";
+    const runWorkspace = path.join(tmpHome, "workspace", runId);
+    const outside = path.join(tmpHome, "outside-command-cwd");
+    fs.mkdirSync(runWorkspace, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.symlinkSync(outside, path.join(runWorkspace, "source"), "dir");
+    const parsed = parseWorkflowSource(yaml(runId, `
+agents: {}
+nodes:
+  check:
+    kind: command
+    outputs: { passed: {}, failed: {} }
+    config:
+      command: [node, -e, process.exit(0)]
+      cwd: $run_workspace/source
+      timeout_ms: 5000
+      success_port: passed
+      failure_port: failed
+  done: { kind: terminal, outcome: success, inputs: { result: {} } }
+  failed: { kind: terminal, outcome: failure, inputs: { result: {} } }
+edges:
+  - { from: check.passed, to: done.result }
+  - { from: check.failed, to: failed.result, condition: on_failure }
+`));
+    const executor = new GraphExecutor(new FakeDAGDispatcher());
+    executor.createRun(runId, parsed);
+    expect(executor.tick(runId)).toBe(1);
+    expect(getActiveRun(runId)?.status).toBe("failed");
+    expect(loadRunSnapshot(runId)?.handoffs.find((handoff) => handoff.fromNode === "check")?.content)
+      .toMatchObject({ ok: false, error: "command cwd resolves outside run workspace" });
   });
 
   it("runs the ratchet through adjacent command measurements and enrolls the floor", () => {

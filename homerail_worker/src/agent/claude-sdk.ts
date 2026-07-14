@@ -6,10 +6,11 @@
  * @version 0.1.0
  */
 
+import { AGENT_BUILTIN_TOOL_NAMES } from "homerail-protocol";
 import type { AgentClient, AgentEvent, AgentRunContext, AgentUsage, DagToolDefinition } from "./types.js";
 import { jsonSchemaObjectToZodRawShape } from "./json-schema-zod.js";
 
-const BUILTIN_TOOLS = ["Bash", "Read", "Write", "Edit", "MultiEdit", "Grep", "Glob", "LS"] as const;
+const HANDOFF_ONLY_THINKING_BUDGET = 2048;
 
 interface SdkModule {
   query(params: {
@@ -180,11 +181,19 @@ export class ClaudeSdkAdapter implements AgentClient {
     try {
       const effectiveModel = context.model || this.model;
       const authEnv = this.buildClaudeEnv(context, effectiveModel);
+      const requestedBuiltinTools = context.allowedBuiltinTools ?? AGENT_BUILTIN_TOOL_NAMES;
+      const supportedBuiltinTools = new Set<string>(AGENT_BUILTIN_TOOL_NAMES);
+      const builtinTools = context.handoffOnly
+        ? []
+        : requestedBuiltinTools.filter((tool) => supportedBuiltinTools.has(tool));
+      const effectiveThinkingBudget = context.handoffOnly
+        ? Math.min(this.thinkingBudget, HANDOFF_ONLY_THINKING_BUDGET)
+        : this.thinkingBudget;
       const options: Record<string, unknown> = {
         model: effectiveModel,
-        maxThinkingTokens: this.thinkingBudget,
-        tools: [...BUILTIN_TOOLS],
-        allowedTools: [...BUILTIN_TOOLS],
+        maxThinkingTokens: effectiveThinkingBudget,
+        tools: builtinTools,
+        allowedTools: builtinTools,
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         cwd: context.workspace ?? process.cwd(),
@@ -247,7 +256,7 @@ export class ClaudeSdkAdapter implements AgentClient {
           model: effectiveModel,
           max_turns: this.maxTurns,
           max_turns_source: this.maxTurnsSource,
-          thinking_budget: this.thinkingBudget,
+          thinking_budget: effectiveThinkingBudget,
           cwd: options.cwd,
           has_system_prompt: Boolean(context.systemPrompt),
           tool_count: tools.length,
@@ -257,7 +266,8 @@ export class ClaudeSdkAdapter implements AgentClient {
           base_url_source: authEnv.baseUrlSource,
           timeout_ms: this.queryTimeoutMs > 0 ? this.queryTimeoutMs : null,
           external_abort_signal: Boolean(context.abortSignal),
-          builtin_tools: [...BUILTIN_TOOLS],
+          builtin_tools: builtinTools,
+          handoff_only: context.handoffOnly === true,
         },
       };
 

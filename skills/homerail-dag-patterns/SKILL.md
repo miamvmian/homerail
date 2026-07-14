@@ -2,7 +2,7 @@
 name: homerail-dag-patterns
 description: |
   Select, inspect, instantiate, adapt, and validate HomeRail's built-in DAG design patterns.
-  Use when an agent needs to design a reusable workflow for periodic triage, planner/worker fan-out,
+  Use when an agent needs to design a reusable workflow for periodic triage, read-only issue diagnosis, planner/worker fan-out,
   on-demand executor/advisor consultation, budget admission, graduated trust, standing-goal verification, quorum decisions, adversarial
   builder/breaker review, monotonic improvement, or evidence-driven process evolution. Also use
   when deciding whether a workflow needs condition, loop, join, or while gateway semantics.
@@ -61,6 +61,10 @@ Choose from constraints, not keyword similarity:
 
 - `heartbeat`: periodic work needs a cheap quiet exit, one selected action, and
   an independent verdict.
+- `issue-diagnosis`: an untrusted issue snapshot must be checked against one
+  explicit repository revision by independent reproduction, data-flow, and
+  history reviewers, then arbitrated and unanimously verified without platform
+  write-back.
 - `orchestrator-workers`: one planner can split independent work that must
   aggregate before verification.
 - `executor-advisor`: an executor should retain context and call a separately
@@ -99,6 +103,15 @@ Preserve the invariant that made the pattern useful:
 - Keep `ratchet` bounded and metric-driven.
 - Keep policy changes behind review in `compost`.
 - Keep the quiet path cheaper than the action path in `heartbeat`.
+- Keep `issue-diagnosis` revision-pinned, credential-free, remote-read-only, and
+  independent from issue-tracker triggers or comment permissions. Preserve its
+  three investigation roles, explicit arbiter, and scenario/evidence/adversarial
+  3-of-3 verification policy. Only the reproduction role may modify a private
+  `scratch/reproduction/source` copy for focused tests; the shared prepared
+  source stays read-only. Treat issue comments that clarify state, ordering,
+  provider, and credential reuse as part of the immutable snapshot. Consume the
+  fixed `diagnosis.json` and `verification.json` outputs through generic `hr dag
+  artifacts <run-id>` / `hr dag artifact <run-id> <name>` commands.
 
 Do not put provider, model, API key, or base URL fields in generated workflow
 YAML. Bind models through HomeRail database settings and runtime profiles.

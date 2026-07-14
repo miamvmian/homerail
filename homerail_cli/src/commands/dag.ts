@@ -12,6 +12,8 @@ import { cmdDagWatch } from "./dag-watch.js";
 import { cmdInject } from "./inject.js";
 import { cmdResume, type ResumeOptions } from "./resume.js";
 import { orchestrationsDir, resolveTemplatePath } from "./templates.js";
+import { registerDagRunTemplateCommands } from "./dag-run-template.js";
+import { cmdDagArtifact, cmdDagArtifacts, type DagArtifactDownloadOptions } from "./dag-artifacts.js";
 
 interface GlobalOpts {
   baseUrl?: string;
@@ -46,6 +48,7 @@ interface WorkflowValidationResult {
 
 export function registerDagCommands(program: Command): void {
   const dagCmd = program.command("dag").description("DAG status and supervision commands");
+  registerDagRunTemplateCommands(dagCmd, program);
   const registerResumeCommand = (command: Command) => {
     command
       .command("resume <runId> <nodeId>")
@@ -396,6 +399,24 @@ export function registerDagCommands(program: Command): void {
         parseInt(opts.contentLimit, 10),
         !!globalOpts.json,
       );
+    });
+
+  dagCmd
+    .command("artifacts <runId>")
+    .description("List fixed output artifacts declared by a DAG run")
+    .action(async (runId: string) => {
+      const globalOpts = program.opts<GlobalOpts>();
+      process.exitCode = await cmdDagArtifacts(getClient(globalOpts), runId, !!globalOpts.json);
+    });
+
+  dagCmd
+    .command("artifact <runId> <name>")
+    .description("Download a declared DAG run artifact by name")
+    .option("-o, --output <path>", "Write the artifact atomically to this path")
+    .option("--force", "Replace an existing output path", false)
+    .action(async (runId: string, name: string, opts: DagArtifactDownloadOptions) => {
+      const globalOpts = program.opts<GlobalOpts>();
+      process.exitCode = await cmdDagArtifact(getClient(globalOpts), runId, name, opts, !!globalOpts.json);
     });
 
   registerResumeCommand(dagCmd);

@@ -1,5 +1,6 @@
 export const EXPECTED_PATTERN_IDS = [
   "heartbeat",
+  "issue-diagnosis",
   "orchestrator-workers",
   "executor-advisor",
   "budget-gate",
@@ -48,18 +49,44 @@ export function patternParameters(pattern, runSuffix = "") {
 
 const passCommand = ["node", "-e", "process.exit(0)"];
 const sparringTestCommand = [
-  "bash",
-  "-c",
-  "test \"$(cat tests/sparring/live.txt)\" = '1+1 must equal 2' && test \"$(cat src/live-fix.txt)\" = '2'",
+  "node",
+  "-e",
+  "const fs=require('node:fs');const challenge=fs.readFileSync('tests/sparring/live.txt','utf8').trimEnd();const repair=fs.readFileSync('src/live-fix.txt','utf8').trimEnd();process.exit(challenge==='1+1 must equal 2'&&repair==='2'?0:1)",
 ];
+
+export const LIVE_ISSUE_REVISION = process.env.HOMERAIL_LIVE_ISSUE_REVISION
+  ?? "4bd2cdca7525f488e9ef25211d4430cedcc071cb";
 
 export const prompts = {
   heartbeat: JSON.stringify({
-    signal: { value: 2, status: "actionable" },
-    instruction: "Select one bounded synthetic action and preserve the exact check_command in the conductor work order.",
+    signal: { value: 2, status: "actionable", action: "record synthetic heartbeat acknowledgement" },
+    instruction: "Select the synthetic heartbeat acknowledgement as the bounded action. Set done_when so the worker can satisfy it with status=completed and explicit acknowledgement evidence. Preserve check_command only as the separate Manager-owned deterministic check; never describe the command as the action itself.",
     check_command: passCommand,
   }),
-  "orchestrator-workers": "Topology-only validation. Do not inspect files, shell, network, or external systems. Create exactly three execution work_items and no verifier/reviewer item: check id equals sample-1, count equals 2, and status equals ready for the record {id:sample-1,count:2,status:ready}. Give every item concrete acceptance_criteria. Every worker must report top-level status using exactly success or failed plus top-level evidence; never use pass/fail as status values. The existing downstream verifier confirms all three results and hands off verified.",
+  "issue-diagnosis": JSON.stringify({
+    issue: {
+      id: "live-synthetic",
+      title: "Heartbeat is missing from the built-in pattern catalog",
+      body: "The reporter claims homerail_manager/src/orchestration/dag-patterns.ts does not register a heartbeat pattern. Check the exact requested commit and determine whether this claim reproduces. Use only bounded source inspection and the smallest relevant test.",
+      source: "live-validator",
+      discussion: [{
+        author: "live-validator",
+        body: "This is the built-in catalog path, not a custom pattern or a stale generated file. Check the requested commit and the focused catalog test.",
+      }],
+    },
+    target: {
+      repository_url: "https://github.com/xiaotianfotos/homerail",
+      revision: LIVE_ISSUE_REVISION,
+    },
+    constraints: {
+      max_test_seconds: 300,
+      focus_paths: [
+        "homerail_manager/src/orchestration/dag-patterns.ts",
+        "homerail_manager/tests/dag-patterns.test.ts",
+      ],
+    },
+  }),
+  "orchestrator-workers": "Topology-only validation. Do not inspect files, shell, network, or external systems. Copy this entire objective verbatim into Plan.context. Create exactly three execution work_items and no verifier/reviewer item: check id equals sample-1, count equals 2, and status equals ready for the record {id:sample-1,count:2,status:ready}. Give every item concrete acceptance_criteria. Every worker must evaluate its item against input:item.context and report top-level status using exactly success or failed plus top-level evidence; never use pass/fail as status values. The existing downstream verifier confirms all three results and hands off verified.",
   "executor-advisor": "Use the declared advisor_id expert exactly once to decide whether signed audit records should use canonical JSON or ordinary JSON. Continue in the same executor turn after advice and hand off done with consulted_advisor=true, advisor_id=expert, a decision, and two constraints.",
   "budget-gate": JSON.stringify({ task: "Immediately hand off completed with exactly {usage:1,evidence:'synthetic bounded check completed'}. Do not call any other tool.", expected_usage: 1 }),
   "trust-ledger": JSON.stringify({
@@ -69,7 +96,7 @@ export const prompts = {
   }),
   "standing-goal-sentinel": "Run the two Manager-owned standing goal commands exactly as stored. No model node is required.",
   quorum: "Preserve this evidence: health_check=passed, regression_count=0, risk=low. Each voter independently hands off top-level vote=act with evidence. Do not inspect other votes.",
-  sparring: `SMOKE CONTRACT. The exact test_command is ${JSON.stringify(sparringTestCommand)}. Breaker: use exactly one Write call to create tests/sparring/live.txt containing exactly '1+1 must equal 2', then immediately hand off challenge with artifact_path, that exact test_command array, and evidence; no Bash, Read, scaffolding, package files, or extra writes. Builder: use exactly one Write call to create src/live-fix.txt containing exactly '2', never modify tests/sparring/live.txt, then immediately hand off repaired with that exact test_command array and evidence. Verifier: read only those two files and immediately hand off verdict with top-level verdict=pass and evidence. Do nothing else.`,
+  sparring: `SMOKE CONTRACT. The exact test_command is ${JSON.stringify(sparringTestCommand)}. Breaker: use exactly one Write call to create tests/sparring/live.txt containing exactly '1+1 must equal 2', then immediately hand off challenge with artifact_path, that exact test_command array, and evidence; no Bash, Read, scaffolding, package files, or extra writes. Builder: use exactly one Write call to create src/live-fix.txt containing exactly '2', never modify tests/sparring/live.txt, then immediately hand off repaired with that exact test_command array and evidence. The Manager runs test_command and supplies its result to the fresh verifier. Do nothing else.`,
   ratchet: JSON.stringify({
     objective: "Reduce a deterministic synthetic metric from 2 to 0.",
     measure_command: [
@@ -94,6 +121,20 @@ export const semanticRequirements = {
     { node: "verdict_gate", port: "check" },
     { node: "deterministic_check", port: "passed" },
   ],
+  "issue-diagnosis": [
+    { node: "checkout_repository", port: "checked" },
+    { node: "match_repository_revision", port: "checked" },
+    { node: "snapshot_focus_paths", port: "snapshotted" },
+    { node: "normalize_reproduction", port: "reviewed" },
+    { node: "normalize_dataflow", port: "reviewed" },
+    { node: "normalize_history", port: "reviewed" },
+    { node: "arbitrate", port: "reported" },
+    { node: "verify_scenario", port: "voted" },
+    { node: "verify_evidence", port: "voted" },
+    { node: "verify_adversarial", port: "voted" },
+    { node: "consensus", port: "checked" },
+    { node: "consensus_gate", port: "accepted" },
+  ],
   "orchestrator-workers": [
     { node: "fanout", port: "passed" },
     { node: "verify", port: "verified" },
@@ -114,7 +155,10 @@ export const semanticRequirements = {
     { node: "record_pass", port: "recorded" },
   ],
   quorum: [{ node: "quorum", port: "act" }],
-  sparring: [{ node: "verdict_gate", port: "passed" }],
+  sparring: [
+    { node: "deterministic_check", port: "passed" },
+    { node: "verdict_gate", port: "passed" },
+  ],
   ratchet: [
     { node: "target_gate", port: "improve", minimum: 2 },
     { node: "compare_measurements", port: "ready", minimum: 2 },
@@ -147,8 +191,34 @@ export function matchingHandoffs(handoffs, node, port) {
   return handoffs.filter((handoff) => handoffNode(handoff) === node && handoff.port === port);
 }
 
+const DIAGNOSTIC_FAILURE_PORTS = new Set([
+  "failed",
+  "failure",
+  "rejected",
+  "error",
+  "blocked",
+  "stale",
+  "disputed",
+  "conflict",
+  "exhausted",
+]);
+
+export function diagnosticFailureHandoffs(handoffs) {
+  return handoffs
+    .filter((handoff) => DIAGNOSTIC_FAILURE_PORTS.has(String(handoff.port ?? "").toLowerCase()))
+    .map((handoff) => ({
+      node: handoffNode(handoff),
+      port: handoff.port,
+      content: parseContent(handoff.content),
+    }));
+}
+
 function objectValue(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
+}
+
+function isExactGitRevision(value) {
+  return typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
 }
 
 export function semanticFailures(patternId, handoffs, context = {}) {
@@ -167,6 +237,76 @@ export function semanticFailures(patternId, handoffs, context = {}) {
     const aggregate = objectValue(parseContent(matchingHandoffs(handoffs, "fanout", "passed").at(-1)?.content));
     if (aggregate?.total !== 3 || aggregate?.successes !== 3 || aggregate?.failures !== 0) {
       failures.push("dynamic fan-out did not complete exactly three successful worker items");
+    }
+  }
+  if (patternId === "issue-diagnosis") {
+    const checkout = objectValue(parseContent(
+      matchingHandoffs(handoffs, "checkout_repository", "checked").at(-1)?.content,
+    ));
+    if (checkout?.ok !== true || String(checkout?.value ?? "").trim() !== LIVE_ISSUE_REVISION) {
+      failures.push("issue diagnosis did not deterministically check out the requested revision");
+    }
+    const revisionCheck = objectValue(parseContent(
+      matchingHandoffs(handoffs, "match_repository_revision", "checked").at(-1)?.content,
+    ));
+    if (revisionCheck?.ok !== true || String(revisionCheck?.value ?? "").trim() !== LIVE_ISSUE_REVISION) {
+      failures.push("issue diagnosis did not deterministically verify repository HEAD against the requested revision");
+    }
+    const focusedSnapshot = objectValue(parseContent(
+      matchingHandoffs(handoffs, "snapshot_focus_paths", "snapshotted").at(-1)?.content,
+    ));
+    const focusedFiles = Array.isArray(focusedSnapshot?.files) ? focusedSnapshot.files : [];
+    const focusedPaths = new Set(focusedFiles.map((file) => objectValue(file)?.path));
+    if (
+      focusedSnapshot?.revision_verified !== true ||
+      focusedSnapshot?.tested_revision !== LIVE_ISSUE_REVISION ||
+      !focusedPaths.has("homerail_manager/src/orchestration/dag-patterns.ts") ||
+      !focusedPaths.has("homerail_manager/tests/dag-patterns.test.ts")
+    ) {
+      failures.push("issue diagnosis did not capture both exact-revision focused source files");
+    }
+    const report = objectValue(parseContent(matchingHandoffs(handoffs, "arbitrate", "reported").at(-1)?.content));
+    if (report?.schema_version !== "2.0" || report?.issue_id !== "live-synthetic") {
+      failures.push("issue diagnosis did not emit the expected versioned report identity");
+    }
+    if (!new Set(["not_reproduced", "insufficient_evidence"]).has(report?.outcome)) {
+      failures.push(`issue diagnosis expected a safe negative or conservative outcome, observed ${String(report?.outcome)}`);
+    }
+    if (!isExactGitRevision(report?.tested_revision) || report?.tested_revision !== LIVE_ISSUE_REVISION) {
+      failures.push("issue diagnosis did not record the exact requested full commit revision");
+    }
+    for (const field of ["findings", "evidence", "tests", "recommendations", "limitations"]) {
+      if (!Array.isArray(report?.[field])) failures.push(`issue diagnosis report is missing ${field}`);
+    }
+    if (report?.outcome === "insufficient_evidence") {
+      const reviews = ["normalize_reproduction", "normalize_dataflow", "normalize_history"]
+        .map((node) => objectValue(parseContent(matchingHandoffs(handoffs, node, "reviewed").at(-1)?.content)));
+      const exactNegativeReview = reviews.some((review) =>
+        review?.issue_match === "exact" &&
+        review?.reproduction === "not_reproduced" &&
+        review?.tested_revision === LIVE_ISSUE_REVISION);
+      if (!exactNegativeReview || !Array.isArray(report?.limitations) || report.limitations.length === 0) {
+        failures.push("conservative issue diagnosis lacked exact negative evidence or explicit limitations");
+      }
+    }
+    if (!new Set(["unanimous", "majority", "disputed", "insufficient_evidence"]).has(report?.consensus?.decision) || report?.consensus?.issue_match !== "exact") {
+      failures.push("issue diagnosis arbitration did not support the exact scenario");
+    }
+    const verification = objectValue(parseContent(matchingHandoffs(handoffs, "consensus", "checked").at(-1)?.content));
+    const votes = Array.isArray(verification?.votes) ? verification.votes : [];
+    const reviewerIds = new Set(votes.map((vote) => vote?.reviewer_id));
+    if (
+      verification?.verdict !== "pass" ||
+      verification?.policy !== "unanimous-three-reviewers" ||
+      votes.length !== 3 ||
+      reviewerIds.size !== 3 ||
+      verification?.checked_revision !== report?.tested_revision ||
+      votes.some((vote) =>
+        vote?.verdict !== "pass" ||
+        vote?.issue_match !== "exact" ||
+        vote?.checked_revision !== report?.tested_revision)
+    ) {
+      failures.push("issue diagnosis did not reach unanimous three-reviewer verification");
     }
   }
   if (patternId === "executor-advisor") {

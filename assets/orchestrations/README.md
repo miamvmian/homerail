@@ -25,6 +25,10 @@ node homerail_cli/dist/cli.js dag sync \
 
 WorkflowSpec v1 uses named contracts, top-level edges, and explicit terminal
 outcomes. Bind its logical agents through a separate database runtime profile.
+`pr-review.yaml.template` performs evidence-backed advisory review, while
+`pr-closeout.yaml.template` deterministically routes immutable GitHub and
+validation evidence to `ready_for_review`, a blocked result, or a durable
+owner-only merge approval. Closeout never performs a GitHub merge mutation.
 Additional strict v1 examples cover reusable graph primitives:
 
 - `workflow-spec-v1-fanout.yaml.template`: fan-out plus explicit join;
@@ -117,6 +121,22 @@ through `homerail config set`, then verifies `runtime status` and `doctor` throu
 the cloned CLI. The run must execute as a normal Node-provisioned Worker with a
 run-scoped workspace; fixed host Workers, Docker socket mounts, and
 Docker-in-Docker are outside this test boundary.
+
+Use `pr-review.yaml.template` for a read-only, evidence-backed pull request
+review with runtime, security, tests, and frontend specialists plus independent
+2-of-3 verification quorum:
+
+```bash
+hr dag run-template pr-review \
+  --input '{"repo":"xiaotianfotos/homerail","pr":25}' \
+  --wait
+```
+
+The CLI resolves immutable base/head SHAs and trusted credential-free clone
+URLs, syncs the tracked WorkflowSpec, and waits for its declared
+`pr-review.json` and `pr-review.md` artifacts. Retrieve
+either output with `hr dag artifact <run-id> <name> --output <path>`. The
+workflow never commits, approves, or merges a pull request.
 
 ## Scorecard Policy
 

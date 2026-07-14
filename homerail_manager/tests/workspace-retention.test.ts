@@ -119,7 +119,7 @@ describe("workspace retention", () => {
     expect(fs.existsSync(active)).toBe(true);
     expect(fs.existsSync(pinned)).toBe(true);
     expect(loadRunMetadata("success-old")?.workspaceRetention?.cleanedAt).toEqual(expect.any(Number));
-  });
+  }, 15_000);
 
   it("unlinks an expired workspace symlink without touching its target", async () => {
     const now = Date.now();

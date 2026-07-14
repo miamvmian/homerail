@@ -43,6 +43,7 @@ describe("DAG tools", () => {
 
       expect(result.content).toHaveLength(1);
       const ctx = JSON.parse((result.content as any)[0].text);
+      expect(ctx.run_id).toBe("run-1");
       expect(ctx.node_id).toBe("coder");
       expect(ctx.available_ports).toEqual(["done"]);
       expect(ctx.graph_nodes).toEqual(["triage", "coder", "tester"]);
@@ -119,6 +120,11 @@ describe("DAG tools", () => {
       const tools = createDagTools(state);
       const handoffTool = tools.find((t) => t.name === "handoff")!;
 
+      expect(handoffTool.input_schema).toMatchObject({
+        additionalProperties: false,
+        properties: { port: { enum: ["done"] } },
+      });
+
       const result = await handoffTool.handler({
         port: "invalid",
         content: "x",
@@ -126,6 +132,29 @@ describe("DAG tools", () => {
 
       expect(result.is_error).toBe(true);
       expect(wsSend).not.toHaveBeenCalled();
+    });
+
+    it("rejects contract fields outside content without consuming the handoff", async () => {
+      const tools = createDagTools(state);
+      const handoffTool = tools.find((t) => t.name === "handoff")!;
+
+      const invalid = await handoffTool.handler({
+        port: "done",
+        content: { markdown: "report" },
+        run_id: "run-1",
+      });
+      expect(invalid).toMatchObject({ is_error: true });
+      expect(state.yielded).toBe(false);
+      expect(state.handoffData).toBeNull();
+
+      const corrected = await handoffTool.handler({
+        port: "done",
+        content: { markdown: "report", run_id: "run-1" },
+      });
+      expect(corrected.is_error).not.toBe(true);
+      expect(state.handoffData).toMatchObject({
+        content: { markdown: "report", run_id: "run-1" },
+      });
     });
 
     it("rejects duplicate handoff", async () => {

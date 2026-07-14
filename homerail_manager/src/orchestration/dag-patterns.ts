@@ -1,5 +1,6 @@
 import YAML from "yaml";
 
+import { createIssueDiagnosisPattern } from "./issue-diagnosis-pattern.js";
 import { assertGraphValid, validateGraph, type GraphValidationResult } from "./graph-validator.js";
 import type { ParsedDAG } from "./graph.js";
 import { assertRuntimeGraphParity } from "./runtime-graph-parity.js";
@@ -96,7 +97,7 @@ const terminalNode = (agent: string, after: string): Record<string, unknown> => 
 
 const heartbeat: DAGPatternDefinition = {
   id: "heartbeat",
-  version: "1.0.8",
+  version: "1.0.9",
   name: "Heartbeat",
   summary: "Triage one signal, route one actionable item, execute it, and independently verify the result.",
   intent: "Keep periodic autonomous work bounded by a quiet-path exit, a single selected action, and a separate verifier.",
@@ -133,22 +134,41 @@ const heartbeat: DAGPatternDefinition = {
       contracts: {
         Signals: {},
         Classification: { type: "object", required: ["status"], properties: { status: { type: "string", enum: ["actionable", "quiet"] } } },
+        WorkOrder: {
+          type: "object",
+          additionalProperties: false,
+          required: ["done_when", "evidence", "check_command"],
+          properties: {
+            done_when: { type: "string", minLength: 1 },
+            evidence: {},
+            check_command: { type: "array", minItems: 1, maxItems: 32, items: { type: "string" } },
+          },
+        },
+        WorkResult: {
+          type: "object",
+          additionalProperties: false,
+          required: ["status", "evidence"],
+          properties: {
+            status: { type: "string", enum: ["completed", "failed"] },
+            evidence: {},
+          },
+        },
         Check: { type: "object", required: ["verdict"], properties: { verdict: { type: "string", enum: ["pass", "fail"] } } },
       },
       agents: {
         triage: { system: "Do not execute check_command and do not use Bash, Read, or any tool except handoff. Your first and only tool call must hand off on port classified. Its content must be one JSON object with top-level status set to actionable or quiet, top-level evidence, and the exact check_command JSON array copied from the input when present." },
-        conductor: { system: "Select exactly one actionable item. Do not execute check_command and do not use Bash, Read, or any tool except handoff. Your first and only tool call must hand off on port ordered with one JSON object containing top-level done_when, evidence, and the exact allowlisted check_command JSON array copied from the input." },
-        worker: { system: "Execute only the work order, but never execute check_command because the deterministic gateway owns that check. Do not answer with text. Your final tool call must hand off on port completed with one JSON object containing top-level status and evidence. The Manager routes check_command separately; do not copy or modify it." },
-        verifier: { system: "Independently judge the result. Do not execute check_command and do not use Bash, Read, or any tool except handoff. Your first and only tool call must hand off on port checked with one JSON object containing top-level verdict set to pass or fail and top-level evidence. Never nest verdict and never claim the deterministic command ran." },
+        conductor: { system: "Select exactly one actionable item. Do not execute check_command and do not use Bash, Read, or any tool except handoff. Your first and only tool call must hand off on port ordered with exactly one JSON object containing top-level done_when, evidence, and the exact allowlisted check_command JSON array copied from the input; do not describe check_command as the action itself." },
+        worker: { system: "Execute only the non-command work order. Never execute check_command because the deterministic gateway owns that independent check. Do not answer with text. Your final tool call must hand off on port completed with exactly one JSON object containing top-level status set to completed or failed and top-level evidence describing the bounded action result. Do not copy or modify check_command." },
+        verifier: { system: "Independently compare input:result with input:order.done_when. Judge only whether the worker's bounded result has status=completed and evidence satisfying the work order; the Manager-owned check_command runs after this verdict, so never fail merely because that command has not run yet. Do not execute check_command and do not use Bash, Read, or any tool except handoff. Your first and only tool call must hand off on port checked with exactly one JSON object containing top-level verdict set to pass or fail and top-level evidence. Never nest verdict and never claim the deterministic command ran." },
       },
       nodes: {
         triage: { kind: "agent", agent: "triage", inputs: { signals: { contract: "Signals" } }, outputs: { classified: { contract: "Classification" } } },
         signal_gate: { kind: "condition", inputs: { signal: { contract: "Classification" } }, outputs: { act: { contract: "Classification" }, quiet: { contract: "Classification" } }, config: { field: "status", routes: { actionable: "act", quiet: "quiet" }, default: "quiet" } },
-        conduct: { kind: "agent", agent: "conductor", inputs: { signal: { contract: "Classification" } }, outputs: { ordered: {} } },
-        execute: { kind: "agent", agent: "worker", inputs: { order: {} }, outputs: { completed: {} } },
-        verify: { kind: "agent", agent: "verifier", inputs: { result: {} }, outputs: { checked: { contract: "Check" } } },
+        conduct: { kind: "agent", agent: "conductor", inputs: { signal: { contract: "Classification" } }, outputs: { ordered: { contract: "WorkOrder" } } },
+        execute: { kind: "agent", agent: "worker", inputs: { order: { contract: "WorkOrder" } }, outputs: { completed: { contract: "WorkResult" } } },
+        verify: { kind: "agent", agent: "verifier", inputs: { order: { contract: "WorkOrder" }, result: { contract: "WorkResult" } }, outputs: { checked: { contract: "Check" } } },
         verdict_gate: { kind: "condition", inputs: { check: { contract: "Check" } }, outputs: { check: { contract: "Check" }, failed: { contract: "Check" } }, config: { field: "verdict", routes: { pass: "check", fail: "failed" }, default: "failed" } },
-        deterministic_check: { kind: "command", inputs: { order: {}, verdict: { contract: "Check" } }, outputs: { passed: {}, failed: {} }, config: { input: "order", command_field: "check_command", timeout_ms: 120000, success_port: "passed", failure_port: "failed", parse_stdout: "text" } },
+        deterministic_check: { kind: "command", inputs: { order: { contract: "WorkOrder" }, verdict: { contract: "Check" } }, outputs: { passed: {}, failed: {} }, config: { input: "order", command_field: "check_command", timeout_ms: 120000, success_port: "passed", failure_port: "failed", parse_stdout: "text" } },
         quiet: { kind: "terminal", outcome: "success", inputs: { result: { contract: "Classification" } } },
         done: { kind: "terminal", outcome: "success", inputs: { result: {} } },
         review_model: { kind: "terminal", outcome: "failure", inputs: { result: {} } },
@@ -160,6 +180,7 @@ const heartbeat: DAGPatternDefinition = {
         { from: "signal_gate.act", to: "conduct.signal" },
         { from: "signal_gate.quiet", to: "quiet.result" },
         { from: "conduct.ordered", to: "execute.order" },
+        { from: "conduct.ordered", to: "verify.order" },
         { from: "conduct.ordered", to: "deterministic_check.order" },
         { from: "execute.completed", to: "verify.result" },
         { from: "verify.checked", to: "verdict_gate.check" },
@@ -173,9 +194,11 @@ const heartbeat: DAGPatternDefinition = {
   },
 };
 
+const issueDiagnosis = createIssueDiagnosisPattern(DAG_PATTERN_SOURCE);
+
 const orchestratorWorkers: DAGPatternDefinition = {
   id: "orchestrator-workers",
-  version: "1.1.3",
+  version: "1.2.0",
   name: "Orchestrator and Workers",
   summary: "Separate planning from parallel execution, then aggregate and verify all worker results.",
   intent: "Give one planner ownership of decomposition while independent workers execute bounded parts in parallel.",
@@ -212,8 +235,9 @@ const orchestratorWorkers: DAGPatternDefinition = {
         Objective: { type: "string", minLength: 1 },
         Plan: {
           type: "object",
-          required: ["work_items"],
+          required: ["context", "work_items"],
           properties: {
+            context: { type: "string", minLength: 1 },
             work_items: {
               type: "array",
               minItems: 1,
@@ -240,19 +264,19 @@ const orchestratorWorkers: DAGPatternDefinition = {
         },
       },
       agents: {
-        orchestrator: { system: "Plan only: never inspect repositories, read task files, call shell tools, or execute any work item. Decompose the supplied objective into 1..N non-overlapping work_items. Every item must contain exactly id as a non-empty string, task as a non-empty string, and acceptance_criteria as a non-empty JSON array of strings; acceptance_criteria must never be a single string. Workers must report status using exactly success or failed; never ask for pass/fail or any alternative status vocabulary. Never precompute findings, evidence, status, or result values for a worker. The DAG already has a separate verifier after fan-out: never add verifier, reviewer, aggregator, coordinator, or summary items to work_items. Your first and only tool call must hand off on the exact port planned, never plan or plan.planned, with only the top-level work_items array." },
-        worker: { system: "Execute only the supplied fan-out item and inspect the real inputs required by its task. Use the minimum tools needed to produce grounded evidence and do not wait for other workers. After the work is complete, your final tool call must hand off on the exact port result, with exactly one JSON object containing top-level status set to success or failed and top-level evidence grounded in the work performed. Use status failed when an acceptance criterion cannot be checked. Never use done, completed, pass, or any other port or status vocabulary; never copy planner claims as evidence; never omit, nest, or rename status or evidence." },
+        orchestrator: { system: "Plan only: never inspect repositories, read task files, call shell tools, or execute any work item. Copy the supplied objective verbatim into the top-level context field so every worker receives the same immutable source context, then decompose it into 1..N non-overlapping work_items. Every item must contain exactly id as a non-empty string, task as a non-empty string, and acceptance_criteria as a non-empty JSON array of strings; acceptance_criteria must never be a single string. Workers must report status using exactly success or failed; never ask for pass/fail or any alternative status vocabulary. Never precompute findings, evidence, status, or result values for a worker. The DAG already has a separate verifier after fan-out: never add verifier, reviewer, aggregator, coordinator, or summary items to work_items. Your first and only tool call must hand off on the exact port planned, never plan or plan.planned, with only top-level context and work_items." },
+        worker: { system: "Execute only the supplied fan-out item. Its envelope contains item plus the original immutable context; use that context as source evidence and inspect additional real inputs only when the task requires them. Use the minimum tools needed to produce grounded evidence and do not wait for other workers. After the work is complete, your final tool call must hand off on the exact port result, with exactly one JSON object containing top-level status set to success or failed and top-level evidence grounded in the work performed. Use status failed when an acceptance criterion cannot be checked. Never use done, completed, pass, or any other port or status vocabulary; never copy planner claims as evidence; never omit, nest, or rename status or evidence." },
         verifier: { system: "Verify the combined fan-out evidence against the original objective. Your first and only tool call must hand off on the exact port verified when every result is grounded and satisfies the objective, otherwise on the exact port failed." },
       },
       nodes: {
-        plan: { kind: "agent", agent: "orchestrator", inputs: { objective: { contract: "Objective" } }, outputs: { planned: { contract: "Plan" } } },
+        plan: { kind: "agent", agent: "orchestrator", allowed_builtin_tools: [], allowed_dag_tools: ["handoff"], inputs: { objective: { contract: "Objective" } }, outputs: { planned: { contract: "Plan" } } },
         fanout: {
           kind: "fanout",
           inputs: { plan: { contract: "Plan" } },
           outputs: { passed: {}, failed: {} },
-          config: { input: "plan", item_field: "work_items", worker_agent: "worker", max_items: "{{max_workers}}", max_parallelism: "{{max_parallelism}}", completion: "all", result_contract: "WorkerResult", success_field: "status", success_values: ["success"], result_port: "passed", failed_port: "failed", cancel_remaining: false },
+          config: { input: "plan", item_field: "work_items", context_field: "context", worker_agent: "worker", max_items: "{{max_workers}}", max_parallelism: "{{max_parallelism}}", completion: "all", result_contract: "WorkerResult", success_field: "status", success_values: ["success"], result_port: "passed", failed_port: "failed", cancel_remaining: false },
         },
-        verify: { kind: "agent", agent: "verifier", inputs: { aggregate: {} }, outputs: { verified: {}, failed: {} } },
+        verify: { kind: "agent", agent: "verifier", allowed_builtin_tools: [], allowed_dag_tools: ["handoff"], inputs: { aggregate: {} }, outputs: { verified: {}, failed: {} } },
         done: { kind: "terminal", outcome: "success", inputs: { result: {} } },
         worker_failed: { kind: "terminal", outcome: "failure", inputs: { result: {} } },
         verification_failed: { kind: "terminal", outcome: "failure", inputs: { result: {} } },
@@ -604,17 +628,20 @@ const quorum: DAGPatternDefinition = {
 
 const sparring: DAGPatternDefinition = {
   id: "sparring",
-  version: "1.0.4",
+  version: "1.2.0",
   name: "Sparring",
   summary: "A breaker creates a concrete challenge, a builder addresses it, and a fresh verifier settles the result.",
   intent: "Separate adversarial discovery from repair so neither role grades its own output.",
   ...patternContract({
     category: "continuous-improvement",
-    invariants: ["breaker artifacts are immutable to the builder", "builder writes stay in declared paths", "a fresh verifier decides"],
-    external_dependencies: [{ id: "workspace-policy", required: true, description: "Worker file snapshot enforcement" }],
-    evidence_contract: { required: ["original artifact hash", "builder diff", "fresh verdict"], success: "artifact remains unchanged and verification passes" },
+    invariants: ["breaker artifacts are immutable to the builder", "builder writes stay in declared paths", "a Manager-owned check precedes the fresh verifier"],
+    external_dependencies: [
+      { id: "workspace-policy", required: true, description: "Worker file snapshot enforcement" },
+      { id: "command-policy", required: true, description: "Operator-approved allowlist for the supplied test command" },
+    ],
+    evidence_contract: { required: ["original artifact hash", "builder diff", "Manager-owned check", "fresh verdict"], success: "artifact remains unchanged and deterministic verification passes" },
     composition_ports: { inputs: ["target"], outputs: ["verified", "dispute"] },
-    failure_semantics: { mutation: "fail deterministically", repair: "dispute", verification: "dispute" },
+    failure_semantics: { mutation: "fail deterministically", test: "dispute", repair: "dispute", verification: "dispute" },
   }),
   roles: [
     { id: "breaker", responsibility: "Produce one reproducible failing challenge without fixing it." },
@@ -623,7 +650,7 @@ const sparring: DAGPatternDefinition = {
   ],
   typical_uses: ["regression test generation", "security review", "specification hardening"],
   avoid_when: ["the breaker cannot produce reproducible evidence", "the challenged surface is unsafe for autonomous edits"],
-  required_primitives: ["workspace access policy", "immutable artifact snapshot", "fresh verifier"],
+  required_primitives: ["workspace access policy", "immutable artifact snapshot", "command gateway", "fresh verifier"],
   parameters: {
     ...identityParameters("sparring", "Sparring Pattern"),
     protected_path: { type: "string", description: "Breaker-owned path exposed read-only to builder.", default: "tests/sparring" },
@@ -663,20 +690,27 @@ const sparring: DAGPatternDefinition = {
       agents: {
         breaker: { system: "Create the smallest reproducible challenge under {{protected_path}} that satisfies the supplied task. Your final action must call handoff on challenge with content shaped exactly as {artifact_path: string, test_command: string[], evidence: string}. Copy any supplied test_command exactly. If input:correction is present, do not call Write, Read, Bash, or any other tool except handoff; immediately hand off the existing challenge. Do not rename fields, add fields, scaffold unrelated files, repeatedly refine the artifact, or fix implementation code." },
         builder: { system: "Read input:challenge as one object. Make the smallest requested fix only under {{writable_path}}. Your final action must call handoff on repaired with content shaped exactly as {test_command: string[], evidence: string}. Set test_command to the exact input:challenge.test_command array. If input:correction is present, the previous attempt already performed the file work: do not call Write, Read, Bash, or any other tool except handoff; immediately hand off the existing result. Never use alternate fields such as fix_applied or test_result. The breaker artifact is read-only and must never be weakened, deleted, or replaced." },
-        verifier: { system: "From fresh context, inspect only the supplied challenge and repair, then immediately call handoff on verdict with content shaped exactly as {verdict: 'pass'|'fail', evidence: string}. Do not add fields, answer with text, or modify files." },
+        verifier: { system: "From fresh context, inspect input:challenge, input:repair, and the Manager-owned input:check. Never execute test_command yourself and do not use Bash, Read, Write, or any tool except handoff. If challenge.test_command and repair.test_command are identical, check.ok is true, and check.exit_code is 0, immediately call handoff on verdict with exactly {verdict:'pass',evidence:string}; otherwise hand off exactly {verdict:'fail',evidence:string}. Do not add fields, answer with text, or modify files." },
       },
       nodes: {
-        break: { kind: "agent", agent: "breaker", workspace_access: { writable_paths: ["{{protected_path}}"], readonly_paths: ["{{writable_path}}"] }, inputs: { target: { contract: "Target" } }, outputs: { challenge: { contract: "Challenge" } } },
-        build: { kind: "agent", agent: "builder", workspace_access: { writable_paths: ["{{writable_path}}"], readonly_paths: ["{{protected_path}}"] }, inputs: { challenge: { contract: "Challenge" } }, outputs: { repaired: { contract: "Repair" } } },
-        verify: { kind: "agent", agent: "verifier", workspace_access: { writable_paths: [], readonly_paths: ["{{protected_path}}", "{{writable_path}}"] }, inputs: { repair: { contract: "Repair" } }, outputs: { verdict: { contract: "Verdict" } } },
+        break: { kind: "agent", agent: "breaker", allowed_builtin_tools: ["Write"], allowed_dag_tools: ["handoff"], workspace_access: { writable_paths: ["{{protected_path}}"], readonly_paths: ["{{writable_path}}"] }, inputs: { target: { contract: "Target" } }, outputs: { challenge: { contract: "Challenge" } } },
+        build: { kind: "agent", agent: "builder", allowed_builtin_tools: ["Write"], allowed_dag_tools: ["handoff"], workspace_access: { writable_paths: ["{{writable_path}}"], readonly_paths: ["{{protected_path}}"] }, inputs: { challenge: { contract: "Challenge" } }, outputs: { repaired: { contract: "Repair" } } },
+        deterministic_check: { kind: "command", inputs: { challenge: { contract: "Challenge" }, repair: { contract: "Repair" } }, outputs: { passed: {}, failed: {} }, config: { input: "challenge", command_field: "test_command", cwd: "$run_workspace", timeout_ms: 120000, success_port: "passed", failure_port: "failed", parse_stdout: "text" } },
+        verify: { kind: "agent", agent: "verifier", allowed_builtin_tools: [], allowed_dag_tools: ["handoff"], workspace_access: { writable_paths: [], readonly_paths: ["{{protected_path}}", "{{writable_path}}"] }, inputs: { challenge: { contract: "Challenge" }, repair: { contract: "Repair" }, check: {} }, outputs: { verdict: { contract: "Verdict" } } },
         verdict_gate: { kind: "condition", inputs: { verdict: { contract: "Verdict" } }, outputs: { passed: { contract: "Verdict" }, disputed: { contract: "Verdict" } }, config: { field: "verdict", routes: { pass: "passed", fail: "disputed" }, default: "disputed" } },
         done: { kind: "terminal", outcome: "success", inputs: { result: { contract: "Verdict" } } },
+        check_dispute: { kind: "terminal", outcome: "failure", inputs: { result: {} } },
         dispute: { kind: "terminal", outcome: "failure", inputs: { result: { contract: "Verdict" } } },
       },
       edges: [
         { from: "$run.input", to: "break.target" },
         { from: "break.challenge", to: "build.challenge" },
+        { from: "break.challenge", to: "deterministic_check.challenge" },
+        { from: "break.challenge", to: "verify.challenge" },
+        { from: "build.repaired", to: "deterministic_check.repair" },
         { from: "build.repaired", to: "verify.repair" },
+        { from: "deterministic_check.passed", to: "verify.check" },
+        { from: "deterministic_check.failed", to: "check_dispute.result", condition: "on_failure" },
         { from: "verify.verdict", to: "verdict_gate.verdict" },
         { from: "verdict_gate.passed", to: "done.result" },
         { from: "verdict_gate.disputed", to: "dispute.result", condition: "on_failure" },
@@ -867,6 +901,7 @@ const compost: DAGPatternDefinition = {
 
 const definitions = [
   heartbeat,
+  issueDiagnosis,
   orchestratorWorkers,
   executorAdvisor,
   budgetGate,

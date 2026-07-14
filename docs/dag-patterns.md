@@ -70,6 +70,9 @@ exit codes, optional stdin, and JSON/number parsing are explicit. Use command
 nodes for checks, metric measurement, and compensation. The default allowlist
 is empty because commands run in the Manager host trust boundary. A dynamic
 `command_field` additionally requires `HOMERAIL_DAG_ALLOW_DYNAMIC_COMMANDS=true`.
+By default the handoff contains the complete command evidence envelope. Set
+`result_payload: value` to hand off only the successfully parsed stdout value;
+command failures still preserve and route the full diagnostic envelope.
 When a command node has multiple input ports, `config.input` selects the
 authoritative port used by `command_field` and `stdin_field`; other inputs can
 act as deterministic readiness gates without being able to replace the command.
@@ -140,6 +143,14 @@ root or a protected file changed and restored before the final snapshot;
 OS-level containment remains the responsibility of the selected agent backend
 or container sandbox.
 
+Agent nodes may declare `allowed_builtin_tools` and `allowed_dag_tools` as exact
+allowlists for backend-provided shell/file tools and HomeRail DAG tools.
+Omitting either field preserves that tool set's default; `[]` disables it.
+Agent nodes with outputs must retain `handoff`. Contract-correction turns always
+override both declarations to expose only `handoff` and no built-ins. The
+`claude-sdk` adapter enforces the built-in allowlist; backends that cannot
+enforce it reject the node instead of silently widening access.
+
 Manager-to-Node and Manager-to-Worker WebSocket upgrades are authenticated
 before registration. Connections without configured credentials are restricted
 to loopback; remote clients require a Bearer token and reject plaintext `ws://`
@@ -165,15 +176,116 @@ hashes still apply.
 | Pattern | Invariant |
 | --- | --- |
 | `heartbeat` | Cheap quiet exit, one selected action, independent verdict. |
+| `issue-diagnosis` | One pinned revision, three independent investigations, explicit arbitration, and unanimous three-role verification. |
 | `orchestrator-workers` | One planner, independent workers, aggregate, fresh verifier. |
 | `executor-advisor` | One executor retains context and consults a bounded advisor only at ambiguity boundaries. |
 | `budget-gate` | Explicit budget admission before expensive work. |
 | `trust-ledger` | Autonomy is granted per recurring skill from measured history. |
 | `standing-goal-sentinel` | Completed goals become repeatedly checked invariants. |
 | `quorum` | Independent n-of-m agreement before action. |
-| `sparring` | Breaker, builder, and verifier remain separate. |
+| `sparring` | Breaker, builder, Manager-owned deterministic check, and fresh verifier remain separate. |
 | `ratchet` | Bounded measured attempts until a target or exhaustion. |
 | `compost` | Repeated failures become bounded proposals behind human review. |
+
+`issue-diagnosis` is deliberately an on-demand diagnostic workflow, not an
+issue-tracker bot. Its strict input contract accepts a platform-neutral issue
+snapshot plus a credential-free HTTPS repository URL and a full 40- or 64-hex
+commit object ID. The caller must resolve a branch or tag before starting the
+DAG, so a moving ref cannot silently change during diagnosis. It emits a
+versioned `DiagnosisReport` containing the tested revision, outcome, root-cause
+assessment, findings, evidence, test results, recommendations, limitations,
+confidence, and the agreement or dissent among the independent reviews.
+
+Pure input triage completes first, then a fixed Manager-owned command performs
+one credential-isolated HTTPS clone and detached checkout in the
+contained run workspace. A handoff-only preparation node records that command
+result, after which Manager runs `git rev-parse HEAD` and requires the real
+HEAD, the preparation handoff, and the requested commit to match before
+reviewers can trust the source. This ordering prevents a model from claiming a
+checkout that did not happen and prevents the shared-workspace clone from being
+attributed to the triage node's policy snapshot. When the caller supplies
+`constraints.focus_paths`, a fixed Manager command also captures line-numbered
+content for up to eight regular, non-symlink files at that verified revision.
+It rejects absolute paths, traversal, backslashes, NULs, and resolved escapes;
+each file is capped at 96,000 bytes and the snapshot at 256,000 bytes. Reviewers
+and verifiers consume this deterministic evidence before asking a model to use
+workspace tools, so bounded static catalog and file-presence checks remain
+auditable even when a compatible model cannot reliably invoke a read tool. The
+reproduction reviewer then copies the tree into its private
+`scratch/reproduction/source`
+path for focused tests. After that sole writer finishes, the caller-to-server
+data-flow and regression-history reviewers run in parallel against read-only
+`source`. They receive only completion dependencies, never the reproduction
+conclusion, so the reviews remain independent without cross-reviewer snapshot
+races; no node writes back to the remote repository. Each reviewer result then
+passes through a deterministic normalizer. A valid review is preserved exactly;
+if one model exhausts correction attempts or fails its output contract, the
+normalizer emits a bounded `inconclusive` review with runtime failure evidence.
+The other reviewers can therefore continue into arbitration without hiding the
+failed role or leaving the run permanently active.
+An arbiter may report
+unanimous agreement, a non-contradictory majority, a dispute, or insufficient
+evidence, but cannot add evidence. Scenario-match, evidence-integrity, and
+adversarial verifiers subsequently inspect the arbitrated report in parallel.
+The success terminal requires all three verification votes to pass at the same
+revision; one dissent routes the run to review instead of accepting a plausible
+but wrong diagnosis. Those three independent verification votes are the final
+acceptance authority: a transparently preserved `disputed` or
+`insufficient_evidence` arbitration label does not by itself fail a report that
+all three verifiers independently pass.
+
+Top-level handoff objects and machine-facing decision fields remain strict.
+Nested findings, evidence, and tests keep their causal fields while allowing
+extra metadata. Root-cause detail, reviewer summaries, and recommendation items
+are deliberately extensible JSON because the independent verification stage,
+not harmless wording such as `support` versus `supporting`, decides whether the
+diagnosis is trustworthy.
+Verification verdicts, checked evidence IDs, revision, issue match, and defects
+stay strict; the explanatory `evidence` notes may be strings or structured
+objects because consensus does not branch on their presentation.
+
+The run
+publishes `diagnosis.json` and `verification.json` as fixed, contract-validated
+artifacts. Retrieve them without any issue-specific command:
+
+```bash
+hr dag artifacts <run-id>
+hr dag artifact <run-id> diagnosis.json --output diagnosis.json
+```
+
+The workflow
+has no trigger, provider binding, platform API, comment write-back, or secret
+field. Those integrations can consume the verified report later without
+changing this diagnostic core.
+
+```json
+{
+  "issue": {
+    "id": "manual-17",
+    "title": "Observed failure",
+    "body": "Reproduction details supplied by the reporter",
+    "discussion": [
+      {
+        "author": "reporter",
+        "body": "State, ordering, provider, and whether an existing credential was reused"
+      }
+    ]
+  },
+  "target": {
+    "repository_url": "https://example.test/owner/repository",
+    "revision": "0123456789012345678901234567890123456789"
+  },
+  "constraints": {
+    "max_test_seconds": 300,
+    "focus_paths": ["src/component.ts"]
+  }
+}
+```
+
+Because revision verification uses fixed Manager-owned `git` and `node`
+commands, deployments running this pattern must include both executables in
+`HOMERAIL_DAG_COMMAND_ALLOWLIST` (for example, `node,git`). No dynamic command
+from issue content is accepted.
 
 List and inspect the live catalog:
 

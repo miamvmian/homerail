@@ -8,14 +8,19 @@ import type { AgentEvent, AgentRunContext, DagToolDefinition } from "../agent/ty
 import {
   buildManagerAgentSystemPrompt,
   createManagerAgentWidgetFileTools,
+  DEFAULT_PR_REVIEW_EXPECTED_USAGE,
   DEFAULT_MANAGER_AGENT_RUNTIME_AGENT_TYPE,
+  defaultPrReviewBudgetKey,
+  isFullGitRevision,
   managerAgentToolSpec,
   normalizeManagerAgentRuntimeAgentType,
   redactTelemetry,
+  resolvePrCloseout,
   type ManagerAgentWidgetFileToolAdapter,
   type ManagerAgentWidgetFileToolResult,
   type ManagerAgentToolName,
   type ManagerAgentPromptSkill,
+  type ResolvedPrCloseoutInput,
 } from "homerail-protocol";
 
 interface ManagerAgentConfig {
@@ -148,6 +153,165 @@ function normalizeRequiredToolCalls(value: unknown): string[] {
 
 function managerRestUrl(): string {
   return (process.env.MANAGER_REST_URL || "http://host.docker.internal:19191/api").replace(/\/+$/, "");
+}
+
+function githubApiBaseUrl(): string {
+  return (process.env.HOMERAIL_GITHUB_API_BASE_URL || "https://api.github.com").replace(/\/+$/, "");
+}
+
+const GITHUB_REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+function githubRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function githubCloneUrl(
+  repository: Record<string, unknown> | undefined,
+  expectedRepo: string | undefined,
+  label: "base" | "head",
+): { cloneUrl: string; origin: string } {
+  const fullName = typeof repository?.full_name === "string" ? repository.full_name.trim() : "";
+  if (!GITHUB_REPO_PATTERN.test(fullName)) {
+    throw new Error(`GitHub PR ${label} repository did not contain a valid full_name`);
+  }
+  if (expectedRepo && fullName.toLowerCase() !== expectedRepo.toLowerCase()) {
+    throw new Error(`GitHub PR ${label} repository does not match ${expectedRepo}`);
+  }
+  const raw = typeof repository?.clone_url === "string" ? repository.clone_url.trim() : "";
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`GitHub PR ${label} repository did not contain a valid clone_url`);
+  }
+  if (
+    parsed.protocol !== "https:"
+    || parsed.username
+    || parsed.password
+    || parsed.search
+    || parsed.hash
+    || parsed.pathname !== `/${fullName}.git`
+  ) {
+    throw new Error(`GitHub PR ${label} clone_url must be credential-free HTTPS for ${fullName}`);
+  }
+  return { cloneUrl: parsed.toString(), origin: parsed.origin };
+}
+
+async function resolveGitHubPullRequest(repo: string, pr: number): Promise<{
+  base: string;
+  head: string;
+  baseCloneUrl: string;
+  headCloneUrl: string;
+  title: string;
+  author: string;
+}> {
+  if (!GITHUB_REPO_PATTERN.test(repo)) {
+    throw new Error("repo must use the owner/name form");
+  }
+  if (!Number.isInteger(pr) || pr < 1) throw new Error("pr must be a positive integer");
+  const [owner, name] = repo.split("/");
+  const response = await fetch(
+    `${githubApiBaseUrl()}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/pulls/${pr}`,
+    { headers: { Accept: "application/vnd.github+json", "User-Agent": "HomeRail-Manager-Agent" } },
+  );
+  if (!response.ok) throw new Error(`GitHub PR lookup failed with HTTP ${response.status}`);
+  const body = await response.json() as Record<string, unknown>;
+  const baseRecord = githubRecord(body.base);
+  const headRecord = githubRecord(body.head);
+  const base = String(baseRecord?.sha ?? "");
+  const head = String(headRecord?.sha ?? "");
+  if (!isFullGitRevision(base) || !isFullGitRevision(head)) {
+    throw new Error("GitHub PR response did not contain immutable base/head SHAs");
+  }
+  const baseRepository = githubCloneUrl(githubRecord(baseRecord?.repo), repo, "base");
+  const headRepository = githubCloneUrl(githubRecord(headRecord?.repo), undefined, "head");
+  if (headRepository.origin !== baseRepository.origin) {
+    throw new Error("GitHub PR base/head clone URLs must use the same origin");
+  }
+  return {
+    base,
+    head,
+    baseCloneUrl: baseRepository.cloneUrl,
+    headCloneUrl: headRepository.cloneUrl,
+    title: typeof body.title === "string" ? body.title : "",
+    author: String((body.user as Record<string, unknown> | undefined)?.login ?? ""),
+  };
+}
+
+async function githubRequest(pathname: string): Promise<unknown> {
+  const token = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
+  const response = await fetch(`${githubApiBaseUrl()}${pathname}`, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "HomeRail-Manager-Agent",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+  });
+  if (!response.ok) throw new Error(`GitHub closeout lookup failed for ${pathname}: HTTP ${response.status}`);
+  return await response.json() as unknown;
+}
+
+async function githubReviewThreadStatus(repo: string, pr: number): Promise<{ verified: boolean; unresolved: number | null }> {
+  const token = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
+  if (!token) return { verified: false, unresolved: null };
+  const [owner, name] = repo.split("/");
+  const response = await fetch(`${githubApiBaseUrl()}/graphql`, {
+    method: "POST",
+    headers: {
+      Accept: "application/vnd.github+json",
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+      "User-Agent": "HomeRail-Manager-Agent",
+    },
+    body: JSON.stringify({
+      query: "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved}}}}}",
+      variables: { owner, name, number: pr },
+    }),
+  });
+  if (!response.ok) return { verified: false, unresolved: null };
+  const body = await response.json() as Record<string, unknown>;
+  if (Array.isArray(body.errors) && body.errors.length > 0) return { verified: false, unresolved: null };
+  const data = body.data as Record<string, unknown> | undefined;
+  const repository = data?.repository as Record<string, unknown> | undefined;
+  const pullRequest = repository?.pullRequest as Record<string, unknown> | undefined;
+  const threads = pullRequest?.reviewThreads as Record<string, unknown> | undefined;
+  const nodes = Array.isArray(threads?.nodes) ? threads.nodes as Record<string, unknown>[] : undefined;
+  return nodes
+    ? { verified: true, unresolved: nodes.filter((node) => node.isResolved !== true).length }
+    : { verified: false, unresolved: null };
+}
+
+async function resolveGitHubCloseout(
+  repo: string,
+  pr: number,
+  requestedPhase: string | undefined,
+  validationRuns: string[],
+): Promise<ResolvedPrCloseoutInput> {
+  const snapshot = await resolvePrCloseout({
+    repo,
+    pr,
+    ...(requestedPhase ? { phase: requestedPhase } : {}),
+    validation_runs: validationRuns,
+  }, {
+    github: githubRequest,
+    reviewThreads: githubReviewThreadStatus,
+    run: async (runId) => {
+      const encoded = encodeURIComponent(runId);
+      const metadata = managerData(await requestManager(`/runs/${encoded}`));
+      const status = managerData(await requestManager(`/runs/${encoded}/status`));
+      const handoffData = managerData(await requestManager(`/runs/${encoded}/handoffs`));
+      const handoffs = Array.isArray(handoffData.handoffs)
+        ? handoffData.handoffs.filter(
+            (item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item)),
+          )
+        : [];
+      return { metadata, status, handoffs };
+    },
+  });
+  return snapshot;
 }
 
 function managerAgentTurnTimeoutMs(): number {
@@ -386,13 +550,18 @@ function createManagerTools(state: {
       async handler() {
         const dir = path.join(projectWorkspace(), "assets", "orchestrations");
         const files = fs.existsSync(dir)
-          ? fs.readdirSync(dir).filter((name) => name.endsWith(".yaml") || name.endsWith(".yml")).sort()
+          ? fs.readdirSync(dir).filter((name) =>
+            name.endsWith(".yaml") ||
+            name.endsWith(".yml") ||
+            name.endsWith(".yaml.template") ||
+            name.endsWith(".yml.template")
+          ).sort()
           : [];
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
-              root: "assets/orchestrations",
+              root: dir,
               files,
             }),
           }],
@@ -550,6 +719,146 @@ function createManagerTools(state: {
         } catch (err) {
           state.objectiveToolCalls.push({
             name: "create_change",
+            success: false,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          throw err;
+        }
+      },
+    },
+    {
+      name: "run_pr_review",
+      description: "Resolve immutable GitHub PR metadata in code and start HomeRail's built-in read-only pr-review DAG. Prefer this over manually calling gh, curl, or create_and_run for PR reviews.",
+      input_schema: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "GitHub repository in owner/name form" },
+          pr: { type: "integer", minimum: 1 },
+          expected_usage: { type: "integer", minimum: 0, maximum: 100 },
+        },
+        required: ["repo", "pr"],
+        additionalProperties: false,
+      },
+      async handler(args) {
+        const repo = String(args.repo || "").trim();
+        const pr = Number(args.pr);
+        try {
+          const metadata = await resolveGitHubPullRequest(repo, pr);
+          const requestedUsage = Number(args.expected_usage);
+          const expectedUsage = Number.isInteger(requestedUsage) && requestedUsage >= 0 && requestedUsage <= 100
+            ? requestedUsage
+            : DEFAULT_PR_REVIEW_EXPECTED_USAGE;
+          const envelope = {
+            trigger_id: "manager-agent",
+            trigger_type: "manual",
+            fire_key: `manager-agent:${repo}#${pr}:${metadata.head}`,
+            payload: {
+              repo,
+              pr,
+              base: metadata.base,
+              head: metadata.head,
+              base_clone_url: metadata.baseCloneUrl,
+              head_clone_url: metadata.headCloneUrl,
+              title: metadata.title,
+              author: metadata.author,
+              expected_usage: expectedUsage,
+              budget_key: defaultPrReviewBudgetKey(repo),
+            },
+          };
+          const body = await requestManager("/runs/create-and-run", {
+            method: "POST",
+            body: JSON.stringify({
+              yamlPath: "assets/orchestrations/pr-review.yaml.template",
+              prompt: JSON.stringify(envelope),
+            }),
+          }) as Record<string, unknown>;
+          const data = body.data as Record<string, unknown> | undefined;
+          const runId = String(data?.runId ?? data?.run_id ?? "");
+          if (!runId) throw new Error("Manager did not return a PR review run id");
+          state.createdRunIds.push(runId);
+          state.objectiveToolCalls.push({ name: "run_pr_review", success: true });
+          state.objectiveToolCalls.push({ name: "create_and_run", success: true, inferred: true });
+          return {
+            content: [{
+              type: "text",
+              text: short({ run_id: runId, workflow_id: "pr-review", repo, pr, base: metadata.base, head: metadata.head }),
+            }],
+          };
+        } catch (err) {
+          state.objectiveToolCalls.push({
+            name: "run_pr_review",
+            success: false,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          throw err;
+        }
+      },
+    },
+    {
+      name: "run_pr_closeout",
+      description: "Resolve GitHub and persisted HomeRail evidence in code, then start the deterministic pr-closeout DAG. This tool never merges a PR and does not accept model-asserted local test evidence.",
+      input_schema: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "GitHub repository in owner/name form" },
+          pr: { type: "integer", minimum: 1 },
+          phase: { type: "string", enum: ["draft", "merge"] },
+          validation_runs: {
+            type: "array",
+            items: { type: "string", minLength: 1 },
+            maxItems: 20,
+          },
+        },
+        required: ["repo", "pr"],
+        additionalProperties: false,
+      },
+      async handler(args) {
+        const repo = String(args.repo || "").trim();
+        const pr = Number(args.pr);
+        const phase = typeof args.phase === "string" ? args.phase : undefined;
+        const validationRuns = Array.isArray(args.validation_runs)
+          ? args.validation_runs.map((value) => String(value).trim()).filter(Boolean)
+          : [];
+        try {
+          const snapshot = await resolveGitHubCloseout(repo, pr, phase, validationRuns);
+          const envelope = {
+            trigger_id: "manager-agent",
+            trigger_type: "manual",
+            fire_key: `pr-closeout:${repo}#${pr}:${String(snapshot.head)}:${String(snapshot.phase)}`,
+            payload: snapshot,
+          };
+          const body = await requestManager("/runs/create-and-run", {
+            method: "POST",
+            body: JSON.stringify({
+              yamlPath: "assets/orchestrations/pr-closeout.yaml.template",
+              prompt: JSON.stringify(envelope),
+            }),
+          }) as Record<string, unknown>;
+          const data = body.data as Record<string, unknown> | undefined;
+          const runId = String(data?.runId ?? data?.run_id ?? "");
+          if (!runId) throw new Error("Manager did not return a PR closeout run id");
+          state.createdRunIds.push(runId);
+          state.objectiveToolCalls.push({ name: "run_pr_closeout", success: true });
+          state.objectiveToolCalls.push({ name: "create_and_run", success: true, inferred: true });
+          return {
+            content: [{
+              type: "text",
+              text: short({
+                run_id: runId,
+                workflow_id: "pr-closeout",
+                repo,
+                pr,
+                head: snapshot.head,
+                phase: snapshot.phase,
+                closeout_status: snapshot.closeout_status,
+                blockers: snapshot.blockers,
+                merge_performed: false,
+              }, 12000),
+            }],
+          };
+        } catch (err) {
+          state.objectiveToolCalls.push({
+            name: "run_pr_closeout",
             success: false,
             error: err instanceof Error ? err.message : String(err),
           });

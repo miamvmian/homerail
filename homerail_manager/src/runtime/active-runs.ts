@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import path from "node:path";
+import { getHomerailHome } from "../config/env.js";
 import { emit } from "../events/bus.js";
 import type { DAGDispatcher, DispatchEnvelope } from "../orchestration/dag-dispatcher.js";
 import type { DAGRun, NodeState } from "../orchestration/dag-engine.js";
@@ -17,7 +19,7 @@ import {
   resetSkippedSuccessDescendants,
   startNode,
 } from "../orchestration/dag-engine.js";
-import type { DAGAgentConfig, DAGEdge, DAGGatewayConfig, DAGGraphNode, DAGOutputRoute, DAGPatternInstanceMeta, ParsedDAG, ScorecardPolicyConfig } from "../orchestration/graph.js";
+import type { DAGAgentConfig, DAGArtifactDeclaration, DAGEdge, DAGGatewayConfig, DAGGraphNode, DAGOutputRoute, DAGPatternInstanceMeta, ParsedDAG, ScorecardPolicyConfig } from "../orchestration/graph.js";
 import { _normalizeOutputsToEdges } from "../orchestration/yaml-loader.js";
 import { assertGraphValid } from "../orchestration/graph-validator.js";
 import { findDispatchTarget } from "../orchestration/dispatch-tracker.js";
@@ -25,10 +27,14 @@ import { deprovisionProvisionedForRun } from "../orchestration/provisioned-clean
 import { getWorker } from "../worker/registry.js";
 import { getNode } from "../node/registry.js";
 import {
+  AGENT_BUILTIN_TOOL_NAMES,
+  DAG_AGENT_TOOL_NAMES,
   isDisabledDirectLlmAgentType,
   normalizeManagerAgentRuntimeAgentType,
   redactTelemetry,
+  type AgentBuiltinToolName,
   type DagAdvisorConfig,
+  type DagAgentToolName,
   type DagWorkspaceAccess,
 } from "homerail-protocol";
 import { resolveAgentRuntimeConfig } from "./agent-runtime-resolver.js";
@@ -87,6 +93,7 @@ export interface ActiveRun {
   compilerVersion?: string;
   sourceApiVersion?: string;
   contracts?: Record<string, unknown>;
+  artifacts?: DAGArtifactDeclaration[];
   runInputTargets?: Array<{ node: string; port: string; contract?: string }>;
   initialPrompt?: string;
   nodeCount?: number;
@@ -408,6 +415,9 @@ export function createActiveRun(
     compilerVersion: parsedDAG.meta.compiler_version,
     sourceApiVersion: parsedDAG.meta.source_api_version,
     contracts: parsedDAG.meta.contracts ? { ...parsedDAG.meta.contracts } : undefined,
+    artifacts: parsedDAG.meta.artifacts
+      ? structuredClone(parsedDAG.meta.artifacts)
+      : undefined,
     runInputTargets: parsedDAG.meta.run_input_targets
       ? parsedDAG.meta.run_input_targets.map((target) => ({ ...target }))
       : undefined,
@@ -664,6 +674,7 @@ export function restoreActiveRun(
     compilerVersion: metadata.compilerVersion,
     sourceApiVersion: metadata.sourceApiVersion,
     contracts: metadata.contracts ? { ...metadata.contracts } : undefined,
+    artifacts: metadata.artifacts ? structuredClone(metadata.artifacts) : undefined,
     runInputTargets: metadata.runInputTargets
       ? metadata.runInputTargets.map((target) => ({ ...target }))
       : undefined,
@@ -903,8 +914,10 @@ function _correctionPrompt(
     `Previous attempt ended without a valid DAG handoff: ${reason}`,
     `Declared output ports for this node: ${declaredPorts}.`,
     "Treat that error as authoritative. Preserve required field names and JSON array/object/number types exactly.",
-    "If the work already completed, do not repeat it. Do not answer with text.",
-    "Your next and only action must call the handoff tool with exactly one declared output port and contract-valid content derived from the original inputs and completed work.",
+    "Reuse completed evidence when it is available in the original inputs or current workspace.",
+    "Correction mode permits only the handoff tool. Do not repeat investigation, file changes, or other side effects.",
+    "Never print a pseudo-tool call as prose, XML, or JSON. Invoke the SDK tool itself.",
+    "Finish by calling the handoff tool exactly once with one declared output port and contract-valid content. Do not end with prose.",
   ].join("\n");
 }
 
@@ -1673,7 +1686,57 @@ function _commandAllowlist(): Set<string> {
   return new Set(configured.split(",").map((value) => value.trim().toLowerCase()).filter(Boolean));
 }
 
-function _commandGatewayResult(run: ActiveRun, node: DAGGraphNode): { port: string; payload: Record<string, unknown> } {
+const RUN_WORKSPACE_CWD = "$run_workspace";
+
+function _pathIsWithin(root: string, target: string): boolean {
+  const relative = path.relative(root, target);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function _commandGatewayCwd(
+  run: ActiveRun,
+  configured: string | undefined,
+): { cwd: string; label: string } | { error: string } {
+  const managerRoot = path.resolve(process.cwd());
+  const raw = configured ?? ".";
+  const usesRunWorkspace = raw === RUN_WORKSPACE_CWD ||
+    raw.startsWith(`${RUN_WORKSPACE_CWD}/`) ||
+    raw.startsWith(`${RUN_WORKSPACE_CWD}\\`);
+  if (!usesRunWorkspace) {
+    const cwd = path.resolve(managerRoot, raw);
+    if (!_pathIsWithin(managerRoot, cwd)) return { error: "command cwd escapes Manager workspace" };
+    return { cwd, label: path.relative(managerRoot, cwd) || "." };
+  }
+
+  const workspaceRoot = path.resolve(getHomerailHome(), "workspace");
+  const runWorkspace = path.resolve(workspaceRoot, ...run.runId.split("/"));
+  if (runWorkspace === workspaceRoot || !_pathIsWithin(workspaceRoot, runWorkspace)) {
+    return { error: "command run workspace path is unsafe" };
+  }
+  const suffix = raw.slice(RUN_WORKSPACE_CWD.length).replace(/^[/\\]+/, "");
+  const candidate = path.resolve(runWorkspace, suffix || ".");
+  if (!_pathIsWithin(runWorkspace, candidate)) return { error: "command cwd escapes run workspace" };
+  try {
+    const realWorkspaceRoot = realpathSync(workspaceRoot);
+    const realWorkspace = realpathSync(runWorkspace);
+    if (realWorkspace === realWorkspaceRoot || !_pathIsWithin(realWorkspaceRoot, realWorkspace)) {
+      return { error: "command run workspace resolves outside workspace root" };
+    }
+    const realCandidate = realpathSync(candidate);
+    if (!_pathIsWithin(realWorkspace, realCandidate)) {
+      return { error: "command cwd resolves outside run workspace" };
+    }
+    return {
+      cwd: realCandidate,
+      label: suffix ? `${RUN_WORKSPACE_CWD}/${suffix.replace(/\\/g, "/")}` : RUN_WORKSPACE_CWD,
+    };
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? String(error.code) : "unavailable";
+    return { error: `command run workspace cwd is unavailable (${code})` };
+  }
+}
+
+function _commandGatewayResult(run: ActiveRun, node: DAGGraphNode): { port: string; payload: unknown } {
   const config = node.gateway_config;
   const inputs = _nodeInputs(run.dagRun, node.node_id);
   const selectedInputs = config?.input ? inputs[config.input] : undefined;
@@ -1702,11 +1765,16 @@ function _commandGatewayResult(run: ActiveRun, node: DAGGraphNode): { port: stri
       payload: { ok: false, error: `executable '${command[0]}' is not in HOMERAIL_DAG_COMMAND_ALLOWLIST` },
     };
   }
-  const root = process.cwd();
-  const cwd = path.resolve(root, config?.cwd ?? ".");
-  if (cwd !== root && !cwd.startsWith(`${root}${path.sep}`)) {
-    return { port: config?.failure_port || "failed", payload: { ok: false, error: "command cwd escapes Manager workspace" } };
+  const resolvedCwd = _commandGatewayCwd(run, config?.cwd);
+  if ("error" in resolvedCwd) {
+    return { port: config?.failure_port || "failed", payload: { ok: false, error: resolvedCwd.error } };
   }
+  const { cwd, label: cwdLabel } = resolvedCwd;
+  const stdinValue = config?.stdin_field === "$inputs"
+    ? inputs
+    : config?.stdin_field
+      ? _fieldValue(input, config.stdin_field)
+      : undefined;
   const captureLimit = Math.max(1, Math.floor(config?.capture_limit ?? 64_000));
   const startedAt = Date.now();
   const result = spawnSync(command[0], command.slice(1), {
@@ -1716,7 +1784,7 @@ function _commandGatewayResult(run: ActiveRun, node: DAGGraphNode): { port: stri
     maxBuffer: captureLimit * 2,
     shell: false,
     env: process.env,
-    ...(config?.stdin_field ? { input: JSON.stringify(_fieldValue(input, config.stdin_field)) } : {}),
+    ...(config?.stdin_field ? { input: JSON.stringify(stdinValue) } : {}),
   });
   const exitCode = typeof result.status === "number" ? result.status : null;
   const successCodes = config?.success_exit_codes ?? [0];
@@ -1736,7 +1804,7 @@ function _commandGatewayResult(run: ActiveRun, node: DAGGraphNode): { port: stri
     ok: ok && !parseFailed,
     command: command[0],
     args: command.slice(1),
-    cwd: path.relative(root, cwd) || ".",
+    cwd: cwdLabel,
     exit_code: exitCode,
     signal: result.signal ?? null,
     stdout,
@@ -1746,11 +1814,15 @@ function _commandGatewayResult(run: ActiveRun, node: DAGGraphNode): { port: stri
     error: result.error?.message,
     value,
     parse_failed: parseFailed,
-    input,
+    input: config?.stdin_field === "$inputs" ? inputs : input,
   };
   const telemetry = redactTelemetry(payload) as Record<string, unknown>;
   emit("dag:deterministic_command", { runId: run.runId, nodeId: node.node_id, ...telemetry });
-  return { port: payload.ok ? config?.success_port || "passed" : config?.failure_port || "failed", payload };
+  const handoffPayload = payload.ok && config?.result_payload === "value" ? value : payload;
+  return {
+    port: payload.ok ? config?.success_port || "passed" : config?.failure_port || "failed",
+    payload: handoffPayload,
+  };
 }
 
 function _stateInputValue(run: ActiveRun, node: DAGGraphNode): unknown {
@@ -2240,6 +2312,24 @@ function _workspaceAccess(node: DAGGraphNode): DagWorkspaceAccess | undefined {
   };
 }
 
+function _allowedBuiltinTools(node: DAGGraphNode): AgentBuiltinToolName[] | undefined {
+  const raw = _agentRuntimeConfig(node).allowed_builtin_tools;
+  if (!Array.isArray(raw)) return undefined;
+  const allowed = new Set<string>(AGENT_BUILTIN_TOOL_NAMES);
+  return raw.filter((entry): entry is AgentBuiltinToolName => (
+    typeof entry === "string" && allowed.has(entry)
+  ));
+}
+
+function _allowedDagTools(node: DAGGraphNode): DagAgentToolName[] | undefined {
+  const raw = _agentRuntimeConfig(node).allowed_dag_tools;
+  if (!Array.isArray(raw)) return undefined;
+  const allowed = new Set<string>(DAG_AGENT_TOOL_NAMES);
+  return raw.filter((entry): entry is DagAgentToolName => (
+    typeof entry === "string" && allowed.has(entry)
+  ));
+}
+
 function _buildDispatchEnvelope(run: ActiveRun, nodeId: string): DispatchEnvelopeBuildResult {
   if (run.status !== "active") return { ok: false, reason: `run ${run.runId} is not active` };
   if (getNodeState(run.dagRun, nodeId) !== "READY") {
@@ -2293,6 +2383,8 @@ function _buildDispatchEnvelope(run: ActiveRun, nodeId: string): DispatchEnvelop
       requiredCapabilities: node.requires?.capabilities,
       advisors: advisorResolution.advisors,
       workspaceAccess: _workspaceAccess(node),
+      allowedBuiltinTools: _allowedBuiltinTools(node),
+      allowedDagTools: _allowedDagTools(node),
     },
   };
 }
@@ -2320,7 +2412,12 @@ export function dispatchReadyNodes(
     const node = run.dagRun.graph.nodes.find((n) => n.node_id === nodeId);
     if (!node) continue;
     if (_isGatewayNode(node)) {
-      if (_executeGatewayNode(runId, run, node)) count++;
+      try {
+        if (_executeGatewayNode(runId, run, node)) count++;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        failActiveRun(runId, nodeId, `gateway execution failed: ${message}`);
+      }
       continue;
     }
 

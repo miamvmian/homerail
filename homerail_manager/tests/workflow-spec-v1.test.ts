@@ -65,6 +65,75 @@ const MINIMAL_WORKFLOW = {
 } as const;
 
 describe("WorkflowSpec v1", () => {
+  it("canonicalizes strict per-agent built-in tool allowlists", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.nodes.execute.allowed_builtin_tools = ["Write", "Read"];
+    workflow.spec.nodes.execute.allowed_dag_tools = ["handoff", "get_graph_context"];
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid, result.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(result.canonical?.nodes.find((node) => node.id === "execute")?.config).toMatchObject({
+      allowed_builtin_tools: ["Read", "Write"],
+      allowed_dag_tools: ["get_graph_context", "handoff"],
+    });
+
+    workflow.spec.nodes.execute.allowed_builtin_tools.reverse();
+    workflow.spec.nodes.execute.allowed_dag_tools.reverse();
+    expect(compileWorkflowSource(YAML.stringify(workflow)).canonical_hash).toBe(result.canonical_hash);
+  });
+
+  it("rejects duplicate or unknown built-in tool names", () => {
+    for (const allowedBuiltinTools of [["Write", "Write"], ["Write", "UnknownTool"]]) {
+      const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+      workflow.spec.nodes.execute.allowed_builtin_tools = allowedBuiltinTools;
+      const result = compileWorkflowSource(YAML.stringify(workflow));
+      expect(result.valid).toBe(false);
+      expect(result.diagnostics).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "DAG_SCHEMA_INVALID_FIELD" }),
+      ]));
+    }
+  });
+
+  it("requires output-producing agents to retain the handoff DAG tool", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.nodes.execute.allowed_dag_tools = ["get_graph_context"];
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid).toBe(false);
+    expect(result.diagnostics).toContainEqual(expect.objectContaining({
+      code: "DAG_SEMANTIC_HANDOFF_TOOL_REQUIRED",
+      path: "/spec/nodes/execute/allowed_dag_tools",
+    }));
+  });
+
+  it("accepts bounded conditional contract invariants", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.contracts.Result = {
+      type: "object",
+      additionalProperties: false,
+      required: ["status", "evidence"],
+      properties: {
+        status: { type: "string", enum: ["confirmed", "inconclusive"] },
+        evidence: { type: "array", items: { type: "string" } },
+      },
+      allOf: [{
+        if: { required: ["status"], properties: { status: { const: "confirmed" } } },
+        then: {
+          properties: {
+            evidence: { type: "array", contains: { type: "string", const: "executable" } },
+          },
+        },
+        else: { properties: { evidence: { type: "array" } } },
+      }],
+    };
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+    expect(result.valid).toBe(true);
+    expect(result.diagnostics.filter((entry) => entry.severity === "error")).toEqual([]);
+  });
+
   it("defines a strict schema branch for every v1 node kind", () => {
     const document = {
       api_version: "homerail.ai/v1",
@@ -144,6 +213,112 @@ describe("WorkflowSpec v1", () => {
       entry_nodes: ["execute"],
       terminal_nodes: ["done"],
     });
+  });
+
+  it("normalizes handoff and compressed workspace artifact declarations into canonical IR", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.artifacts = [
+      {
+        name: "evidence.tar.gz",
+        source: { type: "workspace", path: "evidence", produced_by: "execute" },
+        archive: { format: "tar.gz" },
+        publish: "always",
+      },
+      {
+        name: "result.json",
+        source: { type: "handoff", node: "execute", port: "result" },
+        media_type: "application/json",
+        contract: "Result",
+        required: true,
+      },
+    ];
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid, result.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(result.canonical?.compiler_version).toBe("4");
+    expect(result.canonical?.artifacts).toEqual([
+      {
+        name: "evidence.tar.gz",
+        source: { type: "workspace", path: "evidence", produced_by: "execute" },
+        media_type: "application/gzip",
+        archive: { format: "tar.gz", deterministic: true },
+        required: false,
+        publish: "always",
+        limits: {
+          max_files: 10_000,
+          max_uncompressed_bytes: 268_435_456,
+          max_compressed_bytes: 134_217_728,
+          timeout_ms: 120_000,
+        },
+      },
+      {
+        name: "result.json",
+        source: { type: "handoff", node: "execute", port: "result" },
+        media_type: "application/json",
+        contract: "Result",
+        required: true,
+        publish: "success",
+      },
+    ]);
+  });
+
+  it("preserves a bounded handoff JSON pointer for nested text artifacts", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.artifacts = [{
+      name: "summary.md",
+      source: {
+        type: "handoff",
+        node: "execute",
+        port: "result",
+        json_pointer: "/details/summary",
+      },
+      media_type: "text/markdown",
+      required: true,
+      publish: "always",
+    }];
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid, result.diagnostics.map((item) => item.message).join("\n")).toBe(true);
+    expect(result.canonical?.artifacts).toEqual([{
+      name: "summary.md",
+      source: {
+        type: "handoff",
+        node: "execute",
+        port: "result",
+        json_pointer: "/details/summary",
+      },
+      media_type: "text/markdown",
+      required: true,
+      publish: "always",
+    }]);
+  });
+
+  it("rejects unsafe, duplicate, and contract-invalid artifact declarations", () => {
+    const workflow = structuredClone(MINIMAL_WORKFLOW) as any;
+    workflow.spec.artifacts = [
+      {
+        name: "result.json",
+        source: { type: "handoff", node: "execute", port: "result" },
+        media_type: "application/json",
+      },
+      {
+        name: "result.json",
+        source: { type: "workspace", path: "../evidence", produced_by: "missing" },
+        archive: { format: "tar.gz" },
+      },
+    ];
+
+    const result = compileWorkflowSource(YAML.stringify(workflow));
+
+    expect(result.valid).toBe(false);
+    expect(result.diagnostics.map((item) => item.code)).toEqual(expect.arrayContaining([
+      "DAG_SEMANTIC_ARTIFACT_CONTRACT_REQUIRED",
+      "DAG_SEMANTIC_DUPLICATE_ARTIFACT",
+      "DAG_SEMANTIC_UNSAFE_ARTIFACT_PATH",
+      "DAG_SEMANTIC_UNKNOWN_NODE",
+    ]));
   });
 
   it("rejects unknown and provider-specific fields with source positions", () => {

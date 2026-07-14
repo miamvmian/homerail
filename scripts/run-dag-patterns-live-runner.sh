@@ -2,6 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE_TASK="${HOMERAIL_LIVE_TASK:-patterns}"
 RUNNER_BASE="${HOMERAIL_RUNNER_BASE:-$HOME/.homerail-runners}"
 HOME_BASE="${HOMERAIL_LIVE_HOME_BASE:-$RUNNER_BASE/homerail_home}"
 ARTIFACT_BASE="${HOMERAIL_LIVE_ARTIFACTS:-$RUNNER_BASE/artifacts}"
@@ -15,18 +16,27 @@ AGENT_TYPE="${HOMERAIL_PATTERN_AGENT_TYPE:-claude-sdk}"
 RUN_KEY="${HOMERAIL_LIVE_RUN_KEY:-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}}"
 RUN_KEY="$(printf '%s' "$RUN_KEY" | tr -c 'A-Za-z0-9_.-' '-')"
 
+case "$LIVE_TASK" in
+  patterns|pr-review) ;;
+  *)
+    echo "Unsupported HOMERAIL_LIVE_TASK: $LIVE_TASK" >&2
+    exit 1
+    ;;
+esac
+
 if [ -z "$MODEL_BASE_URL" ]; then
-  echo "HOMERAIL_PATTERN_MODEL_BASE_URL is required for live DAG validation." >&2
+  echo "HOMERAIL_PATTERN_MODEL_BASE_URL is required for isolated live DAG execution." >&2
   exit 1
 fi
 
 export HOMERAIL_HOME="$HOME_BASE/run-$RUN_KEY"
+unset HOMERAIL_ASSET_DIR
 export HOMERAIL_PATTERN_MODEL="$MODEL_NAME"
 export HOMERAIL_PATTERN_MODEL_PROTOCOL="$MODEL_PROTOCOL"
 export HOMERAIL_PATTERN_AGENT_TYPE="$AGENT_TYPE"
 export HOMERAIL_WORKER_IMAGE="${HOMERAIL_LIVE_WORKER_IMAGE_PREFIX:-homerail-worker:dag-live}-$RUN_KEY"
 export HOMERAIL_MANAGER_AGENT_IMAGE="$HOMERAIL_WORKER_IMAGE"
-export HOMERAIL_DAG_COMMAND_ALLOWLIST="${HOMERAIL_DAG_COMMAND_ALLOWLIST:-node}"
+export HOMERAIL_DAG_COMMAND_ALLOWLIST="${HOMERAIL_DAG_COMMAND_ALLOWLIST:-node,git}"
 export HOMERAIL_DAG_ALLOW_DYNAMIC_COMMANDS="${HOMERAIL_DAG_ALLOW_DYNAMIC_COMMANDS:-true}"
 if [ -z "${HOMERAIL_DAG_APPROVAL_TOKEN:-}" ]; then
   HOMERAIL_DAG_APPROVAL_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
@@ -168,6 +178,30 @@ if ! wait_for_model 6 5; then
   fi
 fi
 
+requested_live_patterns="${HOMERAIL_LIVE_PATTERNS:-}"
+requested_live_patterns=",${requested_live_patterns//[[:space:]]/},"
+if [ "$LIVE_TASK" = "patterns" ] \
+  && { [ -z "${HOMERAIL_LIVE_PATTERNS:-}" ] || [[ "$requested_live_patterns" == *",issue-diagnosis,"* ]]; }; then
+  if [ -z "${HOMERAIL_LIVE_ISSUE_REVISION:-}" ]; then
+    HOMERAIL_LIVE_ISSUE_REVISION="$(
+      HOME="$HOMERAIL_HOME" \
+      USERPROFILE="$HOMERAIL_HOME" \
+      XDG_CONFIG_HOME="$HOMERAIL_HOME/.config" \
+      GIT_ASKPASS='' \
+      GIT_TERMINAL_PROMPT=0 \
+      GCM_INTERACTIVE=Never \
+      git -c credential.helper= -c http.extraHeader= ls-remote --exit-code \
+        https://github.com/xiaotianfotos/homerail.git refs/heads/main \
+        | awk 'NR == 1 { print $1 }'
+    )"
+  fi
+  if [[ ! "$HOMERAIL_LIVE_ISSUE_REVISION" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+    echo "Could not resolve an exact commit for live issue diagnosis." >&2
+    exit 1
+  fi
+  export HOMERAIL_LIVE_ISSUE_REVISION
+fi
+
 echo "Building isolated worker image $HOMERAIL_WORKER_IMAGE"
 docker build \
   --label "org.homerail.live_run=$RUN_KEY" \
@@ -189,6 +223,51 @@ fi
 
 node "$REPO_ROOT/homerail_cli/dist/cli.js" start --host 0.0.0.0 --no-build-worker-image
 SETTING_ID="$(node "$REPO_ROOT/scripts/configure-live-pattern-model.mjs")"
+
+if [ "$LIVE_TASK" = "pr-review" ]; then
+  REVIEW_INPUT="${HOMERAIL_PR_REVIEW_INPUT:-}"
+  REVIEW_ARTIFACT_DIR="${HOMERAIL_PR_REVIEW_ARTIFACT_DIR:-$REPO_ROOT/artifacts/pr-review}"
+  REVIEW_TIMEOUT_SECONDS="${HOMERAIL_PR_REVIEW_TIMEOUT_SECONDS:-3300}"
+  if [ -z "$REVIEW_INPUT" ]; then
+    echo "HOMERAIL_PR_REVIEW_INPUT is required for the pr-review live task." >&2
+    exit 1
+  fi
+  mkdir -p "$REVIEW_ARTIFACT_DIR"
+  command_path="$REVIEW_ARTIFACT_DIR/command.json"
+  command_tmp="$command_path.tmp"
+  stderr_path="$REVIEW_ARTIFACT_DIR/command.stderr.log"
+  rm -f "$command_path" "$command_tmp" "$stderr_path"
+  review_args=(
+    dag run-template pr-review
+    --input "$REVIEW_INPUT"
+    --setting-id "$SETTING_ID"
+    --wait
+    --timeout "$REVIEW_TIMEOUT_SECONDS"
+  )
+  if ! node "$REPO_ROOT/homerail_cli/dist/cli.js" --json "${review_args[@]}" \
+    >"$command_tmp" 2> >(tee "$stderr_path" >&2); then
+    rm -f "$command_tmp"
+    exit 1
+  fi
+  mv "$command_tmp" "$command_path"
+  [ -s "$stderr_path" ] || rm -f "$stderr_path"
+  REVIEW_RUN_ID="$(
+    node -e 'const fs=require("fs"); const value=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); if (!value.run_id) process.exit(1); process.stdout.write(String(value.run_id))' \
+      "$command_path"
+  )"
+  node "$REPO_ROOT/homerail_cli/dist/cli.js" dag artifact "$REVIEW_RUN_ID" pr-review.json \
+    --output "$REVIEW_ARTIFACT_DIR/pr-review.json"
+  node "$REPO_ROOT/homerail_cli/dist/cli.js" dag artifact "$REVIEW_RUN_ID" pr-review.md \
+    --output "$REVIEW_ARTIFACT_DIR/pr-review.md"
+  test -s "$REVIEW_ARTIFACT_DIR/pr-review.json"
+  test -s "$REVIEW_ARTIFACT_DIR/pr-review.md"
+  node "$REPO_ROOT/scripts/validate-pr-review-artifacts.mjs" \
+    "$command_path" \
+    "$REVIEW_ARTIFACT_DIR/pr-review.json" \
+    "$REVIEW_ARTIFACT_DIR/pr-review.md"
+  echo "HomeRail PR Review artifacts: $REVIEW_ARTIFACT_DIR"
+  exit 0
+fi
 
 validation_args=(
   --base-url "$HOMERAIL_MANAGER_URL"
