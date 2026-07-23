@@ -217,4 +217,187 @@ describe("Auto Fix scenario asset", () => {
     });
   });
 
+  it("allows obvious test credential placeholders in a candidate patch", () => {
+    const canonical = compileWorkflowSource(fs.readFileSync(WORKFLOW_FILE, "utf8")).canonical!;
+    const commandNode = canonical.nodes.find((node) => node.id === "finalize_publication");
+    if (commandNode?.kind !== "command" || !commandNode.config.command) throw new Error("finalizer command is missing");
+    const revision = "b".repeat(40);
+    const patch = [
+      "diff --git a/example.test.ts b/example.test.ts",
+      "--- a/example.test.ts",
+      "+++ b/example.test.ts",
+      "@@ -0,0 +1 @@",
+      "+const credential = { api_key: 'test-api-key-0000' };",
+      "",
+    ].join("\n");
+    const input = {
+      issue: [{ repo: "owner/repo", issue: 92, revision }],
+      patch: [{ status: "fixed", patch, explanation: "repair", files_changed: ["example.test.ts"], test_plan: ["focused"] }],
+      arbitration: [{ verdict: "approve", summary: "approved", blocking_defects: [] }],
+      summary: [{ review_summary: "approved by consensus", markdown: `# Auto Fix #92\n\nBase: ${revision}\n` }],
+    };
+    const result = spawnSync(process.execPath, commandNode.config.command.slice(1), {
+      cwd: os.tmpdir(), encoding: "utf8", input: JSON.stringify(input),
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ status: "ready", patch });
+  });
+
+  it("scans many test placeholders without rescanning the patch for every match", () => {
+    const canonical = compileWorkflowSource(fs.readFileSync(WORKFLOW_FILE, "utf8")).canonical!;
+    const commandNode = canonical.nodes.find((node) => node.id === "finalize_publication");
+    if (commandNode?.kind !== "command" || !commandNode.config.command) throw new Error("finalizer command is missing");
+    const revision = "1".repeat(40);
+    const additions = Array.from(
+      { length: 4_000 },
+      (_, index) => `+const fixture${index} = { api_key: 'test-api-key-0000' };`,
+    );
+    const patch = [
+      "diff --git a/tests/many.test.ts b/tests/many.test.ts",
+      "--- a/tests/many.test.ts",
+      "+++ b/tests/many.test.ts",
+      `@@ -0,0 +1,${additions.length} @@`,
+      ...additions,
+      "",
+    ].join("\n");
+    const input = {
+      issue: [{ repo: "owner/repo", issue: 92, revision }],
+      patch: [{ status: "fixed", patch, explanation: "repair", files_changed: ["tests/many.test.ts"], test_plan: [] }],
+      arbitration: [{ verdict: "approve", summary: "approved", blocking_defects: [] }],
+      summary: [{ review_summary: "approved by consensus", markdown: `# Auto Fix #92\n\nBase: ${revision}\n` }],
+    };
+    const result = spawnSync(process.execPath, commandNode.config.command.slice(1), {
+      cwd: os.tmpdir(), encoding: "utf8", input: JSON.stringify(input), timeout: 3_000,
+    });
+    expect(result.status, result.stderr).toBe(0);
+  });
+
+  it.each([
+    { field: "explanation", mutate: (candidate: Record<string, unknown>) => { candidate.explanation = { api_key: "hidden" }; } },
+    { field: "files_changed", mutate: (candidate: Record<string, unknown>) => { candidate.files_changed = [{ api_key: "hidden" }]; } },
+    { field: "test_plan", mutate: (candidate: Record<string, unknown>) => { candidate.test_plan = [{ api_key: "hidden" }]; } },
+  ])("rejects a non-string $field before publication scanning", ({ mutate }) => {
+    const canonical = compileWorkflowSource(fs.readFileSync(WORKFLOW_FILE, "utf8")).canonical!;
+    const commandNode = canonical.nodes.find((node) => node.id === "finalize_publication");
+    if (commandNode?.kind !== "command" || !commandNode.config.command) throw new Error("finalizer command is missing");
+    const revision = "f".repeat(40);
+    const candidate: Record<string, unknown> = {
+      status: "fixed",
+      patch: "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n",
+      explanation: "repair",
+      files_changed: ["a.txt"],
+      test_plan: ["focused"],
+    };
+    mutate(candidate);
+    const input = {
+      issue: [{ repo: "owner/repo", issue: 92, revision }],
+      patch: [candidate],
+      arbitration: [{ verdict: "approve", summary: "approved", blocking_defects: [] }],
+      summary: [{ review_summary: "approved by consensus", markdown: `# Auto Fix #92\n\nBase: ${revision}\n` }],
+    };
+    const result = spawnSync(process.execPath, commandNode.config.command.slice(1), {
+      cwd: os.tmpdir(), encoding: "utf8", input: JSON.stringify(input),
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("FixCandidate input is invalid");
+    expect(result.stderr).not.toContain("hidden");
+  });
+
+  it("rejects real-looking credentials with a redacted, actionable location", () => {
+    const canonical = compileWorkflowSource(fs.readFileSync(WORKFLOW_FILE, "utf8")).canonical!;
+    const commandNode = canonical.nodes.find((node) => node.id === "finalize_publication");
+    if (commandNode?.kind !== "command" || !commandNode.config.command) throw new Error("finalizer command is missing");
+    const revision = "c".repeat(40);
+    const credential = ["r4Nd0m", "S3cr3t", "V4lu3", "9XyZ"].join("");
+    const patch = [
+      "diff --git a/src/config.ts b/src/config.ts",
+      "--- a/src/config.ts",
+      "+++ b/src/config.ts",
+      "@@ -0,0 +1 @@",
+      `+const client_secret = '${credential}';`,
+      "",
+    ].join("\n");
+    const input = {
+      issue: [{ repo: "owner/repo", issue: 92, revision }],
+      patch: [{ status: "fixed", patch, explanation: "repair", files_changed: ["src/config.ts"], test_plan: [] }],
+      arbitration: [{ verdict: "approve", summary: "approved", blocking_defects: [] }],
+      summary: [{ review_summary: "approved by consensus", markdown: `# Auto Fix #92\n\nBase: ${revision}\n` }],
+    };
+    const result = spawnSync(process.execPath, commandNode.config.command.slice(1), {
+      cwd: os.tmpdir(), encoding: "utf8", input: JSON.stringify(input),
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("publication patch (src/config.ts, patch line 5) contains credential-like client_secret assignment");
+    expect(result.stderr).not.toContain(credential);
+  });
+
+  it.each([
+    {
+      name: "placeholder outside a test fixture path",
+      file: "src/config.ts",
+      credential: ["test", "api", "key", "0000"].join("-"),
+    },
+    {
+      name: "marker-bearing value with an unrecognized secret token",
+      file: "tests/config.test.ts",
+      credential: ["sk", "test", "realcredential"].join("-"),
+    },
+  ])("rejects $name", ({ file, credential }) => {
+    const canonical = compileWorkflowSource(fs.readFileSync(WORKFLOW_FILE, "utf8")).canonical!;
+    const commandNode = canonical.nodes.find((node) => node.id === "finalize_publication");
+    if (commandNode?.kind !== "command" || !commandNode.config.command) throw new Error("finalizer command is missing");
+    const revision = "e".repeat(40);
+    const patch = [
+      `diff --git a/${file} b/${file}`,
+      `--- a/${file}`,
+      `+++ b/${file}`,
+      "@@ -0,0 +1 @@",
+      `+const api_key = '${credential}';`,
+      "",
+    ].join("\n");
+    const input = {
+      issue: [{ repo: "owner/repo", issue: 92, revision }],
+      patch: [{ status: "fixed", patch, explanation: "repair", files_changed: [file], test_plan: [] }],
+      arbitration: [{ verdict: "approve", summary: "approved", blocking_defects: [] }],
+      summary: [{ review_summary: "approved by consensus", markdown: `# Auto Fix #92\n\nBase: ${revision}\n` }],
+    };
+    const result = spawnSync(process.execPath, commandNode.config.command.slice(1), {
+      cwd: os.tmpdir(), encoding: "utf8", input: JSON.stringify(input),
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(`publication patch (${file}, patch line 5) contains credential-like api_key assignment`);
+    expect(result.stderr).not.toContain(credential);
+  });
+
+  it.each([
+    {
+      name: "private network address",
+      sensitive: ["192", "168", "100", "112"].join("."),
+      diagnostic: "contains a private network address",
+    },
+    {
+      name: "non-noreply email",
+      sensitive: ["local", "example.com"].join("@"),
+      diagnostic: "contains a non-noreply email",
+    },
+  ])("keeps $name publication protection strict", ({ sensitive, diagnostic }) => {
+    const canonical = compileWorkflowSource(fs.readFileSync(WORKFLOW_FILE, "utf8")).canonical!;
+    const commandNode = canonical.nodes.find((node) => node.id === "finalize_publication");
+    if (commandNode?.kind !== "command" || !commandNode.config.command) throw new Error("finalizer command is missing");
+    const revision = "d".repeat(40);
+    const patch = `diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -0,0 +1 @@\n+${sensitive}\n`;
+    const input = {
+      issue: [{ repo: "owner/repo", issue: 92, revision }],
+      patch: [{ status: "fixed", patch, explanation: "repair", files_changed: ["a.txt"], test_plan: [] }],
+      arbitration: [{ verdict: "approve", summary: "approved", blocking_defects: [] }],
+      summary: [{ review_summary: "approved by consensus", markdown: `# Auto Fix #92\n\nBase: ${revision}\n` }],
+    };
+    const result = spawnSync(process.execPath, commandNode.config.command.slice(1), {
+      cwd: os.tmpdir(), encoding: "utf8", input: JSON.stringify(input),
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(diagnostic);
+    expect(result.stderr).not.toContain(sensitive);
+  });
+
 });
