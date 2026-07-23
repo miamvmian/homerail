@@ -1,0 +1,36 @@
+  name: backup-branches
+
+  on:
+    workflow_dispatch:
+    schedule:
+      - cron: '0 14 * * 5'
+
+  permissions:
+    contents: write
+  
+  jobs:
+    backup:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+
+        - name: Fetch ALL remote branches
+          run: git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+
+        - name: Backup all branches with timestamp
+          run: |
+            TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
+            PREFIX="auto-backup"
+
+            # 列出 origin 上的所有分支（排除 HEAD）
+            for branch in $(git branch -r | grep -v 'origin/HEAD' | sed 's/  origin\///'); do
+              TAG="${PREFIX}/${branch}/${TIMESTAMP}"
+              if git rev-parse --verify "origin/$branch" > /dev/null 2>&1; then
+                git tag "$TAG" "origin/$branch"
+                echo "  ✅ $TAG → $branch"
+              fi
+            done
+
+            git push origin --tags
